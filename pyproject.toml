@@ -1,0 +1,30 @@
+[project]
+name = "snowflake-emulator"
+version = "0.1.0"
+description = "A local Snowflake SQL API emulator built with FastAPI, sqlglot, and DuckDB"
+readme = "README.md"
+authors = [
+    { name = "khorshuheng", email = "solemnpriest@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "duckdb>=1.5.5",
+    "fastapi>=0.141.1",
+    "pydantic-settings>=2.15.0",
+    "sqlglot>=30.15.0",
+    "uvicorn[standard]>=0.52.1",
+]
+
+[project.scripts]
+snowflake-emulator = "snowflake_emulator.main:main"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "snowflake-connector-python>=4.7.2",
+]
