@@ -13,11 +13,13 @@ def client():
     """
     import snowflake_emulator.database as database_module
     import snowflake_emulator.sessions as sessions_module
+    import snowflake_emulator.stages as stages_module
     import snowflake_emulator.statement_store as statement_store_module
     from snowflake_emulator.main import app
 
     database_module._manager = None
     sessions_module._manager = None
+    stages_module._manager = None
     statement_store_module._store = None
 
     with TestClient(app) as test_client:

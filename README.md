@@ -60,11 +60,18 @@ database_path = ":memory:"
 [statements]
 # Maximum number of cached statement results kept in memory.
 max_cached_statements = 500
+
+[staging]
+# Root directory under which staged files (PUT/GET/COPY INTO @stage) are stored.
+# Leave empty to use an auto-created temporary directory.
+stage_root = ""
 ```
 
 Edit this file to change the bind address/port, default database/schema, or to
 persist data to disk (set `persistence.database_path` to a file path, e.g.
-`"/var/lib/sfemu/emulator.duckdb"`, instead of `":memory:"`).
+`"/var/lib/sfemu/emulator.duckdb"`, instead of `":memory:"`). Set
+`staging.stage_root` to a directory to keep staged files there instead of an
+auto-created temp directory.
 
 Settings can also be overridden with environment variables prefixed with
 `SNOWFLAKE_EMULATOR_`, using `__` to reach nested fields — these take priority
@@ -119,6 +126,47 @@ including `QUALIFY`, `ILIKE`, `DATEADD`/`DATEDIFF`, semi-structured functions li
 WAREHOUSE/ROLE` statements are intercepted and applied to the emulator's in-memory
 session state rather than being sent to DuckDB.
 
+## Staging files (PUT / GET / LIST / REMOVE / COPY INTO)
+
+The emulator implements Snowflake's local stage workflow for JSON and CSV files.
+Stages are backed by a directory tree on disk (see `[staging]` config above), and
+the official `snowflake-connector-python` driver performs the actual file transfer
+through its built-in `local` storage client — no cloud credentials needed.
+
+```python
+import snowflake.connector
+
+con = snowflake.connector.connect(
+    user="u", password="p", account="a", host="localhost", port=8000,
+    protocol="http", disable_ocsp_checks=True,
+)
+cur = con.cursor()
+
+cur.execute("CREATE STAGE my_stage")
+cur.execute("PUT file:///tmp/data.csv @my_stage")            # stage a CSV
+cur.execute("PUT file:///tmp/data.json @~/staged")           # user stage @~
+cur.execute("LIST @~/staged")
+cur.execute("CREATE TABLE t (a INT, b VARCHAR)")
+cur.execute("COPY INTO t FROM @~/staged FILE_FORMAT = (TYPE = CSV)")
+cur.execute("COPY INTO t FROM @my_stage FILE_FORMAT = (TYPE = JSON)")
+cur.execute("GET @my_stage file:///tmp/downloads")
+cur.execute("REMOVE @my_stage")
+```
+
+Supported stage commands:
+
+| Command | Notes |
+| --- | --- |
+| `PUT file://... @stage [OVERWRITE=TRUE]` | Stage local JSON/CSV files (globs and multiple files supported). |
+| `GET @stage file://... [PATTERN='...']` | Download staged files to a local directory. |
+| `LIST @stage [PATTERN='...']` | List staged files (name/size/md5/last_modified). |
+| `REMOVE @stage [PATTERN='...']` | Delete staged files. |
+| `COPY INTO t FROM @stage [FILE_FORMAT=(TYPE=CSV\|JSON, ...)]` | Load staged files into an existing table via DuckDB. |
+| `CREATE STAGE` / `DROP STAGE` / `ALTER STAGE` / `SHOW STAGES` | Stage metadata; `@name` resolves in the session's current database/schema. |
+
+Stage references supported: `@~` (user stage, private per session), `@name`,
+`@db.schema.name`, `@%table` (table stage), `@%` (internal stage).
+
 ## Development
 
 ```bash
@@ -126,6 +174,7 @@ uv run pytest        # run the whole test suite
 uv run pytest tests/test_statements_api.py           # SQL API v2 tests (FastAPI TestClient)
 uv run pytest tests/test_connector_integration.py     # real snowflake-connector-python driver
 uv run pytest tests/test_settings.py                  # TOML/env configuration tests
+uv run pytest tests/test_stages.py                    # stage command parsing unit tests
 ```
 
 The connector integration tests spin up a real `uvicorn` server on a background
@@ -152,6 +201,7 @@ src/snowflake_emulator/
   executor.py            # statement execution against DuckDB
   database.py             # DuckDB connection/catalog management
   sessions.py             # in-memory session (token -> db/schema/warehouse/role)
+  stages.py               # local stage tree: PUT/GET/LIST/REMOVE/COPY INTO @stage
   statement_store.py      # cache of executed statement results, by handle
   type_mapping.py          # DuckDB type -> Snowflake rowType mapping
   wire_format.py            # DuckDB value -> connector wire-format string encoding
@@ -162,4 +212,5 @@ tests/
   test_statements_api.py           # SQL API v2 tests via FastAPI TestClient
   test_connector_integration.py    # real snowflake-connector-python driver tests
   test_settings.py                 # TOML config file + env var override tests
+  test_stages.py                   # stage command parsing unit tests
 ```

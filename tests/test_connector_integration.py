@@ -22,6 +22,7 @@ from snowflake.connector.constants import FIELD_NAME_TO_ID as FIELD_ID_TO_NAME_L
 
 import snowflake_emulator.database as database_module
 import snowflake_emulator.sessions as sessions_module
+import snowflake_emulator.stages as stages_module
 import snowflake_emulator.statement_store as statement_store_module
 from snowflake_emulator.main import app
 
@@ -37,6 +38,7 @@ def emulator_port():
     """Run the real emulator app on a background thread, with fresh in-memory state."""
     database_module._manager = None
     sessions_module._manager = None
+    stages_module._manager = None
     statement_store_module._store = None
 
     port = _free_port()
@@ -190,3 +192,171 @@ def test_invalid_sql_raises_programming_error(connection):
     cur = connection.cursor()
     with pytest.raises(snowflake.connector.errors.ProgrammingError):
         cur.execute("SELEKT * FROM nowhere")
+
+
+# -- Staging (PUT / GET / LIST / REMOVE / COPY INTO @stage) ------------------
+
+
+def _write_csv(path, header=("a", "b"), rows=((1, "x"), (2, "y"))):
+    with open(path, "w") as fh:
+        fh.write(",".join(header) + "\n")
+        for row in rows:
+            fh.write(",".join(str(v) for v in row) + "\n")
+
+
+def _write_json(path, rows):
+    with open(path, "w") as fh:
+        for row in rows:
+            fh.write(json.dumps(row) + "\n")
+
+
+def test_copy_into_file_format_options(connection, tmp_path):
+    """FILE_FORMAT options (SKIP_HEADER, FIELD_DELIMITER) are honored by COPY INTO."""
+    cur = connection.cursor()
+
+    headerless = tmp_path / "no_header.csv"
+    headerless.write_text("1,x\n2,y\n")
+    cur.execute(f"PUT file://{headerless} @~/nh")
+    cur.execute("CREATE OR REPLACE TABLE th (a INT, b VARCHAR)")
+    cur.execute("COPY INTO th FROM @~/nh FILE_FORMAT = (TYPE = CSV, SKIP_HEADER = 1)")
+    assert cur.fetchall() == [(1,)]
+    cur.execute("SELECT * FROM th ORDER BY a")
+    assert cur.fetchall() == [(2, "y")]
+
+    tsv = tmp_path / "data.tsv"
+    tsv.write_text("a\tb\n5\tq\n")
+    cur.execute(f"PUT file://{tsv} @~/t")
+    cur.execute("CREATE OR REPLACE TABLE tt (a INT, b VARCHAR)")
+    cur.execute(
+        "COPY INTO tt FROM @~/t FILE_FORMAT = (TYPE = CSV, FIELD_DELIMITER = '\\t')"
+    )
+    assert cur.fetchall() == [(1,)]
+    cur.execute("SELECT * FROM tt")
+    assert cur.fetchall() == [(5, "q")]
+
+
+def test_put_csv_then_copy_into(connection, tmp_path):
+    csv_path = tmp_path / "data.csv"
+    _write_csv(csv_path)
+
+    cur = connection.cursor()
+    cur.execute(f"PUT file://{csv_path} @~/staged")
+    row = cur.fetchone()
+    assert row[0] == "data.csv"  # source
+    assert row[1] == "data.csv"  # target
+    assert row[6] == "UPLOADED"
+
+    cur.execute("CREATE OR REPLACE TABLE staged_csv (a INT, b VARCHAR)")
+    cur.execute("COPY INTO staged_csv FROM @~/staged FILE_FORMAT = (TYPE = CSV)")
+    assert cur.fetchall() == [(2,)]
+
+    cur.execute("SELECT * FROM staged_csv ORDER BY a")
+    assert cur.fetchall() == [(1, "x"), (2, "y")]
+
+
+def test_put_json_then_copy_into(connection, tmp_path):
+    json_path = tmp_path / "data.json"
+    _write_json(json_path, [{"a": 3, "b": "z"}, {"a": 4, "b": "w"}])
+
+    cur = connection.cursor()
+    cur.execute(f"PUT file://{json_path} @~/staged")
+    assert cur.fetchone()[6] == "UPLOADED"
+
+    cur.execute("CREATE OR REPLACE TABLE staged_json (a INT, b VARCHAR)")
+    cur.execute("COPY INTO staged_json FROM @~/staged FILE_FORMAT = (TYPE = JSON)")
+    assert cur.fetchall() == [(2,)]
+
+    cur.execute("SELECT * FROM staged_json ORDER BY a")
+    assert cur.fetchall() == [(3, "z"), (4, "w")]
+
+
+def test_put_list_remove(connection, tmp_path):
+    csv_path = tmp_path / "data.csv"
+    _write_csv(csv_path)
+
+    cur = connection.cursor()
+    cur.execute(f"PUT file://{csv_path} @~/staged")
+    cur.execute("LIST @~/staged")
+    rows = cur.fetchall()
+    assert [(r[0], r[1]) for r in rows] == [("staged/data.csv", 12)]
+    assert cur.description[0].name == "name"
+
+    cur.execute("REMOVE @~/staged")
+    assert cur.fetchall() == [("staged/data.csv", "removed", "")]
+
+    cur.execute("LIST @~/staged")
+    assert cur.fetchall() == []
+
+
+def test_put_glob_and_list_pattern(connection, tmp_path):
+    _write_csv(tmp_path / "part1.csv")
+    _write_csv(tmp_path / "part2.csv")
+    _write_json(tmp_path / "meta.json", [{"a": 9, "b": "q"}])
+
+    cur = connection.cursor()
+    cur.execute(f"PUT file://{tmp_path}/*.csv @~/staged")
+    assert cur.rowcount == 2
+
+    cur.execute("LIST @~/staged")
+    assert {r[0] for r in cur.fetchall()} == {
+        "staged/part1.csv",
+        "staged/part2.csv",
+    }
+
+    cur.execute("LIST @~/staged PATTERN='.*part1.*'")
+    assert [r[0] for r in cur.fetchall()] == ["staged/part1.csv"]
+
+
+def test_put_overwrite_default_and_force(connection, tmp_path):
+    csv_path = tmp_path / "data.csv"
+    _write_csv(csv_path)
+
+    cur = connection.cursor()
+    cur.execute(f"PUT file://{csv_path} @~/staged")
+    # Without OVERWRITE, re-putting an existing file fails (like real Snowflake).
+    with pytest.raises(snowflake.connector.errors.ProgrammingError):
+        cur.execute(f"PUT file://{csv_path} @~/staged")
+    # With OVERWRITE=TRUE it succeeds.
+    cur.execute(f"PUT file://{csv_path} @~/staged OVERWRITE=TRUE")
+    assert cur.fetchone()[6] == "UPLOADED"
+
+
+def test_get_from_stage(connection, tmp_path):
+    csv_path = tmp_path / "data.csv"
+    _write_csv(csv_path)
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    cur = connection.cursor()
+    cur.execute(f"PUT file://{csv_path} @~/staged")
+    cur.execute(f"GET @~/staged file://{out_dir}")
+    # The connector reports the downloaded file name (stage path stripped).
+    assert cur.fetchall() == [("data.csv", 12, "DOWNLOADED", "")]
+
+    downloaded = out_dir / "data.csv"
+    assert downloaded.read_text() == csv_path.read_text()
+
+
+def test_named_stage_roundtrip(connection, tmp_path):
+    csv_path = tmp_path / "data.csv"
+    _write_csv(csv_path)
+
+    cur = connection.cursor()
+    cur.execute("CREATE STAGE my_stage")
+    cur.execute(f"PUT file://{csv_path} @my_stage")
+    assert cur.fetchone()[6] == "UPLOADED"
+
+    cur.execute("SHOW STAGES")
+    stages = cur.fetchall()
+    assert any(row[0] == "my_stage" for row in stages)
+
+    cur.execute("CREATE OR REPLACE TABLE named_t (a INT, b VARCHAR)")
+    cur.execute("COPY INTO named_t FROM @my_stage FILE_FORMAT = (TYPE = CSV)")
+    assert cur.fetchall() == [(2,)]
+    cur.execute("SELECT * FROM named_t ORDER BY a")
+    assert cur.fetchall() == [(1, "x"), (2, "y")]
+
+    cur.execute("DROP STAGE my_stage")
+    cur.execute("SHOW STAGES")
+    assert not any(row[0] == "my_stage" for row in cur.fetchall())
