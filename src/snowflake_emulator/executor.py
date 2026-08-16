@@ -7,17 +7,21 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from sqlglot import exp
+
 from snowflake_emulator.database import DuckDBManager
 from snowflake_emulator.sessions import SessionContext
 from snowflake_emulator.translator import (
     TranslationError,
     UseStatement,
-    is_query,
     match_use_statement,
     split_statements,
     transpile_to_duckdb,
 )
-from snowflake_emulator.type_mapping import duckdb_type_to_snowflake
+from snowflake_emulator.type_mapping import (
+    duckdb_type_to_snowflake,
+    duckdb_type_to_snowflake_sql_type,
+)
 
 
 class ExecutionError(RuntimeError):
@@ -98,6 +102,8 @@ def execute_sql(
                 for col in description
             ]
             rows = [list(row) for row in cursor.fetchall()]
+            if isinstance(statement, exp.Describe):
+                rows = _convert_describe_types(rows)
         else:
             row_type = [ColumnMeta(name="status", type="text")]
             affected = cursor.fetchone()
@@ -111,6 +117,22 @@ def execute_sql(
         rows=rows,
         message=message,
     )
+
+
+def _convert_describe_types(rows: list[list[Any]]) -> list[list[Any]]:
+    """Convert DuckDB type names in a ``DESCRIBE`` result to Snowflake type names.
+
+    DuckDB's ``DESCRIBE`` returns a ``column_type`` column (index 1) whose values are
+    DuckDB-specific type names. Snowflake's ``DESCRIBE TABLE`` reports Snowflake SQL
+    types in that column, so we rewrite each value in place.
+    """
+    converted: list[list[Any]] = []
+    for row in rows:
+        if len(row) >= 2 and isinstance(row[1], str):
+            row = list(row)
+            row[1] = duckdb_type_to_snowflake_sql_type(row[1])
+        converted.append(row)
+    return converted
 
 
 def _apply_use_statement(

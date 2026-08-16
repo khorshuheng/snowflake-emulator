@@ -68,6 +68,65 @@ def duckdb_type_to_snowflake(duckdb_type: str) -> str:
     return _TYPE_MAP.get(normalized, "text")
 
 
+# DuckDB type name -> Snowflake SQL data type name, as shown in the ``type`` column
+# of ``DESCRIBE TABLE`` output. Unlike the SQL API ``rowType`` names above ("fixed",
+# "text", ...), DESCRIBE reports the actual SQL types a client would see on Snowflake.
+_SQL_TYPE_MAP: dict[str, str] = {
+    "BIGINT": "NUMBER(38,0)",
+    "HUGEINT": "NUMBER(38,0)",
+    "INTEGER": "NUMBER(38,0)",
+    "SMALLINT": "NUMBER(38,0)",
+    "TINYINT": "NUMBER(38,0)",
+    "UBIGINT": "NUMBER(38,0)",
+    "UINTEGER": "NUMBER(38,0)",
+    "USMALLINT": "NUMBER(38,0)",
+    "UTINYINT": "NUMBER(38,0)",
+    "DOUBLE": "FLOAT",
+    "FLOAT": "FLOAT",
+    "REAL": "FLOAT",
+    "BOOLEAN": "BOOLEAN",
+    "VARCHAR": "VARCHAR",
+    "BLOB": "BINARY",
+    "BINARY": "BINARY",
+    "DATE": "DATE",
+    "TIME": "TIME",
+    "TIME WITH TIME ZONE": "TIME",
+    "TIMESTAMP": "TIMESTAMP_NTZ",
+    "TIMESTAMP WITH TIME ZONE": "TIMESTAMP_TZ",
+    "TIMESTAMP_TZ": "TIMESTAMP_TZ",
+    "TIMESTAMP WITH LOCAL TIME ZONE": "TIMESTAMP_LTZ",
+    "TIMESTAMP_LTZ": "TIMESTAMP_LTZ",
+    "INTERVAL": "VARCHAR",
+    "JSON": "VARIANT",
+    "UUID": "VARCHAR",
+    "ENUM": "VARCHAR",
+    "BIT": "VARCHAR",
+}
+
+_DESCRIBE_DECIMAL_RE = re.compile(r"^DECIMAL\((\d+),\s*(\d+)\)$")
+
+
+def duckdb_type_to_snowflake_sql_type(duckdb_type: str) -> str:
+    """Map a DuckDB type name to the Snowflake SQL type shown by ``DESCRIBE TABLE``.
+
+    DuckDB's ``DESCRIBE`` output embeds DuckDB type names (e.g. ``INTEGER``,
+    ``TIMESTAMP WITH TIME ZONE``, ``VARCHAR[]``) in its ``column_type`` column. Snowflake
+    clients expect Snowflake type names instead, so the emulator converts them before
+    returning the result set.
+    """
+    normalized = duckdb_type.upper().strip()
+    if normalized.startswith("DECIMAL"):
+        m = _DESCRIBE_DECIMAL_RE.match(normalized)
+        if m:
+            return f"NUMBER({m.group(1)},{m.group(2)})"
+        return "NUMBER"
+    if normalized.startswith("STRUCT") or normalized.startswith("MAP"):
+        return "OBJECT"
+    if normalized.startswith("LIST") or normalized.startswith("ARRAY") or normalized.endswith("[]"):
+        return "ARRAY"
+    return _SQL_TYPE_MAP.get(normalized, "VARCHAR")
+
+
 _DECIMAL_RE = re.compile(r"^DECIMAL\((\d+),\s*(\d+)\)$")
 
 

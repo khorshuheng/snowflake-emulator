@@ -18,6 +18,30 @@ def test_simple_select(client):
     assert body["resultSetMetaData"]["rowType"][0]["type"] == "fixed"
 
 
+def test_describe_table_returns_snowflake_types(client):
+    stmt = (
+        "CREATE TABLE dt (a INT, b VARCHAR, c DOUBLE, d BOOLEAN, e DATE, "
+        "f TIMESTAMP, g DECIMAL(10,2), h VARCHAR[])"
+    )
+    resp = client.post("/api/v2/statements", json={"statement": stmt})
+    assert resp.status_code == 200
+
+    resp = client.post("/api/v2/statements", json={"statement": "DESCRIBE TABLE dt"})
+    assert resp.status_code == 200
+    body = resp.json()
+    types = {row[0]: row[1] for row in body["data"]}
+    assert types == {
+        "a": "NUMBER(38,0)",
+        "b": "VARCHAR",
+        "c": "FLOAT",
+        "d": "BOOLEAN",
+        "e": "DATE",
+        "f": "TIMESTAMP_NTZ",
+        "g": "NUMBER(10,2)",
+        "h": "ARRAY",
+    }
+
+
 def test_multi_statement_ddl_dml_query(client):
     stmt = (
         "CREATE TABLE t (a INT, b VARCHAR); "
