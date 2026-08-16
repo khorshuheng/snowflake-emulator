@@ -78,6 +78,7 @@ _SQL_TYPE_MAP: dict[str, str] = {
     "SMALLINT": "NUMBER(38,0)",
     "TINYINT": "NUMBER(38,0)",
     "UBIGINT": "NUMBER(38,0)",
+    "UHUGEINT": "NUMBER(38,0)",
     "UINTEGER": "NUMBER(38,0)",
     "USMALLINT": "NUMBER(38,0)",
     "UTINYINT": "NUMBER(38,0)",
@@ -91,7 +92,11 @@ _SQL_TYPE_MAP: dict[str, str] = {
     "DATE": "DATE",
     "TIME": "TIME",
     "TIME WITH TIME ZONE": "TIME",
+    "TIMETZ": "TIME",
     "TIMESTAMP": "TIMESTAMP_NTZ",
+    "TIMESTAMP_S": "TIMESTAMP_NTZ",
+    "TIMESTAMP_MS": "TIMESTAMP_NTZ",
+    "TIMESTAMP_NS": "TIMESTAMP_NTZ",
     "TIMESTAMP WITH TIME ZONE": "TIMESTAMP_TZ",
     "TIMESTAMP_TZ": "TIMESTAMP_TZ",
     "TIMESTAMP WITH LOCAL TIME ZONE": "TIMESTAMP_LTZ",
@@ -115,15 +120,20 @@ def duckdb_type_to_snowflake_sql_type(duckdb_type: str) -> str:
     returning the result set.
     """
     normalized = duckdb_type.upper().strip()
+    # Array detection comes first: DECIMAL(10,2)[] is an array of decimals.
+    if normalized.startswith(("LIST", "ARRAY")):
+        return "ARRAY"
+    if normalized.endswith("[]") or _FIXED_ARRAY_RE.match(normalized):
+        return "ARRAY"
     if normalized.startswith("DECIMAL"):
         m = _DESCRIBE_DECIMAL_RE.match(normalized)
         if m:
             return f"NUMBER({m.group(1)},{m.group(2)})"
         return "NUMBER"
-    if normalized.startswith("STRUCT") or normalized.startswith("MAP"):
+    if normalized.startswith(("STRUCT", "MAP", "UNION")):
         return "OBJECT"
-    if normalized.startswith("LIST") or normalized.startswith("ARRAY") or normalized.endswith("[]"):
-        return "ARRAY"
+    if normalized.startswith("ENUM"):
+        return "VARCHAR"
     return _SQL_TYPE_MAP.get(normalized, "VARCHAR")
 
 

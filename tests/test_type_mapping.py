@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from snowflake_emulator.type_mapping import duckdb_type_to_snowflake, parse_precision_scale
+from snowflake_emulator.type_mapping import (
+    duckdb_type_to_snowflake,
+    duckdb_type_to_snowflake_sql_type,
+    parse_precision_scale,
+)
 
 
 @pytest.mark.parametrize(
@@ -72,6 +76,59 @@ def test_mapping_is_case_insensitive():
     assert duckdb_type_to_snowflake("timestamp with time zone") == "timestamp_tz"
     assert duckdb_type_to_snowflake("float[2]") == "array"
     assert duckdb_type_to_snowflake("  varchar  ") == "text"
+
+
+@pytest.mark.parametrize(
+    ("duckdb_type", "expected"),
+    [
+        # Integers -> Snowflake NUMBER
+        ("INTEGER", "NUMBER(38,0)"),
+        ("BIGINT", "NUMBER(38,0)"),
+        ("UHUGEINT", "NUMBER(38,0)"),
+        ("DECIMAL(10,2)", "NUMBER(10,2)"),
+        ("DECIMAL(38, 0)", "NUMBER(38,0)"),
+        # Floating point
+        ("FLOAT", "FLOAT"),
+        ("DOUBLE", "FLOAT"),
+        # Strings / binary
+        ("VARCHAR", "VARCHAR"),
+        ("BLOB", "BINARY"),
+        ("BIT", "VARCHAR"),
+        # Temporal
+        ("DATE", "DATE"),
+        ("TIME", "TIME"),
+        ("TIME WITH TIME ZONE", "TIME"),
+        ("TIMETZ", "TIME"),
+        ("TIMESTAMP", "TIMESTAMP_NTZ"),
+        ("TIMESTAMP_S", "TIMESTAMP_NTZ"),
+        ("TIMESTAMP_MS", "TIMESTAMP_NTZ"),
+        ("TIMESTAMP_NS", "TIMESTAMP_NTZ"),
+        ("TIMESTAMP WITH TIME ZONE", "TIMESTAMP_TZ"),
+        ("TIMESTAMP_LTZ", "TIMESTAMP_LTZ"),
+        # Semi-structured
+        ("JSON", "VARIANT"),
+        ("STRUCT(a INTEGER)", "OBJECT"),
+        ("MAP(INTEGER, VARCHAR)", "OBJECT"),
+        ("UNION(a INTEGER)", "OBJECT"),
+        # Arrays
+        ("INTEGER[]", "ARRAY"),
+        ("INTEGER[2]", "ARRAY"),
+        ("FLOAT[2]", "ARRAY"),
+        ("DECIMAL(10,2)[]", "ARRAY"),
+        # No native Snowflake equivalent -> VARCHAR
+        ("UUID", "VARCHAR"),
+        ("ENUM('a','b')", "VARCHAR"),
+        ("INTERVAL", "VARCHAR"),
+    ],
+)
+def test_duckdb_type_to_snowflake_sql_type(duckdb_type, expected):
+    assert duckdb_type_to_snowflake_sql_type(duckdb_type) == expected
+
+
+def test_describe_sql_type_mapping_is_case_insensitive():
+    assert duckdb_type_to_snowflake_sql_type("timestamp with time zone") == "TIMESTAMP_TZ"
+    assert duckdb_type_to_snowflake_sql_type("integer[2]") == "ARRAY"
+    assert duckdb_type_to_snowflake_sql_type("  varchar  ") == "VARCHAR"
 
 
 @pytest.mark.parametrize(
