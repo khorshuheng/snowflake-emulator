@@ -37,6 +37,7 @@ def test_config_file_created_with_defaults(isolated_home):
     assert settings_module.settings.default_schema == "PUBLIC"
     assert settings_module.settings.database_path == ":memory:"
     assert settings_module.settings.max_cached_statements == 500
+    assert settings_module.settings.stage_root == ""
 
 
 def test_config_file_values_are_applied(isolated_home):
@@ -59,6 +60,9 @@ database_path = "/tmp/sfemu-test.duckdb"
 
 [statements]
 max_cached_statements = 42
+
+[staging]
+stage_root = "/tmp/sfemu-stages"
 """
     )
 
@@ -71,6 +75,7 @@ max_cached_statements = 42
     assert reloaded.default_schema == "MY_SCHEMA"
     assert reloaded.database_path == "/tmp/sfemu-test.duckdb"
     assert reloaded.max_cached_statements == 42
+    assert reloaded.stage_root == "/tmp/sfemu-stages"
 
 
 def test_env_var_overrides_toml_file(isolated_home, monkeypatch):

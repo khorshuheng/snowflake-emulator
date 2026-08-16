@@ -47,6 +47,11 @@ database_path = ":memory:"
 [statements]
 # Maximum number of cached statement results kept in memory.
 max_cached_statements = 500
+
+[staging]
+# Root directory under which staged files (PUT/GET/COPY INTO @stage) are stored.
+# Leave empty to use an auto-created temporary directory.
+stage_root = ""
 """
 
 
@@ -79,6 +84,11 @@ class StatementSettings(BaseModel):
     max_cached_statements: int = 500
 
 
+class StagingSettings(BaseModel):
+    # Root directory for staged files; empty means an auto-created temp directory.
+    stage_root: str = ""
+
+
 class Settings(BaseSettings):
     """Runtime configuration for the emulator, overridable via TOML file and/or env vars."""
 
@@ -93,6 +103,7 @@ class Settings(BaseSettings):
     snowflake: SnowflakeDefaults = SnowflakeDefaults()
     persistence: PersistenceSettings = PersistenceSettings()
     statements: StatementSettings = StatementSettings()
+    staging: StagingSettings = StagingSettings()
 
     @classmethod
     def settings_customise_sources(
@@ -135,6 +146,10 @@ class Settings(BaseSettings):
     @property
     def max_cached_statements(self) -> int:
         return self.statements.max_cached_statements
+
+    @property
+    def stage_root(self) -> str:
+        return self.staging.stage_root
 
     @property
     def host(self) -> str:

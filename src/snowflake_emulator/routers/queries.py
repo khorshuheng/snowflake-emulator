@@ -52,6 +52,30 @@ def query_request(
 
     get_statement_store().put(result)
 
+    if result.file_transfer is not None:
+        # PUT/GET: hand the connector a local storage location and let its
+        # file-transfer agent copy the files itself (SnowflakeLocalStorageClient).
+        transfer = result.file_transfer
+        data: dict[str, Any] = {
+            "command": transfer.kind,
+            "queryId": result.handle,
+            "sqlState": "00000",
+            "src_locations": transfer.src_locations,
+            "stageInfo": {
+                "locationType": "LOCAL_FS",
+                "location": transfer.stage_location,
+                "creds": {},
+            },
+            "parallel": 4,
+            "overwrite": transfer.overwrite,
+            "autoCompress": False,
+            "sourceCompression": "auto_detect",
+            "threshold": 67108864,
+        }
+        if transfer.kind == "DOWNLOAD" and transfer.local_location:
+            data["localLocation"] = transfer.local_location
+        return {"success": True, "message": None, "data": data}
+
     rowtype = [column_wire_metadata(col) for col in result.row_type]
     rowset = encode_rows(result.rows, result.row_type)
 
