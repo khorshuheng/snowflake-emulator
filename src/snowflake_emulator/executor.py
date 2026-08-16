@@ -7,6 +7,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from sqlglot import exp
+
 from snowflake_emulator.database import DuckDBManager
 from snowflake_emulator.sessions import SessionContext
 from snowflake_emulator.translator import (
@@ -17,7 +19,7 @@ from snowflake_emulator.translator import (
     split_statements,
     transpile_to_duckdb,
 )
-from snowflake_emulator.type_mapping import duckdb_type_to_snowflake
+from snowflake_emulator.type_mapping import duckdb_type_to_snowflake, duckdb_type_to_snowflake_sql
 
 
 class ExecutionError(RuntimeError):
@@ -98,6 +100,8 @@ def execute_sql(
                 for col in description
             ]
             rows = [list(row) for row in cursor.fetchall()]
+            if isinstance(statement, exp.Describe):
+                rows = _translate_describe_rows(row_type, rows)
         else:
             row_type = [ColumnMeta(name="status", type="text")]
             affected = cursor.fetchone()
@@ -111,6 +115,25 @@ def execute_sql(
         rows=rows,
         message=message,
     )
+
+
+def _translate_describe_rows(
+    row_type: list[ColumnMeta], rows: list[list[Any]]
+) -> list[list[Any]]:
+    """Rewrite DuckDB's ``column_type`` values in ``DESCRIBE`` output as Snowflake types.
+
+    DuckDB's ``DESCRIBE <table>`` reports its own native type names (e.g. ``BIGINT``,
+    ``VARCHAR``) in a ``column_type`` column. Snowflake clients expect Snowflake type
+    names there instead (e.g. ``NUMBER(38,0)``, ``VARCHAR(16777216)``).
+    """
+    try:
+        type_idx = next(i for i, col in enumerate(row_type) if col.name == "column_type")
+    except StopIteration:
+        return rows
+
+    for row in rows:
+        row[type_idx] = duckdb_type_to_snowflake_sql(str(row[type_idx]))
+    return rows
 
 
 def _apply_use_statement(
