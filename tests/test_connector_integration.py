@@ -109,6 +109,17 @@ def test_ddl_dml_and_typed_roundtrip(connection):
     ]
 
 
+def test_describe_table_returns_snowflake_types(connection):
+    cur = connection.cursor()
+    cur.execute("CREATE OR REPLACE TABLE desc_t (a INT, b VARCHAR, c TIMESTAMP)")
+    cur.execute("DESCRIBE TABLE desc_t")
+    rows = cur.fetchall()
+    assert [r[0] for r in rows] == ["a", "b", "c"]
+    assert rows[0][1] == "NUMBER(38,0)"
+    assert rows[1][1] == "VARCHAR"
+    assert rows[2][1] == "TIMESTAMP_NTZ"
+
+
 def test_snowflake_qualify_and_ilike(connection):
     cur = connection.cursor()
     cur.execute("CREATE OR REPLACE TABLE u (name VARCHAR, grp INT, val INT)")
