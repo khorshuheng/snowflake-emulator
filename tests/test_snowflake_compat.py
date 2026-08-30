@@ -118,6 +118,64 @@ def test_information_schema_tables_lists_views(client):
     ]
 
 
+def test_show_terse_schemas_snowflake_shape(client):
+    resp = _post(client, "SHOW TERSE SCHEMAS IN DATABASE EMULATOR_DB")
+    assert resp.status_code == 200
+    body = resp.json()
+    names = [c["name"] for c in body["resultSetMetaData"]["rowType"]]
+    assert "name" in names  # dbt reads row["name"] from this result
+    idx = {n: i for i, n in enumerate(names)}
+    assert any(r[idx["name"]] == "PUBLIC" and r[idx["kind"]] == "SCHEMA" for r in body["data"])
+
+
+def test_show_objects_snowflake_shape(client):
+    assert _post(client, "CREATE TABLE obj_t (a INT)").status_code == 200
+    resp = _post(client, "SHOW OBJECTS IN EMULATOR_DB.PUBLIC")
+    assert resp.status_code == 200
+    body = resp.json()
+    names = [c["name"] for c in body["resultSetMetaData"]["rowType"]]
+    for required in ("database_name", "schema_name", "name", "kind", "is_dynamic", "is_iceberg"):
+        assert required in names  # columns dbt selects from SHOW OBJECTS
+    idx = {n: i for i, n in enumerate(names)}
+    assert any(
+        r[idx["name"]] == "OBJ_T" and r[idx["kind"]] == "TABLE" for r in body["data"]
+    )
+
+
+def test_show_user_functions_returns_empty_shape(client):
+    resp = _post(client, "SHOW USER FUNCTIONS IN EMULATOR_DB.PUBLIC")
+    assert resp.status_code == 200
+    body = resp.json()
+    names = [c["name"] for c in body["resultSetMetaData"]["rowType"]]
+    assert "name" in names and "catalog_name" in names and "is_builtin" in names
+    assert body["data"] == []
+
+
+def test_describe_table_snowflake_column_names(client):
+    assert _post(client, "CREATE TABLE desc_s (id INT, name VARCHAR)").status_code == 200
+    resp = _post(client, "DESCRIBE TABLE desc_s")
+    assert resp.status_code == 200
+    body = resp.json()
+    names = [c["name"] for c in body["resultSetMetaData"]["rowType"]]
+    assert names[:2] == ["name", "type"]  # dbt reads row["name"]/row["type"]
+    rows = body["data"]
+    types = {r[0]: r[1] for r in rows}
+    assert set(types) == {"ID", "NAME"}
+    assert types["ID"] == "NUMBER(38,0)"
+    assert types["NAME"] == "VARCHAR"
+
+
+def test_insert_overwrite_clears_then_inserts(client):
+    stmt = (
+        "CREATE TABLE iow (id INT, v INT); "
+        "INSERT INTO iow VALUES (1, 10); "
+        "INSERT OVERWRITE INTO iow (id, v) VALUES (2, 20)"
+    )
+    assert _post(client, stmt).status_code == 200
+    resp = _post(client, "SELECT id, v FROM iow ORDER BY id")
+    assert resp.json()["data"] == [[2, 20]]
+
+
 def test_seq_nextval_in_select_and_default(client):
     assert _post(client, "CREATE SEQUENCE compat_seq").status_code == 200
 

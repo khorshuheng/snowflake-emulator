@@ -428,6 +428,18 @@ def transpile_to_duckdb(statement: exp.Expression) -> str:
         statement = statement.transform(_uppercase_unquoted_identifiers)
         statement = statement.transform(_rewrite_information_schema)
         statement = statement.transform(_rewrite_snowflake_specifics)
+
+        # Snowflake's ``INSERT OVERWRITE`` clears the table then inserts; DuckDB has
+        # no such statement (it would be mis-serialized as ``INSERT OVERWRITE TABLE``).
+        if isinstance(statement, exp.Insert) and statement.args.get("overwrite"):
+            statement = statement.copy()
+            statement.set("overwrite", False)
+            target = statement.args.get("this")
+            table = target.this if isinstance(target, exp.Schema) else target
+            if isinstance(table, exp.Table):
+                delete = exp.Delete(this=table.copy())
+                return f"{delete.sql(dialect=WRITE_DIALECT)};\n{statement.sql(dialect=WRITE_DIALECT)}"
+
         if isinstance(statement, exp.Create) and statement.args.get("kind") == "TABLE":
             pre_statements, create = _rewrite_autoincrement_create(statement)
             if pre_statements:

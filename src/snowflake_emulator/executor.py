@@ -127,6 +127,16 @@ def execute_sql(
             row_type, rows = _execute_stage_ddl(manager, session, statement, stage_ddl)
             continue
 
+        show_result = _execute_snowflake_show(cursor, session, statement)
+        if show_result is not None:
+            row_type, rows = show_result
+            continue
+
+        describe_result = _execute_snowflake_describe(cursor, session, statement)
+        if describe_result is not None:
+            row_type, rows = describe_result
+            continue
+
         try:
             duckdb_sql = transpile_to_duckdb(statement)
         except TranslationError as exc:
@@ -191,6 +201,223 @@ def _convert_describe_types(rows: list[list[Any]]) -> list[list[Any]]:
             row[1] = duckdb_type_to_snowflake_sql_type(row[1])
         converted.append(row)
     return converted
+
+
+def _result_columns(cursor: Any) -> tuple[list[ColumnMeta], list[list[Any]]]:
+    """Build ``(row_type, rows)`` from a cursor that just executed a query."""
+    description = cursor.description
+    row_type = [
+        ColumnMeta(
+            name=col[0],
+            type=duckdb_type_to_snowflake(str(col[1])),
+            duckdb_type=str(col[1]),
+        )
+        for col in description
+    ]
+    rows = [list(row) for row in cursor.fetchall()]
+    return row_type, rows
+
+
+def _show_scope(statement: exp.Show, session: SessionContext) -> tuple[str, str] | None:
+    """Extract the ``(database, schema)`` a scoped ``SHOW ... IN ...`` targets.
+
+    ``SHOW SCHEMAS IN DATABASE db`` targets a database (schema ``None``);
+    ``SHOW OBJECTS IN db.schema`` targets a schema. Returns ``None`` for unscoped
+    forms (``SHOW TABLES``), which are left to DuckDB's native SHOW.
+    """
+    scope = statement.args.get("scope")
+    kind = statement.args.get("scope_kind")
+    if not isinstance(scope, exp.Table):
+        return None
+    if kind == "DATABASE":
+        return scope.name, None
+    if kind == "SCHEMA":
+        db = scope.args.get("db")
+        database = db.name if isinstance(db, exp.Identifier) else session.database
+        return database, scope.name
+    return None
+
+
+def _show_limit(statement: exp.Show) -> int | None:
+    """Extract the ``LIMIT n`` from a SHOW statement, if any."""
+    limit = statement.args.get("limit")
+    if isinstance(limit, exp.Limit):
+        expr = limit.args.get("expression")
+        if isinstance(expr, exp.Literal):
+            try:
+                return int(expr.this)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _escape_like(text: str) -> str:
+    """Escape LIKE wildcards so a ``STARTS WITH`` match is a plain prefix."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _name_prefix_filter(column: str, prefix: str | None) -> str:
+    """Return a WHERE fragment restricting ``column`` to a ``STARTS WITH`` prefix."""
+    if not prefix:
+        return ""
+    escaped = _escape_like(prefix).replace("'", "''")
+    return f" AND {column} LIKE '{escaped}%' ESCAPE '\\'"
+
+
+def _execute_snowflake_show(
+    cursor: Any,
+    session: SessionContext,
+    statement: exp.Expression,
+) -> tuple[list[ColumnMeta], list[list[Any]]] | None:
+    """Execute Snowflake ``SHOW ... IN ...`` statements with Snowflake-shaped output.
+
+    DuckDB's native SHOW returns its own column names (``schema_name``, ...), but
+    Snowflake tools such as dbt expect ``name``/``kind``/``database_name``/...
+    These are generated from DuckDB's catalog introspection functions instead.
+    Returns ``None`` for SHOW forms this handler doesn't own.
+    """
+    if isinstance(statement, exp.Command):
+        text = (statement.args.get("expression") or "").upper()
+        if any(kind in text for kind in ("USER FUNCTIONS IN", "ALL FUNCTIONS IN", "EXTERNAL FUNCTIONS IN")):
+            # No user functions are emulated; return the Snowflake SHOW FUNCTIONS
+            # shape with zero rows (dbt filters ``is_builtin = 'N'``).
+            cursor.execute(
+                """
+                SELECT
+                    NULL::TIMESTAMP AS created_on,
+                    NULL::VARCHAR AS name,
+                    NULL::VARCHAR AS schema_name,
+                    NULL::VARCHAR AS catalog_name,
+                    'N'::VARCHAR AS is_builtin,
+                    'N'::VARCHAR AS is_secure,
+                    NULL::VARCHAR AS arguments,
+                    NULL::VARCHAR AS result_type,
+                    NULL::VARCHAR AS description
+                WHERE FALSE
+                """
+            )
+            return _result_columns(cursor)
+        return None
+    if not isinstance(statement, exp.Show):
+        return None
+    obj = str(statement.args.get("this") or "").upper()
+    scope = _show_scope(statement, session)
+    if scope is None:
+        return None
+    database, schema = scope
+
+    limit = _show_limit(statement)
+    prefix = statement.args.get("starts_with")
+    prefix = prefix.this if isinstance(prefix, exp.Literal) else None
+
+    if obj == "SCHEMAS":
+        sql = f"""
+            SELECT
+                NULL::TIMESTAMP AS created_on,
+                schema_name AS name,
+                'SCHEMA' AS kind,
+                database_name AS database_name,
+                schema_name AS schema_name,
+                comment AS comment,
+                NULL::VARCHAR AS options,
+                NULL::VARCHAR AS owner,
+                NULL::BIGINT AS retention_time
+            FROM duckdb_schemas()
+            WHERE lower(database_name) = lower('{database}')
+              AND lower(schema_name) != 'main'
+              {_name_prefix_filter('schema_name', prefix)}
+            ORDER BY schema_name
+        """
+    else:
+        selects: list[str] = []
+        if obj in ("TABLES", "OBJECTS"):
+            selects.append(f"""
+                SELECT
+                    NULL::TIMESTAMP AS created_on,
+                    table_name AS name,
+                    'TABLE' AS kind,
+                    database_name AS database_name,
+                    schema_name AS schema_name,
+                    comment AS comment,
+                    'N' AS is_dynamic,
+                    'N' AS is_iceberg
+                FROM duckdb_tables()
+                WHERE lower(database_name) = lower('{database}')
+                  AND lower(schema_name) = lower('{schema}')
+                  {_name_prefix_filter('table_name', prefix)}
+            """)
+        if obj in ("VIEWS", "OBJECTS"):
+            selects.append(f"""
+                SELECT
+                    NULL::TIMESTAMP AS created_on,
+                    view_name AS name,
+                    'VIEW' AS kind,
+                    database_name AS database_name,
+                    schema_name AS schema_name,
+                    comment AS comment,
+                    'N' AS is_dynamic,
+                    'N' AS is_iceberg
+                FROM duckdb_views()
+                WHERE lower(database_name) = lower('{database}')
+                  AND lower(schema_name) = lower('{schema}')
+                  {_name_prefix_filter('view_name', prefix)}
+            """)
+        if not selects:
+            return None
+        sql = " UNION ALL ".join(selects) + " ORDER BY name"
+
+    if limit is not None:
+        sql += f" LIMIT {limit}"
+    cursor.execute(sql)
+    return _result_columns(cursor)
+
+
+def _execute_snowflake_describe(
+    cursor: Any,
+    session: SessionContext,
+    statement: exp.Expression,
+) -> tuple[list[ColumnMeta], list[list[Any]]] | None:
+    """Execute ``DESCRIBE TABLE`` with Snowflake's output shape.
+
+    dbt's ``get_columns_in_relation`` reads the ``name``/``type`` columns of the
+    DESCRIBE result; DuckDB's own DESCRIBE returns ``column_name``/``column_type``.
+    """
+    if not (isinstance(statement, exp.Describe) and statement.args.get("kind") == "TABLE"):
+        return None
+    table = statement.args.get("this")
+    if not isinstance(table, exp.Table):
+        return None
+    db_ident = table.args.get("catalog")
+    schema_ident = table.args.get("db")
+    database = db_ident.name if isinstance(db_ident, exp.Identifier) else session.database
+    schema = schema_ident.name if isinstance(schema_ident, exp.Identifier) else session.schema
+    table_name = table.name
+
+    cursor.execute(
+        f"""
+        SELECT
+            column_name AS "name",
+            data_type AS "type",
+            'COLUMN' AS "kind",
+            CASE WHEN is_nullable THEN 'Y' ELSE 'N' END AS "null?",
+            column_default AS "default",
+            NULL::VARCHAR AS "primary key",
+            NULL::VARCHAR AS "unique key",
+            NULL::VARCHAR AS "check",
+            NULL::VARCHAR AS "expression",
+            comment AS "comment",
+            NULL::VARCHAR AS "policy name"
+        FROM duckdb_columns()
+        WHERE lower(database_name) = lower('{database}')
+          AND lower(schema_name) = lower('{schema}')
+          AND lower(table_name) = lower('{table_name}')
+        ORDER BY column_index
+        """
+    )
+    row_type, rows = _result_columns(cursor)
+    rows = _convert_describe_types(rows)
+    return row_type, rows
+
 
 
 def _execute_stage_command(
