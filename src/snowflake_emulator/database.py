@@ -117,6 +117,21 @@ class DuckDBManager:
         """Return an isolated cursor so concurrent requests don't clobber each other's state."""
         return self._connection.cursor()
 
+    def has_database(self, database: str) -> bool:
+        """Return True if a Snowflake database is already attached as a catalog."""
+        return database.lower() in self._attached_catalogs
+
+    def replace_database(self, database: str) -> None:
+        """Recreate a Snowflake database (``CREATE OR REPLACE DATABASE``)."""
+        db_ident = _quote_ident(database)
+        with self._lock:
+            if self.has_database(database):
+                self._connection.execute(f"DETACH {db_ident}")
+                self._attached_catalogs.discard(database.lower())
+        # Re-attach (with INFORMATION_SCHEMA + default PUBLIC schema) via the
+        # normal namespace path.
+        self.ensure_namespace(database, "PUBLIC")
+
 
 _manager: DuckDBManager | None = None
 _manager_lock = threading.Lock()

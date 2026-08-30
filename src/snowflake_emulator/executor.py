@@ -127,6 +127,11 @@ def execute_sql(
             row_type, rows = _execute_stage_ddl(manager, session, statement, stage_ddl)
             continue
 
+        create_db = _execute_create_database(manager, statement)
+        if create_db is not None:
+            row_type, rows = create_db
+            continue
+
         show_result = _execute_snowflake_show(cursor, session, statement)
         if show_result is not None:
             row_type, rows = show_result
@@ -161,17 +166,23 @@ def execute_sql(
 
         if cursor.description:
             description = cursor.description
-            row_type = [
-                ColumnMeta(
-                    name=col[0],
-                    type=duckdb_type_to_snowflake(str(col[1])),
-                    duckdb_type=str(col[1]),
-                )
-                for col in description
-            ]
-            rows = [list(row) for row in cursor.fetchall()]
-            if isinstance(statement, exp.Describe):
-                rows = _convert_describe_types(rows)
+            if _is_ddl_status_artifact(statement, description):
+                # DuckDB DDL (CREATE/DROP/ALTER) reports a bare Count/Success column;
+                # Snowflake returns a plain status, so report it that way too.
+                row_type = [ColumnMeta(name="status", type="text")]
+                rows = [["Statement executed successfully."]]
+            else:
+                row_type = [
+                    ColumnMeta(
+                        name=col[0],
+                        type=duckdb_type_to_snowflake(str(col[1])),
+                        duckdb_type=str(col[1]),
+                    )
+                    for col in description
+                ]
+                rows = [list(row) for row in cursor.fetchall()]
+                if isinstance(statement, exp.Describe):
+                    rows = _convert_describe_types(rows)
         else:
             row_type = [ColumnMeta(name="status", type="text")]
             affected = cursor.fetchone()
@@ -417,6 +428,46 @@ def _execute_snowflake_describe(
     row_type, rows = _result_columns(cursor)
     rows = _convert_describe_types(rows)
     return row_type, rows
+
+
+def _is_ddl_status_artifact(statement: exp.Expression, description: list[Any]) -> bool:
+    """Return True when DuckDB reports DDL as a single ``Count``/``Success`` column.
+
+    DuckDB's Python API reports CREATE/DROP/ALTER as a one-column result named
+    ``Count`` or ``Success`` with no rows. Snowflake returns a plain status instead,
+    so those statements are routed to the standard status result.
+    """
+    if len(description) != 1 or description[0][0] not in ("Count", "Success"):
+        return False
+    return isinstance(statement, (exp.Create, exp.Drop, exp.Alter))
+
+
+def _execute_create_database(
+    manager: DuckDBManager,
+    statement: exp.Expression,
+) -> tuple[list[ColumnMeta], list[list[Any]]] | None:
+    """Execute ``CREATE DATABASE`` by attaching a fresh catalog (DuckDB has no
+    ``CREATE DATABASE``). Returns ``None`` for non-database CREATE statements.
+    """
+    if not (isinstance(statement, exp.Create) and str(statement.args.get("kind") or "").upper() == "DATABASE"):
+        return None
+    this = statement.args.get("this")
+    ident = this.this if isinstance(this, exp.Table) else this
+    if not isinstance(ident, exp.Identifier) or not ident.name:
+        return None
+    # Unquoted identifiers are uppercased (Snowflake semantics); quoted preserved.
+    name = ident.name if ident.args.get("quoted") else ident.name.upper()
+
+    if statement.args.get("replace"):
+        manager.replace_database(name)
+    else:
+        if not statement.args.get("exists") and manager.has_database(name):
+            raise ExecutionError(f"Database {name} already exists.")
+        manager.ensure_namespace(name, "PUBLIC")
+    return (
+        [ColumnMeta(name="status", type="text")],
+        [[f"Database {name} successfully created."]],
+    )
 
 
 

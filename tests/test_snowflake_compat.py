@@ -176,6 +176,51 @@ def test_insert_overwrite_clears_then_inserts(client):
     assert resp.json()["data"] == [[2, 20]]
 
 
+def test_create_database(client):
+    resp = _post(client, "CREATE DATABASE sales_db")
+    assert resp.status_code == 200
+    assert resp.json()["data"] == [["Database SALES_DB successfully created."]]
+    # A new database ships with a default PUBLIC schema, visible via INFORMATION_SCHEMA.
+    resp = _post(
+        client,
+        "SELECT COUNT(*) AS n FROM SALES_DB.INFORMATION_SCHEMA.SCHEMATA "
+        "WHERE SCHEMA_NAME = 'PUBLIC'",
+    )
+    assert resp.json()["data"] == [[1]]
+
+
+def test_create_database_if_not_exists_and_duplicate(client):
+    assert _post(client, "CREATE DATABASE dup_db").status_code == 200
+    assert _post(client, "CREATE DATABASE IF NOT EXISTS dup_db").status_code == 200
+    resp = _post(client, "CREATE DATABASE dup_db")
+    assert resp.status_code == 422
+    assert "already exists" in resp.json()["detail"]["message"]
+
+
+def test_create_or_replace_database(client):
+    assert _post(client, "CREATE DATABASE repl_db").status_code == 200
+    assert _post(client, "CREATE TABLE REPL_DB.PUBLIC.t1 (a INT)").status_code == 200
+    assert _post(client, "CREATE OR REPLACE DATABASE repl_db").status_code == 200
+    # Replacing the database drops its previous contents.
+    resp = _post(
+        client,
+        "SELECT COUNT(*) AS n FROM REPL_DB.INFORMATION_SCHEMA.TABLES "
+        "WHERE TABLE_SCHEMA = 'PUBLIC' AND TABLE_NAME = 'T1'",
+    )
+    assert resp.json()["data"] == [[0]]
+
+
+def test_ddl_returns_status_shape(client):
+    # DuckDB reports DDL as a bare Count/Success column; Snowflake returns a status.
+    assert _post(client, "CREATE TABLE ddl_t (a INT)").status_code == 200
+    resp = _post(client, "CREATE SCHEMA ddl_s")
+    assert [c["name"] for c in resp.json()["resultSetMetaData"]["rowType"]] == ["status"]
+    resp = _post(client, "CREATE SEQUENCE ddl_sq")
+    assert [c["name"] for c in resp.json()["resultSetMetaData"]["rowType"]] == ["status"]
+    resp = _post(client, "DROP TABLE ddl_t")
+    assert [c["name"] for c in resp.json()["resultSetMetaData"]["rowType"]] == ["status"]
+
+
 def test_seq_nextval_in_select_and_default(client):
     assert _post(client, "CREATE SEQUENCE compat_seq").status_code == 200
 
