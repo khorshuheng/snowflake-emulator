@@ -49,6 +49,15 @@ def query_request(
             "code": "100132",
             "data": {"sqlState": "42000", "queryId": str(uuid.uuid4())},
         }
+    except Exception as exc:  # noqa: BLE001 - surface any bug as a Snowflake-shaped error
+        # Without this, an unexpected exception (e.g. an invalid identifier) escapes
+        # as an HTTP 500 and clients retry indefinitely instead of failing fast.
+        return {
+            "success": False,
+            "message": str(exc),
+            "code": "100132",
+            "data": {"sqlState": "42000", "queryId": str(uuid.uuid4())},
+        }
 
     get_statement_store().put(result)
 

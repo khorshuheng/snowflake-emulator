@@ -18,6 +18,7 @@ import threading
 import duckdb
 
 from snowflake_emulator.settings import settings
+from snowflake_emulator.translator import INFORMATION_SCHEMA_SCHEMA
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 
@@ -49,7 +50,68 @@ class DuckDBManager:
             if database.lower() not in self._attached_catalogs:
                 self._connection.execute(f"ATTACH ':memory:' AS {db_ident}")
                 self._attached_catalogs.add(database.lower())
+                self._ensure_information_schema(db_ident, database)
             self._connection.execute(f"CREATE SCHEMA IF NOT EXISTS {db_ident}.{schema_ident}")
+
+    def _ensure_information_schema(self, db_ident: str, database: str) -> None:
+        """Create a Snowflake-compatible ``INFORMATION_SCHEMA`` in an attached catalog.
+
+        DuckDB only exposes an ``information_schema`` schema in its ``system`` catalog,
+        so attached catalogs (one per Snowflake database) get their own schema with
+        ``tables``/``schemata`` views backed by DuckDB's catalog introspection
+        functions. Column names are uppercase to match Snowflake's
+        ``INFORMATION_SCHEMA``; DuckDB's case-insensitive unquoted identifiers make
+        ``TABLE_SCHEMA``/``SCHEMA_NAME``/``CREATED``/``LAST_ALTERED`` resolve to them.
+        ``CREATED``/``LAST_ALTERED`` are synthesized since DuckDB tracks neither
+        (schemachange only uses them for an existence check + log line). ``tables``
+        unions base tables (``duckdb_tables()``) with views (``duckdb_views()``) so
+        ``TABLE_TYPE`` is ``BASE TABLE`` or ``VIEW`` as on Snowflake.
+        """
+        schema = INFORMATION_SCHEMA_SCHEMA
+        self._connection.execute(f"CREATE SCHEMA IF NOT EXISTS {db_ident}.{schema}")
+        self._connection.execute(
+            f"""
+            CREATE OR REPLACE VIEW {db_ident}.{schema}.schemata AS
+            SELECT
+                database_name AS CATALOG_NAME,
+                schema_name AS SCHEMA_NAME,
+                NULL::VARCHAR AS SCHEMA_OWNER,
+                NULL::TIMESTAMP AS CREATED,
+                NULL::TIMESTAMP AS LAST_ALTERED
+            FROM duckdb_schemas()
+            WHERE database_name = '{database}'
+            """
+        )
+        self._connection.execute(
+            f"""
+            CREATE OR REPLACE VIEW {db_ident}.{schema}.tables AS
+            SELECT
+                database_name AS TABLE_CATALOG,
+                schema_name AS TABLE_SCHEMA,
+                table_name AS TABLE_NAME,
+                'BASE TABLE'::VARCHAR AS TABLE_TYPE,
+                NULL::TIMESTAMP AS CREATED,
+                NULL::TIMESTAMP AS LAST_ALTERED,
+                comment AS COMMENT,
+                NULL::BIGINT AS ROW_COUNT,
+                estimated_size AS BYTES
+            FROM duckdb_tables()
+            WHERE database_name = '{database}'
+            UNION ALL
+            SELECT
+                database_name AS TABLE_CATALOG,
+                schema_name AS TABLE_SCHEMA,
+                view_name AS TABLE_NAME,
+                'VIEW'::VARCHAR AS TABLE_TYPE,
+                NULL::TIMESTAMP AS CREATED,
+                NULL::TIMESTAMP AS LAST_ALTERED,
+                comment AS COMMENT,
+                NULL::BIGINT AS ROW_COUNT,
+                NULL::BIGINT AS BYTES
+            FROM duckdb_views()
+            WHERE database_name = '{database}'
+            """
+        )
 
     def cursor(self) -> duckdb.DuckDBPyConnection:
         """Return an isolated cursor so concurrent requests don't clobber each other's state."""

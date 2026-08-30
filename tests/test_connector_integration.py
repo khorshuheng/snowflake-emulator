@@ -84,9 +84,8 @@ def test_connect_and_select_literal(connection):
     cur = connection.cursor()
     cur.execute("SELECT 1 AS x")
     assert cur.fetchall() == [(1,)]
-    # Note: unlike real Snowflake, the emulator does not uppercase unquoted
-    # identifiers (DuckDB preserves case as written).
-    assert cur.description[0].name == "x"
+    # Unquoted identifiers are uppercased, matching real Snowflake.
+    assert cur.description[0].name == "X"
 
 
 def test_ddl_dml_and_typed_roundtrip(connection):
@@ -116,7 +115,7 @@ def test_describe_table_returns_snowflake_types(connection):
     cur.execute("CREATE OR REPLACE TABLE desc_t (a INT, b VARCHAR, c TIMESTAMP)")
     cur.execute("DESCRIBE TABLE desc_t")
     rows = cur.fetchall()
-    assert [r[0] for r in rows] == ["a", "b", "c"]
+    assert [r[0] for r in rows] == ["A", "B", "C"]
     assert rows[0][1] == "NUMBER(38,0)"
     assert rows[1][1] == "VARCHAR"
     assert rows[2][1] == "TIMESTAMP_NTZ"
@@ -187,7 +186,7 @@ def test_dict_cursor(connection):
     connection.cursor().execute("INSERT INTO dictt VALUES (1, 'x')")
     dict_cursor = connection.cursor(snowflake.connector.DictCursor)
     dict_cursor.execute("SELECT * FROM dictt")
-    assert dict_cursor.fetchall() == [{"a": 1, "b": "x"}]
+    assert dict_cursor.fetchall() == [{"A": 1, "B": "x"}]
 
 
 def test_use_database_updates_session(connection):

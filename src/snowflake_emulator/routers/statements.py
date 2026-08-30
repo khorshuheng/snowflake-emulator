@@ -64,6 +64,11 @@ def submit_statement(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail={"message": str(exc), "sqlState": "42000", "code": "100132"},
         ) from exc
+    except Exception as exc:  # noqa: BLE001 - surface any bug as a Snowflake-shaped error
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"message": str(exc), "sqlState": "42000", "code": "100132"},
+        ) from exc
 
     get_statement_store().put(result)
     return _to_response(result)

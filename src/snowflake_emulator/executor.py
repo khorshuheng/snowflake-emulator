@@ -30,6 +30,8 @@ from snowflake_emulator.stages import (
 from snowflake_emulator.translator import (
     TranslationError,
     UseStatement,
+    is_alter_session,
+    is_transaction_control,
     match_use_statement,
     split_statements,
     transpile_to_duckdb,
@@ -103,9 +105,19 @@ def execute_sql(
     message = "Statement executed successfully."
 
     for statement in statements:
-        use_stmt = match_use_statement(statement.sql(dialect="snowflake"))
+        stmt_sql = statement.sql(dialect="snowflake")
+
+        use_stmt = match_use_statement(stmt_sql)
         if use_stmt is not None:
             _apply_use_statement(manager, session, cursor, use_stmt)
+            row_type, rows = [], []
+            message = "Statement executed successfully."
+            continue
+
+        if is_alter_session(stmt_sql) or is_transaction_control(statement):
+            # ALTER SESSION SET/UNSET <param> and BEGIN/COMMIT/ROLLBACK have no
+            # meaning under the emulator's autocommit execution model; accept them
+            # as no-ops (schemachange sets QUERY_TAG and commits around every script).
             row_type, rows = [], []
             message = "Statement executed successfully."
             continue

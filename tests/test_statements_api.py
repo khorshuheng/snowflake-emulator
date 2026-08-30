@@ -16,7 +16,7 @@ def test_simple_select(client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["data"] == [[1]]
-    assert body["resultSetMetaData"]["rowType"][0]["name"] == "x"
+    assert body["resultSetMetaData"]["rowType"][0]["name"] == "X"
     assert body["resultSetMetaData"]["rowType"][0]["type"] == "fixed"
 
 
@@ -33,14 +33,14 @@ def test_describe_table_returns_snowflake_types(client):
     body = resp.json()
     types = {row[0]: row[1] for row in body["data"]}
     assert types == {
-        "a": "NUMBER(38,0)",
-        "b": "VARCHAR",
-        "c": "FLOAT",
-        "d": "BOOLEAN",
-        "e": "DATE",
-        "f": "TIMESTAMP_NTZ",
-        "g": "NUMBER(10,2)",
-        "h": "ARRAY",
+        "A": "NUMBER(38,0)",
+        "B": "VARCHAR",
+        "C": "FLOAT",
+        "D": "BOOLEAN",
+        "E": "DATE",
+        "F": "TIMESTAMP_NTZ",
+        "G": "NUMBER(10,2)",
+        "H": "ARRAY",
     }
 
 
