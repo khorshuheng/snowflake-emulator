@@ -88,6 +88,15 @@ def test_connect_and_select_literal(connection):
     assert cur.description[0].name == "X"
 
 
+def test_current_version_is_numeric_snowflake_version(connection):
+    cur = connection.cursor()
+    cur.execute("SELECT CURRENT_VERSION()")
+    assert cur.fetchall() == [("8.23.1",)]
+    # The connector's own version probe (consumed by e.g. snowflake-sqlalchemy)
+    # must parse cleanly as a dotted-numeric version, not DuckDB's "v1.5.5".
+    assert connection.snowflake_version == "8.23.1"
+
+
 def test_ddl_dml_and_typed_roundtrip(connection):
     cur = connection.cursor()
     cur.execute(

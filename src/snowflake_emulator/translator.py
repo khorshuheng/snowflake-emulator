@@ -17,6 +17,12 @@ WRITE_DIALECT = "duckdb"
 # kept uppercase so it matches the emulator's Snowflake-style identifier casing.
 INFORMATION_SCHEMA_SCHEMA = "SF_INFORMATION_SCHEMA"
 
+# Snowflake's ``CURRENT_VERSION()`` reports the server's own release version. DuckDB's
+# ``VERSION()`` returns ``v1.5.5`` (with a leading ``v``), which breaks clients such as
+# snowflake-sqlalchemy that parse each dot-separated component as an ``int``. Answer
+# with a Snowflake-compatible dotted-numeric version instead.
+EMULATED_SNOWFLAKE_VERSION = "8.23.1"
+
 _USE_RE = re.compile(
     r"^\s*USE\s+(DATABASE|SCHEMA|WAREHOUSE|ROLE)\s+(.+?)\s*;?\s*$",
     re.IGNORECASE,
@@ -336,6 +342,10 @@ def _rewrite_information_schema(node: exp.Expression) -> exp.Expression:
 
 def _rewrite_snowflake_specifics(node: exp.Expression) -> exp.Expression:
     """Rewrite Snowflake nodes that sqlglot can't fully transpile to DuckDB."""
+    # ``CURRENT_VERSION()`` -> a Snowflake-style dotted-numeric version literal.
+    if isinstance(node, exp.CurrentVersion):
+        return exp.Literal.string(EMULATED_SNOWFLAKE_VERSION)
+
     # ``LATERAL FLATTEN(input => X)`` -> DuckDB json_each-based lateral subquery.
     if (
         isinstance(node, exp.Lateral)

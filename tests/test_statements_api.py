@@ -20,6 +20,14 @@ def test_simple_select(client):
     assert body["resultSetMetaData"]["rowType"][0]["type"] == "fixed"
 
 
+def test_current_version_returns_numeric_version(client):
+    resp = client.post("/api/v2/statements", json={"statement": "SELECT CURRENT_VERSION()"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["data"] == [["8.23.1"]]
+    assert body["resultSetMetaData"]["rowType"][0]["type"] == "text"
+
+
 def test_describe_table_returns_snowflake_types(client):
     stmt = (
         "CREATE TABLE dt (a INT, b VARCHAR, c DOUBLE, d BOOLEAN, e DATE, "
