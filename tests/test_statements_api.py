@@ -46,7 +46,7 @@ def test_describe_table_returns_snowflake_types(client):
         "C": "FLOAT",
         "D": "BOOLEAN",
         "E": "DATE",
-        "F": "TIMESTAMP_NTZ",
+        "F": "TIMESTAMP_NTZ(6)",
         "G": "NUMBER(10,2)",
         "H": "ARRAY",
     }

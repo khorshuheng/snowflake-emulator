@@ -127,7 +127,7 @@ def test_describe_table_returns_snowflake_types(connection):
     assert [r[0] for r in rows] == ["A", "B", "C"]
     assert rows[0][1] == "NUMBER(38,0)"
     assert rows[1][1] == "VARCHAR"
-    assert rows[2][1] == "TIMESTAMP_NTZ"
+    assert rows[2][1] == "TIMESTAMP_NTZ(6)"
 
 
 def test_snowflake_qualify_and_ilike(connection):

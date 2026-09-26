@@ -15,7 +15,10 @@ import json
 from typing import Any
 
 from snowflake_emulator.executor import ColumnMeta
-from snowflake_emulator.type_mapping import parse_precision_scale
+from snowflake_emulator.type_mapping import (
+    duckdb_timestamp_scale,
+    parse_precision_scale,
+)
 
 _EPOCH_DATE = datetime.date(1970, 1, 1)
 _EPOCH_DATETIME = datetime.datetime(1970, 1, 1)
@@ -24,8 +27,11 @@ _EPOCH_DATETIME = datetime.datetime(1970, 1, 1)
 def column_wire_metadata(col: ColumnMeta) -> dict[str, Any]:
     """Build the ``rowtype`` entry the connector expects for a single column."""
     precision, scale = parse_precision_scale(col.duckdb_type)
-    if col.type in ("timestamp_ntz", "timestamp_tz", "timestamp_ltz"):
-        scale = 6
+    ts_scale = duckdb_timestamp_scale(col.duckdb_type)
+    if ts_scale is not None:
+        # Report the precision DuckDB actually stores rather than a fixed 6, so a
+        # ``TIMESTAMP(3)`` column advertises scale 3 and a ``TIMESTAMP(0)`` scale 0.
+        scale = ts_scale
     return {
         "name": col.name,
         "type": col.type,

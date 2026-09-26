@@ -96,8 +96,10 @@ _SQL_TYPE_MAP: dict[str, str] = {
     "TIMESTAMP": "TIMESTAMP_NTZ",
     "TIMESTAMP_S": "TIMESTAMP_NTZ",
     "TIMESTAMP_MS": "TIMESTAMP_NTZ",
+    "TIMESTAMP_US": "TIMESTAMP_NTZ",
     "TIMESTAMP_NS": "TIMESTAMP_NTZ",
     "TIMESTAMP WITH TIME ZONE": "TIMESTAMP_TZ",
+    "TIMESTAMPTZ": "TIMESTAMP_TZ",
     "TIMESTAMP_TZ": "TIMESTAMP_TZ",
     "TIMESTAMP WITH LOCAL TIME ZONE": "TIMESTAMP_LTZ",
     "TIMESTAMP_LTZ": "TIMESTAMP_LTZ",
@@ -107,6 +109,33 @@ _SQL_TYPE_MAP: dict[str, str] = {
     "ENUM": "VARCHAR",
     "BIT": "VARCHAR",
 }
+
+# DuckDB timestamp storage granularity -> the number of fractional-second digits it
+# actually holds. DuckDB only stores seconds/milliseconds/microseconds/nanoseconds, so
+# this is the *real* precision, which can differ from the precision Snowflake was asked
+# for (e.g. ``TIMESTAMP(1)`` is stored as milliseconds).
+_TIMESTAMP_SCALE: dict[str, int] = {
+    "TIMESTAMP_S": 0,
+    "TIMESTAMP_MS": 3,
+    "TIMESTAMP": 6,
+    "TIMESTAMP_US": 6,
+    "TIMESTAMP_NS": 9,
+    "TIMESTAMP WITH TIME ZONE": 6,
+    "TIMESTAMPTZ": 6,
+    "TIMESTAMP_TZ": 6,
+    "TIMESTAMP WITH LOCAL TIME ZONE": 6,
+    "TIMESTAMP_LTZ": 6,
+}
+
+
+def duckdb_timestamp_scale(duckdb_type: str) -> int | None:
+    """Return the real fractional-second precision of a DuckDB timestamp type.
+
+    Returns ``None`` for any non-timestamp type so callers can fall back to their own
+    handling (e.g. ``DECIMAL`` precision/scale).
+    """
+    return _TIMESTAMP_SCALE.get(duckdb_type.upper().strip())
+
 
 _DESCRIBE_DECIMAL_RE = re.compile(r"^DECIMAL\((\d+),\s*(\d+)\)$")
 
@@ -134,6 +163,11 @@ def duckdb_type_to_snowflake_sql_type(duckdb_type: str) -> str:
         return "OBJECT"
     if normalized.startswith("ENUM"):
         return "VARCHAR"
+    # Timestamps report the precision DuckDB actually stores, e.g. ``TIMESTAMP_MS``
+    # (a declared ``TIMESTAMP(3)``) is shown as ``TIMESTAMP_NTZ(3)``.
+    ts_scale = _TIMESTAMP_SCALE.get(normalized)
+    if ts_scale is not None:
+        return f"{_SQL_TYPE_MAP.get(normalized, 'TIMESTAMP_NTZ')}({ts_scale})"
     return _SQL_TYPE_MAP.get(normalized, "VARCHAR")
 
 

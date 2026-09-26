@@ -346,6 +346,20 @@ def _rewrite_snowflake_specifics(node: exp.Expression) -> exp.Expression:
     if isinstance(node, exp.CurrentVersion):
         return exp.Literal.string(EMULATED_SNOWFLAKE_VERSION)
 
+    # Snowflake JSON path extraction (``col:path``, ``GET_PATH``) transpiles to
+    # DuckDB's ``->``/``->>``, which parses its operand as JSON on the fly. A VALUE
+    # bound from a Python dict is stored by DuckDB in a Python-repr form (e.g.
+    # ``{'a': 1}``) that is not valid JSON, so the extraction raises. Casting the
+    # operand to JSON first makes it round-trip through real JSON instead of the
+    # VARIANT/VARCHAR repr. ``exp.cast`` skips an operand that is already cast to JSON.
+    if isinstance(node, (exp.JSONExtract, exp.JSONExtractScalar)):
+        if not isinstance(node.this, exp.ParseJSON):
+            node.set(
+                "this",
+                exp.cast(node.this, exp.DataType.build("JSON"), dialect=WRITE_DIALECT),
+            )
+        return node
+
     # ``LATERAL FLATTEN(input => X)`` -> DuckDB json_each-based lateral subquery.
     if (
         isinstance(node, exp.Lateral)
@@ -396,6 +410,19 @@ def _rewrite_snowflake_specifics(node: exp.Expression) -> exp.Expression:
             return exp.DataType.build("JSON")
         if node.this == exp.DataType.Type.ARRAY and not node.expressions:
             return exp.DataType.build("JSON")
+        # Snowflake's TIMESTAMP_TZ(p)/TIMESTAMP_LTZ(p) accept a precision parameter,
+        # but DuckDB's ``TIMESTAMP WITH [LOCAL] TIME ZONE`` takes none -- sqlglot
+        # renders ``TIMESTAMP_LTZ(3)`` as ``TIMESTAMPTZ(3)``, which DuckDB rejects.
+        # Drop the modifier so the DDL/CAST is accepted; DuckDB stores microsecond
+        # precision either way (reported honestly via the timestamp scale mapping).
+        if (
+            node.this
+            in (exp.DataType.Type.TIMESTAMPTZ, exp.DataType.Type.TIMESTAMPLTZ)
+            and node.expressions
+        ):
+            stripped = node.copy()
+            stripped.set("expressions", [])
+            return stripped
 
     # ``MERGE ... UPDATE SET t.col = ...`` -> unqualified target column. DuckDB rejects
     # the target-table qualifier on the left side of a SET assignment.

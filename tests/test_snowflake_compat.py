@@ -254,6 +254,78 @@ def test_bare_semi_structured_column_types(client):
     assert resp.json()["data"] == [[1]]
 
 
+def test_json_path_extraction_on_bound_variant_operand(client):
+    # A VARIANT value bound from a Python dict is stored by DuckDB as a Python-repr
+    # string (``{'a': 1}``) that is not valid JSON, and ``->`` used to raise when it
+    # tried to parse it. The operand must be cast back to JSON first.
+    headers = _auth_headers(client)
+
+    def wire(statement, bindings=None):
+        body = {"sqlText": statement}
+        if bindings is not None:
+            body["bindings"] = bindings
+        return client.post("/queries/v1/query-request", json=body, headers=headers)
+
+    assert wire("CREATE OR REPLACE TABLE v_t (id INT, data VARIANT)").json()["success"]
+    assert wire(
+        "INSERT INTO v_t VALUES (?, ?)",
+        {
+            "1": {"type": "FIXED", "value": 1},
+            "2": {"type": "VARIANT", "value": {"a": 1, "b": {"c": 2}}},
+        },
+    ).json()["success"]
+
+    resp = wire(
+        "SELECT data:a AS a, data:b.c AS c, data:a::int AS n FROM v_t"
+    ).json()
+    assert resp["success"], resp
+    assert resp["data"]["rowset"] == [["1", "2", "1"]]
+
+
+def test_timestamp_precision_translation_and_metadata(client):
+    # Snowflake's TIMESTAMP_TZ(p)/TIMESTAMP_LTZ(p) precision parameter must not make
+    # the translated DuckDB DDL/CAST invalid (DuckDB rejects TIMESTAMPTZ(p)), and the
+    # reported type/scale must reflect the precision DuckDB actually stores.
+    headers = _auth_headers(client)
+    assert _post(
+        client,
+        "CREATE TABLE ts_p (a TIMESTAMP(3), b TIMESTAMP(0), c TIMESTAMP(9), "
+        "d TIMESTAMP_LTZ(3), e TIMESTAMP_TZ(6))",
+        headers,
+    ).status_code == 200
+
+    resp = _post(client, "DESCRIBE TABLE ts_p", headers)
+    types = {row[0]: row[1] for row in resp.json()["data"]}
+    assert types == {
+        "A": "TIMESTAMP_NTZ(3)",
+        "B": "TIMESTAMP_NTZ(0)",
+        "C": "TIMESTAMP_NTZ(9)",
+        # DuckDB has no LTZ type; LTZ maps to TIMESTAMP_TZ at microsecond precision.
+        "D": "TIMESTAMP_TZ(6)",
+        "E": "TIMESTAMP_TZ(6)",
+    }
+
+    # LTZ/TZ casts must execute rather than raise "does not take any type parameters".
+    resp = _post(
+        client,
+        "SELECT CAST('2020-01-01 12:00:00.123456789' AS TIMESTAMP(3)) AS a, "
+        "CAST('2020-01-01 12:00:00.123456789' AS TIMESTAMP_LTZ(3)) AS b, "
+        "CAST('2020-01-01 12:00:00.123456789' AS TIMESTAMP_TZ(3)) AS c",
+        headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"][0][0] == "2020-01-01T12:00:00.123000"
+
+    # The connector wire metadata advertises the real granularity, not a fixed 6.
+    wire = client.post(
+        "/queries/v1/query-request",
+        json={"sqlText": "SELECT a, b, c FROM ts_p"},
+        headers=headers,
+    ).json()
+    scales = {col["name"]: col["scale"] for col in wire["data"]["rowtype"]}
+    assert scales == {"A": 3, "B": 0, "C": 9}
+
+
 def test_lateral_flatten_object(client):
     assert _post(client, "CREATE TABLE flat_t (attrs OBJECT)").status_code == 200
     assert (

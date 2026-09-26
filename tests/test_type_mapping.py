@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from snowflake_emulator.type_mapping import (
+    duckdb_timestamp_scale,
     duckdb_type_to_snowflake,
     duckdb_type_to_snowflake_sql_type,
     parse_precision_scale,
@@ -99,12 +100,14 @@ def test_mapping_is_case_insensitive():
         ("TIME", "TIME"),
         ("TIME WITH TIME ZONE", "TIME"),
         ("TIMETZ", "TIME"),
-        ("TIMESTAMP", "TIMESTAMP_NTZ"),
-        ("TIMESTAMP_S", "TIMESTAMP_NTZ"),
-        ("TIMESTAMP_MS", "TIMESTAMP_NTZ"),
-        ("TIMESTAMP_NS", "TIMESTAMP_NTZ"),
-        ("TIMESTAMP WITH TIME ZONE", "TIMESTAMP_TZ"),
-        ("TIMESTAMP_LTZ", "TIMESTAMP_LTZ"),
+        ("TIMESTAMP", "TIMESTAMP_NTZ(6)"),
+        ("TIMESTAMP_S", "TIMESTAMP_NTZ(0)"),
+        ("TIMESTAMP_MS", "TIMESTAMP_NTZ(3)"),
+        ("TIMESTAMP_US", "TIMESTAMP_NTZ(6)"),
+        ("TIMESTAMP_NS", "TIMESTAMP_NTZ(9)"),
+        ("TIMESTAMP WITH TIME ZONE", "TIMESTAMP_TZ(6)"),
+        ("TIMESTAMPTZ", "TIMESTAMP_TZ(6)"),
+        ("TIMESTAMP_LTZ", "TIMESTAMP_LTZ(6)"),
         # Semi-structured
         ("JSON", "VARIANT"),
         ("STRUCT(a INTEGER)", "OBJECT"),
@@ -126,7 +129,7 @@ def test_duckdb_type_to_snowflake_sql_type(duckdb_type, expected):
 
 
 def test_describe_sql_type_mapping_is_case_insensitive():
-    assert duckdb_type_to_snowflake_sql_type("timestamp with time zone") == "TIMESTAMP_TZ"
+    assert duckdb_type_to_snowflake_sql_type("timestamp with time zone") == "TIMESTAMP_TZ(6)"
     assert duckdb_type_to_snowflake_sql_type("integer[2]") == "ARRAY"
     assert duckdb_type_to_snowflake_sql_type("  varchar  ") == "VARCHAR"
 
@@ -143,3 +146,24 @@ def test_describe_sql_type_mapping_is_case_insensitive():
 )
 def test_parse_precision_scale(duckdb_type, expected):
     assert parse_precision_scale(duckdb_type) == expected
+
+
+@pytest.mark.parametrize(
+    ("duckdb_type", "expected"),
+    [
+        # DuckDB's real timestamp granularity, not the declared Snowflake precision.
+        ("TIMESTAMP_S", 0),
+        ("TIMESTAMP_MS", 3),
+        ("TIMESTAMP", 6),
+        ("TIMESTAMP_US", 6),
+        ("TIMESTAMP_NS", 9),
+        ("TIMESTAMPTZ", 6),
+        ("TIMESTAMP WITH LOCAL TIME ZONE", 6),
+        # Non-timestamp types have no timestamp scale.
+        ("INTEGER", None),
+        ("DECIMAL(10,2)", None),
+        ("VARCHAR", None),
+    ],
+)
+def test_duckdb_timestamp_scale(duckdb_type, expected):
+    assert duckdb_timestamp_scale(duckdb_type) == expected
