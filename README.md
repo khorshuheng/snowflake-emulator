@@ -214,3 +214,82 @@ tests/
   test_settings.py                 # TOML config file + env var override tests
   test_stages.py                   # stage command parsing unit tests
 ```
+
+## Implementation coverage
+
+Legend: ✅ fully supported, ⚠️ partial / approximate, ❌ not supported (usually
+rejected with a Snowflake-shaped error rather than failing silently).
+
+### Protocol and sessions
+
+| Feature | Status |
+| --- | --- |
+| Snowflake SQL API v2 (`/api/v2/statements`, statement handles, cancel) | ✅ |
+| Connector wire protocol (`/session/v1/login-request`, `/queries/v1/query-request`) | ✅ |
+| `statementTypeId`, `describeOnly`, `finalDatabaseName/Schema/Warehouse/Role` | ✅ |
+| `GET /monitoring/queries/{sfqid}` | ✅ |
+| Typed / named / array bind parameters (`executemany`) | ✅ |
+| Error `errno`/`sqlState` classification | ✅ |
+| `USE DATABASE/SCHEMA/WAREHOUSE/ROLE`, `ALTER SESSION` no-op, transactions | ✅ |
+| Session variables (`SET`, `SHOW VARIABLES`, `$name`) | ✅ |
+| `RESULT_SCAN(...)`, `LAST_QUERY_ID()` | ✅ (simple `SELECT *` form) |
+| Per-session isolation mode; configurable no-op regexes | ✅ |
+
+### SQL and objects
+
+| Feature | Status |
+| --- | --- |
+| Standard SQL, multi-statement requests, `QUALIFY`, `ILIKE`, `DATEADD`/`DATEDIFF` | ✅ |
+| `MERGE` (including qualified `UPDATE SET t.col`), `INSERT OVERWRITE` | ✅ |
+| `CREATE TABLE ... CLONE` | ✅ (rows copied, not zero-copy) |
+| `AUTOINCREMENT`/`IDENTITY`, `CREATE SEQUENCE`, `seq.NEXTVAL` | ✅ |
+| `VARIANT`/`OBJECT`/`ARRAY`, `PARSE_JSON`, `OBJECT_CONSTRUCT`, `ARRAY_CONSTRUCT` | ✅ |
+| `LATERAL FLATTEN(...)`, `TABLE(FLATTEN(...))` | ✅ |
+| `DESCRIBE TABLE`, `{db}.INFORMATION_SCHEMA.{SCHEMATA,TABLES}` | ✅ |
+| `SHOW` schemas/tables/views/objects/columns/keys/stages/databases/sequences/… | ✅ |
+| Semi-structured function breadth beyond the list above | ⚠️ |
+| `VARCHAR(n)` lengths in `DESCRIBE`/`SHOW COLUMNS` | ⚠️ reported as `VARCHAR` |
+| `TIMESTAMP_LTZ` precision | ⚠️ mapped to `TIMESTAMP_TZ` at microsecond precision |
+| `SHOW FUNCTIONS` built-in catalogue | ⚠️ returns an empty shape |
+
+### Staging and files
+
+| Feature | Status |
+| --- | --- |
+| `PUT`/`GET`/`LIST`/`REMOVE` for `@~`, `@name`, `@db.schema.name`, `@%table` | ✅ |
+| `COPY INTO` from a stage with CSV/TSV/JSON and inline `FILE_FORMAT` | ✅ |
+| Named file formats (`CREATE FILE FORMAT`, `FORMAT_NAME=`) | ✅ |
+| HTTP (non-shared-filesystem) stage transfer | ❌ local filesystem only |
+| External stages (`s3://`, `gcs://`, `azure://`) | ❌ |
+
+### Not supported
+
+| Feature | Behaviour |
+| --- | --- |
+| JavaScript / Python / Java / Scala UDFs | ❌ rejected with a clear error (no runtime) |
+| `CREATE TASK`, `CREATE STREAM` | ❌ syntax error |
+| Time travel (`AT`/`BEFORE`, `RESULT_SCAN` of a past state) | ❌ rejected |
+| `CLONE` of a schema or database | ❌ rejected with a clear error |
+| Stored procedures | ❌ |
+| Access control (roles are cosmetic; any credential is accepted) | ❌ by design |
+
+## Test layout
+
+```
+tests/
+  test_statements_api.py        # SQL API v2 surface (FastAPI TestClient)
+  test_connector_integration.py # real snowflake-connector-python driver
+  test_sqlalchemy.py            # real snowflake-sqlalchemy dialect
+  test_jdbc.py                  # real snowflake-jdbc driver (gated on SNOWFLAKE_JDBC_JAR)
+  test_features.py              # CLONE, RESULT_SCAN, SET/SHOW VARIABLES, file formats
+  test_metadata.py              # SHOW COLUMNS / KEYS / DATABASES / SEQUENCES / …
+  test_bindings.py              # typed / named / array bind parameters
+  test_errors.py                # errno / sqlState classification
+  test_wire_responses.py        # statementTypeId, describeOnly, monitoring
+  test_server_ops.py            # isolation mode, no-op regexes, CLI flags
+  test_snowflake_compat.py      # USE IDENTIFIER, INFORMATION_SCHEMA, MERGE, FLATTEN, …
+  test_autoincrement.py         # AUTOINCREMENT / IDENTITY
+  test_type_mapping.py          # DuckDB -> Snowflake type mapping
+  test_stages.py                # stage command parsing
+  test_settings.py              # TOML/env configuration
+```
