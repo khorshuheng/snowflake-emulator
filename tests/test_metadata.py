@@ -62,3 +62,42 @@ def test_show_imported_keys_composite(client):
     _post(client, "CREATE TABLE chi2 (px INT, py INT, FOREIGN KEY (px, py) REFERENCES par2(id1, id2))")
     rows = _post(client, "SHOW IMPORTED KEYS IN TABLE chi2").json()["data"]
     assert [(row[4], row[8], row[9]) for row in rows] == [("ID1", "PX", 1), ("ID2", "PY", 2)]
+
+
+def test_show_databases_lists_catalogs(client):
+    rows = _post(client, "SHOW DATABASES").json()["data"]
+    assert "EMULATOR_DB" in {row[1] for row in rows}
+
+
+def test_show_warehouses_returns_session_warehouse(client):
+    rows = _post(client, "SHOW WAREHOUSES").json()["data"]
+    assert rows[0][0] == "EMULATOR_WH"
+
+
+def test_show_sequences_lists_created_sequence(client):
+    _post(client, "CREATE SEQUENCE sq1")
+    rows = _post(client, "SHOW SEQUENCES").json()["data"]
+    assert "SQ1" in {row[1] for row in rows}
+
+
+def test_show_parameters_returns_session_parameters(client):
+    rows = _post(client, "SHOW PARAMETERS").json()["data"]
+    assert {row[0] for row in rows} == {"AUTOCOMMIT", "TIMEZONE", "CLIENT_PREFETCH_THREADS"}
+
+
+def test_show_users_procedures_functions_return_empty(client):
+    assert _post(client, "SHOW USERS").json()["data"] == []
+    assert _post(client, "SHOW PROCEDURES").json()["data"] == []
+    assert _post(client, "SHOW FUNCTIONS").json()["data"] == []
+
+
+def test_show_databases_excludes_duckdb_internals(client):
+    rows = _post(client, "SHOW DATABASES").json()["data"]
+    assert {row[1].lower() for row in rows}.isdisjoint({"system", "temp", "memory"})
+
+
+def test_show_sequences_scoped_to_current_schema(client):
+    _post(client, "CREATE SCHEMA other_s")
+    _post(client, "CREATE SEQUENCE other_s.seq_x")
+    rows = _post(client, "SHOW SEQUENCES").json()["data"]
+    assert "SEQ_X" not in {row[1] for row in rows}

@@ -226,6 +226,11 @@ def execute_sql(
             row_type, rows = show_keys
             continue
 
+        show_misc = _execute_show_misc(cursor, session, statement)
+        if show_misc is not None:
+            row_type, rows = show_misc
+            continue
+
         describe_result = _execute_snowflake_describe(cursor, session, statement)
         if describe_result is not None:
             row_type, rows = describe_result
@@ -968,6 +973,89 @@ def _execute_show_keys(
             """,
             params,
         )
+    return _result_columns(cursor)
+
+
+def _execute_show_misc(
+    cursor: Any,
+    session: SessionContext,
+    statement: exp.Expression,
+) -> tuple[list[ColumnMeta], list[list[Any]]] | None:
+    """Handle the simpler SHOW variants (databases, warehouses, sequences, ...)."""
+    obj: str | None = None
+    if isinstance(statement, exp.Show):
+        obj = str(statement.args.get("this") or "").upper()
+    elif isinstance(statement, exp.Command) and str(statement.args.get("this") or "").upper() == "SHOW":
+        # sqlglot cannot parse SHOW PARAMETERS.
+        if str(statement.args.get("expression") or "").upper().strip().startswith("PARAMETERS"):
+            obj = "PARAMETERS"
+
+    if obj == "DATABASES":
+        cursor.execute(
+            """
+            SELECT
+                NULL::TIMESTAMP AS created_on,
+                database_name AS name,
+                'N' AS is_default,
+                CASE WHEN lower(database_name) = lower(?) THEN 'Y' ELSE 'N' END AS is_current,
+                NULL::VARCHAR AS origin,
+                NULL::VARCHAR AS owner,
+                comment AS comment,
+                NULL::VARCHAR AS options,
+                NULL::BIGINT AS retention_time
+            FROM duckdb_databases()
+            WHERE lower(database_name) NOT IN ('system', 'temp', 'memory')
+            ORDER BY name
+            """,
+            [session.database],
+        )
+    elif obj == "WAREHOUSES":
+        cursor.execute(
+            "SELECT ? AS name, 'STARTED' AS state, 'STANDARD' AS type, 'X-SMALL' AS size, "
+            "'N' AS running, 'N' AS queued, NULL::TIMESTAMP AS created_on, NULL::VARCHAR AS owner, "
+            "NULL::VARCHAR AS comment",
+            [session.warehouse],
+        )
+    elif obj == "SEQUENCES":
+        cursor.execute(
+            """
+            SELECT
+                NULL::TIMESTAMP AS created_on,
+                sequence_name AS name,
+                database_name AS database_name,
+                schema_name AS schema_name,
+                last_value AS next_value,
+                increment_by AS interval,
+                comment AS comment
+            FROM duckdb_sequences()
+            WHERE lower(database_name) = lower(?)
+              AND lower(schema_name) = lower(?)
+            ORDER BY name
+            """,
+            [session.database, session.schema],
+        )
+    elif obj == "PARAMETERS":
+        cursor.execute(
+            """
+            SELECT name, value, "default", level FROM (VALUES
+                ('AUTOCOMMIT', 'true', 'true', 'SESSION'),
+                ('TIMEZONE', 'UTC', 'UTC', 'SESSION'),
+                ('CLIENT_PREFETCH_THREADS', '4', '4', 'SESSION')
+            ) AS t(name, value, "default", level)
+            """
+        )
+    elif obj == "PROCEDURES":
+        cursor.execute(
+            "SELECT NULL::VARCHAR AS name, NULL::VARCHAR AS schema_name, NULL::VARCHAR AS catalog_name WHERE FALSE"
+        )
+    elif obj == "FUNCTIONS":
+        cursor.execute(
+            "SELECT NULL::VARCHAR AS name, NULL::VARCHAR AS schema_name, NULL::VARCHAR AS catalog_name WHERE FALSE"
+        )
+    elif obj == "USERS":
+        cursor.execute("SELECT NULL::VARCHAR AS name, NULL::TIMESTAMP AS created_on WHERE FALSE")
+    else:
+        return None
     return _result_columns(cursor)
 
 
