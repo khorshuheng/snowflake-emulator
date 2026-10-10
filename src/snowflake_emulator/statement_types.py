@@ -67,7 +67,12 @@ def statement_type_id(statement: exp.Expression | None) -> int:
 
 
 def number_of_binds(statement: exp.Expression | None) -> int:
-    """Return the number of bind placeholders in a statement."""
+    """Return the number of bind parameters in a statement.
+
+    Covers both ``?``/``:name`` (``Placeholder``) and ``$name`` (``Parameter``).
+    """
     if statement is None:
         return 0
-    return len(list(statement.find_all(exp.Placeholder)))
+    return len(list(statement.find_all(exp.Placeholder))) + len(
+        list(statement.find_all(exp.Parameter))
+    )

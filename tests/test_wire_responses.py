@@ -82,3 +82,34 @@ def test_describe_only_merge_does_not_execute(client):
         "/api/v2/statements", json={"statement": "SELECT v FROM mrg WHERE id = 1"}
     ).json()
     assert row["data"] == [[10]]
+
+
+def test_describe_only_use_does_not_change_session(client):
+    token = client.post("/session/token").json()["token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    def wire(sql, **extra):
+        return client.post(
+            "/queries/v1/query-request", json={"sqlText": sql, **extra}, headers=headers
+        )
+
+    wire("USE DATABASE EMULATOR_DB")
+    wire("USE DATABASE desc_alt", describeOnly=True)
+    body = client.post(
+        "/api/v2/statements",
+        json={"statement": "SELECT CURRENT_DATABASE() AS d"},
+        headers=headers,
+    ).json()
+    assert body["data"] == [["EMULATOR_DB"]]  # the described USE must not have applied
+
+
+def test_describe_only_named_parameter(client):
+    token = client.post("/session/token").json()["token"]
+    body = client.post(
+        "/queries/v1/query-request",
+        json={"sqlText": "SELECT $a AS x", "describeOnly": True},
+        headers={"Authorization": f"Bearer {token}"},
+    ).json()
+    assert body["success"] is True, body
+    assert [col["name"] for col in body["data"]["rowtype"]] == ["X"]
+    assert body["data"]["numberOfBinds"] == 1

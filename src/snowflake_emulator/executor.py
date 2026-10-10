@@ -272,6 +272,12 @@ _DESCRIBE_SYNTHETIC: dict[type[exp.Expression], list[tuple[str, str]]] = {
     exp.Drop: _DESCRIBE_STATUS,
     exp.Alter: _DESCRIBE_STATUS,
     exp.TruncateTable: _DESCRIBE_STATUS,
+    # Session/transaction control must not run during a describe; they are
+    # read-only to observe and would otherwise mutate the session.
+    exp.Use: _DESCRIBE_STATUS,
+    exp.Transaction: _DESCRIBE_STATUS,
+    exp.Commit: _DESCRIBE_STATUS,
+    exp.Rollback: _DESCRIBE_STATUS,
     exp.Insert: [("number of rows inserted", "BIGINT")],
     exp.Update: [
         ("number of rows updated", "BIGINT"),
@@ -334,7 +340,9 @@ def describe_sql(
         return None
     binds = number_of_binds(statement)
     statement = statement.transform(
-        lambda node: exp.Null() if isinstance(node, exp.Placeholder) else node
+        lambda node: exp.Null()
+        if isinstance(node, (exp.Placeholder, exp.Parameter))
+        else node
     )
     cursor = manager.cursor()
     cursor.execute(f'USE "{session.database}"."{session.schema}"')
