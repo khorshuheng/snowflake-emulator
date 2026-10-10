@@ -92,3 +92,35 @@ def test_last_query_id_without_prior_query_reports_02000(client):
     resp = _post(client, "SELECT LAST_QUERY_ID() AS qid", headers)
     assert resp.status_code == 422
     assert resp.json()["detail"]["sqlState"] == "02000"
+
+
+def test_set_and_use_string_variable(client):
+    headers = _auth(client)
+    _post(client, "SET my_var = 'hello'", headers)
+    assert _post(client, "SELECT $my_var AS v", headers).json()["data"] == [["hello"]]
+
+
+def test_set_and_use_numeric_variable(client):
+    headers = _auth(client)
+    _post(client, "SET n = 41", headers)
+    assert _post(client, "SELECT $n + 1 AS v", headers).json()["data"] == [[42]]
+
+
+def test_show_variables_lists_session_variables(client):
+    headers = _auth(client)
+    _post(client, "SET a = 'x'", headers)
+    resp = _post(client, "SHOW VARIABLES", headers)
+    assert resp.status_code == 200
+    assert {row[0] for row in resp.json()["data"]} == {"A"}
+
+
+def test_variables_are_session_scoped(client):
+    _post(client, "SET scoped = 'yes'", _auth(client))
+    other = _post(client, "SHOW VARIABLES", _auth(client))
+    assert other.json()["data"] == []
+
+
+def test_set_expression_variable_expands_expression_not_string(client):
+    headers = _auth(client)
+    _post(client, "SET x = 1 + 1", headers)
+    assert _post(client, "SELECT $x AS v", headers).json()["data"] == [[2]]

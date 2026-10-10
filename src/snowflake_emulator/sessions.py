@@ -25,6 +25,8 @@ class SessionContext:
     warehouse: str = field(default_factory=lambda: settings.default_warehouse)
     role: str = field(default_factory=lambda: settings.default_role)
     last_query_id: str | None = None
+    # Snowflake session variables set with ``SET name = value`` and read with ``$name``.
+    variables: dict[str, object] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
 
 

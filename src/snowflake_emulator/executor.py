@@ -159,6 +159,20 @@ def execute_sql(
         # clearly when the session has not run a query yet.
         statement = statement.transform(lambda node: _resolve_last_query_id(node, session))
 
+        set_result = _execute_set_variable(statement, session)
+        if set_result is not None:
+            row_type, rows = set_result
+            message = "Statement executed successfully."
+            continue
+
+        show_variables = _execute_show_variables(statement, session)
+        if show_variables is not None:
+            row_type, rows = show_variables
+            message = "Statement executed successfully."
+            continue
+
+        statement = _substitute_variables(statement, session)
+
         stmt_sql = statement.sql(dialect="snowflake")
 
         use_stmt = match_use_statement(stmt_sql)
@@ -442,6 +456,117 @@ def _resolve_last_query_id(
             )
         return exp.Literal.string(session.last_query_id)
     return node
+
+
+def _variable_value(node: exp.Expression | None) -> object:
+    """Convert a ``SET`` value expression to a stored value.
+
+    Scalar literals become Python values; any other expression is kept as an AST node
+    so ``$name`` expands to the expression (``SET x = 1 + 1`` then ``$x`` is ``2``),
+    not to its quoted source text.
+    """
+    if node is None:
+        return None
+    if isinstance(node, exp.Literal):
+        if node.is_string:
+            return str(node.this)
+        text = str(node.this)
+        try:
+            return int(text)
+        except ValueError:
+            try:
+                return float(text)
+            except ValueError:
+                return text
+    if isinstance(node, exp.Boolean):
+        return bool(node.this)
+    if isinstance(node, exp.Null):
+        return None
+    return node
+
+
+def _variable_literal(value: object) -> exp.Expression:
+    """Build the SQL expression a ``$name`` reference expands to."""
+    if isinstance(value, exp.Expression):
+        return value.copy()
+    if value is None:
+        return exp.Null()
+    if isinstance(value, bool):
+        return exp.Boolean(this=value)
+    if isinstance(value, (int, float)):
+        return exp.Literal.number(value)
+    return exp.Literal.string(str(value))
+
+
+def _variable_display(value: object) -> str:
+    """Render a session variable for ``SHOW VARIABLES``."""
+    if isinstance(value, exp.Expression):
+        return value.sql(dialect="snowflake")
+    return str(value)
+
+
+def _execute_set_variable(
+    statement: exp.Expression, session: SessionContext
+) -> tuple[list[ColumnMeta], list[list[Any]]] | None:
+    """Handle Snowflake ``SET name = value`` by storing a session variable."""
+    if not isinstance(statement, exp.Set):
+        return None
+    for item in statement.expressions:
+        assignment = item.this if isinstance(item, exp.SetItem) else item
+        if not isinstance(assignment, exp.EQ):
+            raise ExecutionError("Unsupported SET form (expected `name = value`).")
+        name = assignment.this.name if isinstance(assignment.this, exp.Expression) else None
+        if not name:
+            raise ExecutionError("Unsupported SET form (expected a variable name).")
+        session.variables[name.upper()] = _variable_value(assignment.expression)
+    return [ColumnMeta(name="status", type="text")], [["Statement executed successfully."]]
+
+
+def _execute_show_variables(
+    statement: exp.Expression, session: SessionContext
+) -> tuple[list[ColumnMeta], list[list[Any]]] | None:
+    """Handle ``SHOW VARIABLES`` by listing the session's variables."""
+    if not (
+        isinstance(statement, exp.Command)
+        and str(statement.args.get("this") or "").upper() == "SHOW"
+        and "VARIABLES" in str(statement.args.get("expression") or "").upper()
+    ):
+        return None
+    rows = [
+        [
+            name,
+            _variable_display(value),
+            "expression" if isinstance(value, exp.Expression) else type(value).__name__,
+        ]
+        for name, value in sorted(session.variables.items())
+    ]
+    return (
+        [
+            ColumnMeta(name="name", type="text"),
+            ColumnMeta(name="value", type="text"),
+            ColumnMeta(name="type", type="text"),
+        ],
+        rows,
+    )
+
+
+def _substitute_variables(statement: exp.Expression, session: SessionContext) -> exp.Expression:
+    """Expand ``$name`` references to their session variable values.
+
+    A ``$name`` with no matching variable is left untouched so it can still serve as a
+    named bind parameter.
+    """
+    if not session.variables:
+        return statement
+
+    def replace(node: exp.Expression) -> exp.Expression:
+        if isinstance(node, exp.Parameter):
+            value = session.variables.get((node.name or "").upper())
+            if value is not None or (node.name or "").upper() in session.variables:
+                return _variable_literal(value)
+        return node
+
+    return statement.transform(replace)
 
 
 def _convert_describe_types(rows: list[list[Any]]) -> list[list[Any]]:
