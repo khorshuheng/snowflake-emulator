@@ -8,16 +8,50 @@ from typing import Any
 
 from fastapi import APIRouter, Header
 
+from snowflake_emulator import statement_types
 from snowflake_emulator.bindings import decode_bindings
 from snowflake_emulator.database import get_manager
 from snowflake_emulator.errors import error_code_pair
-from snowflake_emulator.executor import execute_sql
+from snowflake_emulator.executor import describe_sql, execute_sql
 from snowflake_emulator.routers.auth import _extract_token
 from snowflake_emulator.sessions import get_session_manager
 from snowflake_emulator.statement_store import get_statement_store
 from snowflake_emulator.wire_format import column_wire_metadata, encode_rows
 
 router = APIRouter(prefix="/queries", tags=["wire-protocol"])
+monitoring_router = APIRouter(tags=["monitoring"])
+
+
+def _final_names(session) -> dict:
+    """Session context echoed on every query response, as Snowflake does."""
+    return {
+        "finalDatabaseName": session.database,
+        "finalSchemaName": session.schema,
+        "finalWarehouseName": session.warehouse,
+        "finalRoleName": session.role,
+    }
+
+
+def _describe_only_response(session, result) -> dict:
+    """Answer a ``describeOnly`` request with metadata and no rows."""
+    return {
+        "success": True,
+        "message": None,
+        "data": {
+            "parameters": [],
+            "rowtype": [column_wire_metadata(col) for col in result.row_type],
+            "rowset": [],
+            "total": 0,
+            "returned": 0,
+            "queryId": result.handle,
+            "sqlState": "00000",
+            "queryResultFormat": "json",
+            "statementTypeId": result.statement_type_id,
+            "numberOfBinds": result.number_of_binds,
+            "arrayBindSupported": result.statement_type_id == statement_types.INSERT,
+            **_final_names(session),
+        },
+    }
 
 
 def _error_response(exc: BaseException) -> dict:
@@ -44,6 +78,11 @@ def query_request(
 
     manager = get_manager()
     try:
+        if body.get("describeOnly"):
+            described = describe_sql(manager, session, sql_text)
+            if described is not None:
+                get_statement_store().put(described)
+                return _describe_only_response(session, described)
         decoded = decode_bindings(body.get("bindings"))
         result = execute_sql(
             manager,
@@ -86,8 +125,6 @@ def query_request(
     rowtype = [column_wire_metadata(col) for col in result.row_type]
     rowset = encode_rows(result.rows, result.row_type)
 
-    is_use_statement = sql_text.strip().upper().startswith("USE ")
-
     return {
         "success": True,
         "message": None,
@@ -100,11 +137,22 @@ def query_request(
             "queryId": result.handle,
             "sqlState": "00000",
             "queryResultFormat": "json",
-            "finalDatabaseName": session.database if is_use_statement else None,
-            "finalSchemaName": session.schema if is_use_statement else None,
-            "finalWarehouseName": session.warehouse if is_use_statement else None,
-            "finalRoleName": session.role if is_use_statement else None,
+            "statementTypeId": result.statement_type_id,
+            **_final_names(session),
         },
+    }
+
+
+@monitoring_router.get("/monitoring/queries/{sfqid}")
+def monitoring_query(sfqid: str) -> dict:
+    """Statement-status endpoint the connector polls for an in-flight query.
+
+    Statements execute synchronously, so a known query is always already done.
+    """
+    known = get_statement_store().get(sfqid) is not None
+    return {
+        "data": {"queries": [{"status": "SUCCESS"}] if known else []},
+        "success": True,
     }
 
 

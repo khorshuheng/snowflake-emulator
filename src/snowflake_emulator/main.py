@@ -22,6 +22,7 @@ app.add_middleware(GzipRequestMiddleware)
 app.include_router(auth.router)
 app.include_router(statements.router)
 app.include_router(queries.router)
+app.include_router(queries.monitoring_router)
 
 
 @app.get("/health", tags=["meta"])

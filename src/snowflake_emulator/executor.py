@@ -13,6 +13,10 @@ from sqlglot import exp
 from snowflake_emulator.database import DuckDBManager
 from snowflake_emulator.errors import classify_exception
 from snowflake_emulator.sessions import SessionContext
+from snowflake_emulator.statement_types import (
+    number_of_binds,
+    statement_type_id,
+)
 from snowflake_emulator.stages import (
     StageError,
     build_copy_sql,
@@ -99,6 +103,8 @@ class ExecutionResult:
     rows: list[list[Any]]
     message: str = "Statement executed successfully."
     file_transfer: FileTransfer | None = None
+    statement_type_id: int = 0
+    number_of_binds: int = 0
 
 
 def execute_sql(
@@ -132,8 +138,10 @@ def execute_sql(
     row_type: list[ColumnMeta] = []
     rows: list[list[Any]] = []
     message = "Statement executed successfully."
+    last_statement: exp.Expression | None = None
 
     for statement in statements:
+        last_statement = statement
         stmt_sql = statement.sql(dialect="snowflake")
 
         use_stmt = match_use_statement(stmt_sql)
@@ -239,6 +247,120 @@ def execute_sql(
         row_type=row_type,
         rows=rows,
         message=message,
+        statement_type_id=statement_type_id(last_statement),
+        number_of_binds=number_of_binds(last_statement),
+    )
+
+
+# Columns Snowflake reports when asked to describe a statement that produces no result
+# set, without running it. Only the names and types matter.
+_DESCRIBE_STATUS = [("status", "VARCHAR")]
+_DESCRIBE_COPY = [
+    ("file", "VARCHAR"),
+    ("status", "VARCHAR"),
+    ("rows_parsed", "BIGINT"),
+    ("rows_loaded", "BIGINT"),
+    ("error_limit", "BIGINT"),
+    ("errors_seen", "BIGINT"),
+    ("first_error", "VARCHAR"),
+    ("first_error_line", "BIGINT"),
+    ("first_error_character", "BIGINT"),
+    ("first_error_column_name", "VARCHAR"),
+]
+_DESCRIBE_SYNTHETIC: dict[type[exp.Expression], list[tuple[str, str]]] = {
+    exp.Create: _DESCRIBE_STATUS,
+    exp.Drop: _DESCRIBE_STATUS,
+    exp.Alter: _DESCRIBE_STATUS,
+    exp.TruncateTable: _DESCRIBE_STATUS,
+    exp.Insert: [("number of rows inserted", "BIGINT")],
+    exp.Update: [
+        ("number of rows updated", "BIGINT"),
+        ("number of multi-joined rows updated", "BIGINT"),
+    ],
+    exp.Delete: [("number of rows deleted", "BIGINT")],
+    # MERGE reports one count per operation; both are listed (a MERGE that omits a
+    # WHEN clause would report fewer, but describing must never execute the write).
+    exp.Merge: [
+        ("number of rows inserted", "BIGINT"),
+        ("number of rows updated", "BIGINT"),
+    ],
+    exp.Copy: _DESCRIBE_COPY,
+}
+
+
+def _describe_result(
+    statement: exp.Expression, columns: list[tuple[str, str]]
+) -> ExecutionResult:
+    """Build a metadata-only result for a statement described without executing."""
+    return ExecutionResult(
+        handle=str(uuid.uuid4()),
+        created_on=int(time.time() * 1000),
+        row_type=[
+            ColumnMeta(
+                name=name,
+                type=duckdb_type_to_snowflake(duckdb_type),
+                duckdb_type=duckdb_type,
+            )
+            for name, duckdb_type in columns
+        ],
+        rows=[],
+        message="Describe statement executed successfully.",
+        statement_type_id=statement_type_id(statement),
+        number_of_binds=number_of_binds(statement),
+    )
+
+
+def describe_sql(
+    manager: DuckDBManager,
+    session: SessionContext,
+    raw_sql: str,
+) -> ExecutionResult | None:
+    """Describe a statement's result columns without executing it.
+
+    Snowflake answers a ``describeOnly`` request with result metadata and no rows, so
+    a client can prepare a statement without running it. DML/DDL get Snowflake's
+    synthetic result shape; a SELECT is described directly with DuckDB ``DESCRIBE``
+    (placeholders replaced with NULL so it stays valid without bindings). Anything
+    else returns ``None`` and the caller falls back to executing it.
+    """
+    manager.ensure_namespace(session.database, session.schema)
+    try:
+        statement = split_statements(raw_sql)[-1]
+    except TranslationError:
+        return None
+    if type(statement) in _DESCRIBE_SYNTHETIC:
+        return _describe_result(statement, _DESCRIBE_SYNTHETIC[type(statement)])
+    if not isinstance(statement, (exp.Select, exp.Union, exp.Subquery)):
+        return None
+    binds = number_of_binds(statement)
+    statement = statement.transform(
+        lambda node: exp.Null() if isinstance(node, exp.Placeholder) else node
+    )
+    cursor = manager.cursor()
+    cursor.execute(f'USE "{session.database}"."{session.schema}"')
+    try:
+        duckdb_sql = transpile_to_duckdb(statement)
+        cursor.execute(f"DESCRIBE {duckdb_sql}")
+    except Exception:  # noqa: BLE001 - only described by running; fall back
+        return None
+    if not cursor.description:
+        return None
+    described = cursor.fetchall()
+    return ExecutionResult(
+        handle=str(uuid.uuid4()),
+        created_on=int(time.time() * 1000),
+        row_type=[
+            ColumnMeta(
+                name=row[0],
+                type=duckdb_type_to_snowflake(str(row[1])),
+                duckdb_type=str(row[1]),
+            )
+            for row in described
+        ],
+        rows=[],
+        message="Describe statement executed successfully.",
+        statement_type_id=statement_type_id(statement),
+        number_of_binds=binds,
     )
 
 
