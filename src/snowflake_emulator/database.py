@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 import threading
+from typing import Any
 
 import duckdb
 
@@ -135,10 +136,36 @@ class DuckDBManager:
 
 _manager: DuckDBManager | None = None
 _manager_lock = threading.Lock()
+# Private managers for isolated mode, keyed by session token.
+_isolated_managers: dict[str, DuckDBManager] = {}
 
 
-def get_manager() -> DuckDBManager:
-    """Return the process-wide DuckDB manager, creating it lazily."""
+def release_isolated_manager(token: str) -> None:
+    """Close and forget a session's isolated database when its session ends."""
+    with _manager_lock:
+        manager = _isolated_managers.pop(token, None)
+    if manager is not None:
+        try:
+            manager.connection.close()
+        except Exception:  # noqa: BLE001 - best-effort cleanup
+            pass
+
+
+def get_manager(session: Any | None = None) -> DuckDBManager:
+    """Return the DuckDB manager serving a request.
+
+    In the default ``shared`` mode one process-wide database backs every session. In
+    ``isolated`` mode each session gets its own private in-memory database, which keeps
+    parallel test runs from seeing each other's tables.
+    """
+    if session is not None and settings.isolation == "isolated":
+        key = getattr(session, "token", None) or "<anonymous>"
+        with _manager_lock:
+            manager = _isolated_managers.get(key)
+            if manager is None:
+                manager = DuckDBManager(":memory:")
+                _isolated_managers[key] = manager
+            return manager
     global _manager
     if _manager is None:
         with _manager_lock:

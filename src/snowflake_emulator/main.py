@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+
 from fastapi import FastAPI
 
 from snowflake_emulator.middleware import GzipRequestMiddleware
@@ -30,15 +32,67 @@ def health() -> dict:
     return {"status": "ok"}
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """Command-line parser for the ``snowflake-emulator`` console script."""
+    parser = argparse.ArgumentParser(
+        prog="snowflake-emulator",
+        description="Run the Snowflake emulator (FastAPI + DuckDB).",
+    )
+    parser.add_argument("--host", default=None, help="Bind address (default: config).")
+    parser.add_argument("--port", type=int, default=None, help="Bind port (default: config).")
+    parser.add_argument(
+        "--db-path",
+        dest="db_path",
+        default=None,
+        help="DuckDB database file (default: config, or :memory:).",
+    )
+    parser.add_argument(
+        "--stage-root",
+        dest="stage_root",
+        default=None,
+        help="Root directory for staged files (default: config, or a temp dir).",
+    )
+    parser.add_argument(
+        "--isolation",
+        choices=["shared", "isolated"],
+        default=None,
+        help="Database isolation mode (default: config).",
+    )
+    parser.add_argument(
+        "--no-reload",
+        dest="reload",
+        action="store_false",
+        default=None,
+        help="Disable uvicorn auto-reload.",
+    )
+    return parser
+
+
+def apply_args(args: argparse.Namespace) -> None:
+    """Apply parsed CLI flags onto the runtime settings (only when provided)."""
+    if args.host is not None:
+        settings.server.host = args.host
+    if args.port is not None:
+        settings.server.port = args.port
+    if args.db_path is not None:
+        settings.persistence.database_path = args.db_path
+    if args.stage_root is not None:
+        settings.staging.stage_root = args.stage_root
+    if args.isolation is not None:
+        settings.persistence.isolation = args.isolation
+
+
+def main(argv: list[str] | None = None) -> None:
     """Run the development server (used by the `snowflake-emulator` console script)."""
     import uvicorn
 
+    args = build_parser().parse_args(argv)
+    apply_args(args)
     uvicorn.run(
         "snowflake_emulator.main:app",
         host=settings.host,
         port=settings.port,
-        reload=True,
+        reload=True if args.reload is None else args.reload,
     )
 
 

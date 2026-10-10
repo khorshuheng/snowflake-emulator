@@ -61,7 +61,13 @@ class SessionManager:
 
     def close(self, token: str) -> bool:
         with self._lock:
-            return self._sessions.pop(token, None) is not None
+            closed = self._sessions.pop(token, None) is not None
+        if closed:
+            # Release any private database the session owned (isolated mode).
+            from snowflake_emulator.database import release_isolated_manager
+
+            release_isolated_manager(token)
+        return closed
 
 
 _manager: SessionManager | None = None

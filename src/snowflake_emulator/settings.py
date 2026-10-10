@@ -43,10 +43,16 @@ default_role = "ACCOUNTADMIN"
 # Path to a DuckDB database file for durable storage across restarts.
 # Use ":memory:" (the default) for an ephemeral, in-process database.
 database_path = ":memory:"
+# Isolation mode. "shared" (default) keeps one database for all sessions;
+# "isolated" gives each session its own private in-memory database.
+isolation = "shared"
 
 [statements]
 # Maximum number of cached statement results kept in memory.
 max_cached_statements = 500
+# Regexes (matched case-insensitively against the whole statement) whose statements
+# succeed without being executed, e.g. session parameters the emulator does not model.
+noop_regexes = []
 
 [staging]
 # Root directory under which staged files (PUT/GET/COPY INTO @stage) are stored.
@@ -78,10 +84,14 @@ class SnowflakeDefaults(BaseModel):
 class PersistenceSettings(BaseModel):
     # Path to the DuckDB database file. Use ":memory:" for an ephemeral, in-process database.
     database_path: str = ":memory:"
+    # "shared" (one database for all sessions) or "isolated" (one per session).
+    isolation: str = "shared"
 
 
 class StatementSettings(BaseModel):
     max_cached_statements: int = 500
+    # Statements matching any of these regexes succeed without being executed.
+    noop_regexes: list[str] = []
 
 
 class StagingSettings(BaseModel):
@@ -146,6 +156,14 @@ class Settings(BaseSettings):
     @property
     def max_cached_statements(self) -> int:
         return self.statements.max_cached_statements
+
+    @property
+    def isolation(self) -> str:
+        return self.persistence.isolation
+
+    @property
+    def noop_regexes(self) -> list[str]:
+        return self.statements.noop_regexes
 
     @property
     def stage_root(self) -> str:

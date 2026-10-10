@@ -19,6 +19,7 @@ def client():
     from snowflake_emulator.main import app
 
     database_module._manager = None
+    database_module._isolated_managers.clear()
     file_formats_module._manager = None
     sessions_module._manager = None
     stages_module._manager = None

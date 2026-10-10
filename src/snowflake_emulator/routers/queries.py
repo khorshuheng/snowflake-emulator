@@ -76,7 +76,7 @@ def query_request(
 
     sql_text: str = body.get("sqlText", "")
 
-    manager = get_manager()
+    manager = get_manager(session)
     try:
         if body.get("describeOnly"):
             described = describe_sql(manager, session, sql_text)

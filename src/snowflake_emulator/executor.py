@@ -19,6 +19,7 @@ from snowflake_emulator.file_formats import (
     resolve_file_format,
 )
 from snowflake_emulator.sessions import SessionContext
+from snowflake_emulator.settings import settings
 from snowflake_emulator.statement_types import (
     number_of_binds,
     statement_type_id,
@@ -128,6 +129,14 @@ def execute_sql(
     named mapping) and `bind_batch` (one tuple per row, for an array binding) are only
     applied when `raw_sql` contains a single statement.
     """
+    if _matches_noop(raw_sql):
+        return ExecutionResult(
+            handle=str(uuid.uuid4()),
+            created_on=int(time.time() * 1000),
+            row_type=[ColumnMeta(name="status", type="text")],
+            rows=[["Statement executed successfully."]],
+        )
+
     manager.ensure_namespace(session.database, session.schema)
     cursor = manager.cursor()
     cursor.execute(f'USE "{session.database}"."{session.schema}"')
@@ -428,6 +437,21 @@ def describe_sql(
         statement_type_id=statement_type_id(statement),
         number_of_binds=binds,
     )
+
+
+def _matches_noop(sql: str) -> bool:
+    """True when the statement matches a configured no-op regex.
+
+    Lets operators skip statements the emulator does not model (session parameters,
+    account-level commands) without hard-failing the client.
+    """
+    for pattern in settings.noop_regexes:
+        try:
+            if re.search(pattern, sql, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
 
 
 def _lookup_cached_result(handle: str) -> ExecutionResult | None:

@@ -64,7 +64,7 @@ def submit_statement(
     session = get_session_manager().get_or_create(token)
     _apply_overrides(session, body)
 
-    manager = get_manager()
+    manager = get_manager(session)
     try:
         decoded = decode_bindings(body.bindings)
         result = execute_sql(
