@@ -148,6 +148,8 @@ def monitoring_query(sfqid: str) -> dict:
     """Statement-status endpoint the connector polls for an in-flight query.
 
     Statements execute synchronously, so a known query is always already done.
+    Intentionally unauthenticated: the emulator is a local development server, not a
+    shared service, so this read-only status endpoint requires no session token.
     """
     known = get_statement_store().get(sfqid) is not None
     return {
