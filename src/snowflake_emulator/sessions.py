@@ -24,6 +24,7 @@ class SessionContext:
     schema: str = field(default_factory=lambda: settings.default_schema)
     warehouse: str = field(default_factory=lambda: settings.default_warehouse)
     role: str = field(default_factory=lambda: settings.default_role)
+    last_query_id: str | None = None
     created_at: float = field(default_factory=time.time)
 
 

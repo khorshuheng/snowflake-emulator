@@ -81,6 +81,7 @@ def query_request(
         if body.get("describeOnly"):
             described = describe_sql(manager, session, sql_text)
             if described is not None:
+                session.last_query_id = described.handle
                 get_statement_store().put(described)
                 return _describe_only_response(session, described)
         decoded = decode_bindings(body.get("bindings"))
@@ -96,6 +97,7 @@ def query_request(
         # as an HTTP 500 and clients retry indefinitely instead of failing fast.
         return _error_response(exc)
 
+    session.last_query_id = result.handle
     get_statement_store().put(result)
 
     if result.file_transfer is not None:

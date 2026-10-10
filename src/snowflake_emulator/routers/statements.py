@@ -80,6 +80,7 @@ def submit_statement(
             detail=_error_detail(exc),
         ) from exc
 
+    session.last_query_id = result.handle
     get_statement_store().put(result)
     return _to_response(result)
 

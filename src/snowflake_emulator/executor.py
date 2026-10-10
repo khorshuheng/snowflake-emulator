@@ -142,6 +142,23 @@ def execute_sql(
 
     for statement in statements:
         last_statement = statement
+
+        scan_id = _result_scan_query_id(statement, session)
+        if scan_id is not None:
+            cached = _lookup_cached_result(scan_id)
+            if cached is None:
+                raise ExecutionError(
+                    f"Statement {scan_id} not found", errno="0709", sqlstate="02000"
+                )
+            row_type = list(cached.row_type)
+            rows = [list(row) for row in cached.rows]
+            message = "Statement executed successfully."
+            continue
+
+        # LAST_QUERY_ID() outside RESULT_SCAN resolves to the previous handle, or fails
+        # clearly when the session has not run a query yet.
+        statement = statement.transform(lambda node: _resolve_last_query_id(node, session))
+
         stmt_sql = statement.sql(dialect="snowflake")
 
         use_stmt = match_use_statement(stmt_sql)
@@ -370,6 +387,61 @@ def describe_sql(
         statement_type_id=statement_type_id(statement),
         number_of_binds=binds,
     )
+
+
+def _lookup_cached_result(handle: str) -> ExecutionResult | None:
+    # Imported lazily: statement_store imports ExecutionResult from this module.
+    from snowflake_emulator.statement_store import get_statement_store
+
+    return get_statement_store().get(handle)
+
+
+def _result_scan_query_id(
+    statement: exp.Expression, session: SessionContext
+) -> str | None:
+    """Return the query id a ``SELECT * FROM TABLE(RESULT_SCAN(...))`` refers to.
+
+    Returns ``None`` when the statement is not a RESULT_SCAN select. Mirrors Snowflake's
+    simple form: the argument is a query-id literal or ``LAST_QUERY_ID()``.
+    """
+    if not isinstance(statement, exp.Select):
+        return None
+    inner = getattr(statement.args.get("from_"), "this", None)
+    if not isinstance(inner, exp.TableFromRows):
+        return None
+    call = inner.this
+    if not (
+        isinstance(call, exp.Anonymous)
+        and call.name.upper() == "RESULT_SCAN"
+        and call.expressions
+    ):
+        return None
+    projections = statement.expressions
+    if not (len(projections) == 1 and isinstance(projections[0], exp.Star)):
+        raise ExecutionError("RESULT_SCAN is only supported with SELECT * by the emulator.")
+    arg = call.expressions[0]
+    if isinstance(arg, exp.Literal) and arg.is_string:
+        return arg.this
+    if isinstance(arg, exp.Anonymous) and arg.name.upper() == "LAST_QUERY_ID":
+        if session.last_query_id is None:
+            raise ExecutionError(
+                "There is no previous query in this session.", errno="0709", sqlstate="02000"
+            )
+        return session.last_query_id
+    raise ExecutionError("RESULT_SCAN requires a query id literal or LAST_QUERY_ID().")
+
+
+def _resolve_last_query_id(
+    node: exp.Expression, session: SessionContext
+) -> exp.Expression:
+    """Replace a ``LAST_QUERY_ID()`` call with the previous statement's handle literal."""
+    if isinstance(node, exp.Anonymous) and node.name.upper() == "LAST_QUERY_ID":
+        if session.last_query_id is None:
+            raise ExecutionError(
+                "There is no previous query in this session.", errno="0709", sqlstate="02000"
+            )
+        return exp.Literal.string(session.last_query_id)
+    return node
 
 
 def _convert_describe_types(rows: list[list[Any]]) -> list[list[Any]]:
