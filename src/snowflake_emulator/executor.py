@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -218,6 +219,11 @@ def execute_sql(
         show_columns = _execute_show_columns(cursor, session, statement)
         if show_columns is not None:
             row_type, rows = show_columns
+            continue
+
+        show_keys = _execute_show_keys(cursor, session, statement)
+        if show_keys is not None:
+            row_type, rows = show_keys
             continue
 
         describe_result = _execute_snowflake_describe(cursor, session, statement)
@@ -842,6 +848,127 @@ def _execute_show_columns(
         [*row[:3], duckdb_type_to_snowflake_sql_type(str(row[3])), *row[4:]] for row in rows
     ]
     return row_type, rows
+
+
+def _show_key_kind(statement: exp.Expression) -> str | None:
+    """Classify a SHOW <PRIMARY|UNIQUE|FOREIGN|IMPORTED> KEYS statement."""
+    kinds = {
+        "PRIMARY KEYS": "PRIMARY",
+        "UNIQUE KEYS": "UNIQUE",
+        "IMPORTED KEYS": "FOREIGN",
+    }
+    if isinstance(statement, exp.Show):
+        return kinds.get(str(statement.args.get("this") or "").upper())
+    # sqlglot cannot parse SHOW FOREIGN KEYS, so it arrives as a Command.
+    if isinstance(statement, exp.Command) and str(statement.args.get("this") or "").upper() == "SHOW":
+        if "FOREIGN KEYS" in str(statement.args.get("expression") or "").upper():
+            return "FOREIGN"
+    return None
+
+
+def _show_key_scope(
+    statement: exp.Expression, session: SessionContext
+) -> tuple[str, str | None, str | None]:
+    """Return the ``(database, schema, table)`` a scoped SHOW KEYS statement targets."""
+    scope_kind = statement.args.get("scope_kind")
+    scope = statement.args.get("scope")
+    database: str = session.database
+    schema: str | None = session.schema
+    table_name: str | None = None
+    if scope_kind == "DATABASE" and isinstance(scope, exp.Table):
+        database, schema = scope.name, None
+    elif scope_kind == "SCHEMA" and isinstance(scope, exp.Table):
+        db = scope.args.get("db")
+        database = db.name if isinstance(db, exp.Identifier) else session.database
+        schema = scope.name
+    elif scope_kind == "TABLE" and isinstance(scope, exp.Table):
+        catalog = scope.args.get("catalog")
+        db = scope.args.get("db")
+        database = catalog.name if isinstance(catalog, exp.Identifier) else session.database
+        schema = db.name if isinstance(db, exp.Identifier) else session.schema
+        table_name = scope.name
+    elif isinstance(statement, exp.Command):
+        # SHOW FOREIGN KEYS is not parseable by sqlglot, so read the ``IN TABLE x``
+        # target from the raw text.
+        match = re.search(r"\bIN\s+(?:TABLE\s+)?([\w.\"]+)", str(statement.args.get("expression") or ""), re.IGNORECASE)
+        if match:
+            parts = [part.strip('"') for part in match.group(1).split(".")]
+            table_name = parts[-1]
+            if len(parts) >= 2:
+                schema = parts[-2]
+            if len(parts) >= 3:
+                database = parts[-3]
+    return database, schema, table_name
+
+
+def _execute_show_keys(
+    cursor: Any,
+    session: SessionContext,
+    statement: exp.Expression,
+) -> tuple[list[ColumnMeta], list[list[Any]]] | None:
+    """Handle SHOW PRIMARY/UNIQUE/FOREIGN/IMPORTED KEYS via ``duckdb_constraints()``."""
+    kind = _show_key_kind(statement)
+    if kind is None:
+        return None
+    database, schema, table_name = _show_key_scope(statement, session)
+
+    where = ["lower(database_name) = lower(?)"]
+    params: list[Any] = [database]
+    if schema is not None:
+        where.append("lower(schema_name) = lower(?)")
+        params.append(schema)
+    if table_name is not None:
+        where.append(f'lower(table_name) = lower(?)')
+        params.append(table_name)
+
+    if kind in ("PRIMARY", "UNIQUE"):
+        params.insert(0, "PRIMARY KEY" if kind == "PRIMARY" else "UNIQUE")
+        cursor.execute(
+            f"""
+            SELECT
+                NULL::TIMESTAMP AS created_on,
+                database_name AS database_name,
+                schema_name AS schema_name,
+                table_name AS table_name,
+                u.column_name AS column_name,
+                u.key_sequence AS key_sequence,
+                constraint_name AS constraint_name,
+                NULL::VARCHAR AS rely,
+                NULL::VARCHAR AS comment
+            FROM duckdb_constraints(), UNNEST(constraint_column_names) WITH ORDINALITY AS u(column_name, key_sequence)
+            WHERE constraint_type = ? AND {' AND '.join(where)}
+            ORDER BY table_name, constraint_name, key_sequence
+            """,
+            params,
+        )
+    else:
+        cursor.execute(
+            f"""
+            SELECT
+                NULL::TIMESTAMP AS created_on,
+                database_name AS pk_database_name,
+                schema_name AS pk_schema_name,
+                referenced_table AS pk_table_name,
+                referenced_column_names[u.key_sequence] AS pk_column_name,
+                database_name AS fk_database_name,
+                schema_name AS fk_schema_name,
+                table_name AS fk_table_name,
+                u.column_name AS fk_column_name,
+                u.key_sequence AS key_sequence,
+                NULL::VARCHAR AS update_rule,
+                NULL::VARCHAR AS delete_rule,
+                constraint_name AS fk_name,
+                NULL::VARCHAR AS pk_name,
+                NULL::VARCHAR AS deferrability,
+                NULL::VARCHAR AS rely,
+                NULL::VARCHAR AS comment
+            FROM duckdb_constraints(), UNNEST(constraint_column_names) WITH ORDINALITY AS u(column_name, key_sequence)
+            WHERE constraint_type = 'FOREIGN KEY' AND {' AND '.join(where)}
+            ORDER BY table_name, constraint_name, key_sequence
+            """,
+            params,
+        )
+    return _result_columns(cursor)
 
 
 def _execute_snowflake_describe(
