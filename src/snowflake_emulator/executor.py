@@ -40,6 +40,7 @@ from snowflake_emulator.stages import (
     show_stages,
 )
 from snowflake_emulator.translator import (
+    INFORMATION_SCHEMA_SCHEMA,
     TranslationError,
     UseStatement,
     is_alter_session,
@@ -277,6 +278,12 @@ def execute_sql(
             raise ExecutionError(str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - re-raised as a typed execution error
             raise _as_execution_error(exc) from exc
+
+        if (
+            isinstance(statement, exp.Create)
+            and str(statement.args.get("kind") or "").upper() == "TABLE"
+        ):
+            _record_declared_columns(manager, session, statement)
 
         if batch is not None:
             # Report the total affected rows across the batch, as Snowflake does for a
@@ -843,40 +850,50 @@ def _execute_show_columns(
 
     # Bound as parameters so an identifier containing a quote cannot break the SQL.
     params: list[Any] = [database]
-    where = ["lower(database_name) = lower(?)"]
+    where = ["lower(c.database_name) = lower(?)"]
     if schema is not None:
-        where.append("lower(schema_name) = lower(?)")
+        where.append("lower(c.schema_name) = lower(?)")
         params.append(schema)
     if table_name is not None:
-        where.append("lower(table_name) = lower(?)")
+        where.append("lower(c.table_name) = lower(?)")
         params.append(table_name)
     cursor.execute(
         f"""
         SELECT
-            table_name AS "table_name",
-            schema_name AS "schema_name",
-            column_name AS "column_name",
-            data_type AS "data_type",
-            CASE WHEN is_nullable THEN 'Y' ELSE 'N' END AS "null?",
-            column_default AS "default",
+            c.table_name AS "table_name",
+            c.schema_name AS "schema_name",
+            c.column_name AS "column_name",
+            c.data_type AS "data_type",
+            e.declared_type AS "declared_type",
+            CASE WHEN c.is_nullable THEN 'Y' ELSE 'N' END AS "null?",
+            c.column_default AS "default",
             'COLUMN' AS "kind",
             NULL::VARCHAR AS "expression",
-            comment AS "comment",
-            database_name AS "database_name",
+            c.comment AS "comment",
+            c.database_name AS "database_name",
             NULL::VARCHAR AS "autoincrement",
             NULL::VARCHAR AS "schema_evolution_record"
-        FROM duckdb_columns()
+        FROM duckdb_columns() c
+        LEFT JOIN "{database}".{INFORMATION_SCHEMA_SCHEMA}._sf_columns_ext e
+          ON lower(e.table_catalog) = lower(c.database_name)
+         AND lower(e.table_schema) = lower(c.schema_name)
+         AND lower(e.table_name) = lower(c.table_name)
+         AND lower(e.column_name) = lower(c.column_name)
         WHERE {' AND '.join(where)}
-        ORDER BY table_name, column_index
+        ORDER BY c.table_name, c.column_index
         """,
         params,
     )
     row_type, rows = _result_columns(cursor)
-    # data_type is column 3 here (unlike DESCRIBE, where it is column 1).
-    rows = [
-        [*row[:3], duckdb_type_to_snowflake_sql_type(str(row[3])), *row[4:]] for row in rows
-    ]
-    return row_type, rows
+    # Drop the helper "declared_type" column (index 4) and prefer the declared type.
+    row_type = [*row_type[:4], *row_type[5:]]
+    converted: list[list[Any]] = []
+    for row in rows:
+        sf_type = _prefer_declared_type(row[4], row[3]) or duckdb_type_to_snowflake_sql_type(
+            str(row[3])
+        )
+        converted.append([*row[:3], sf_type, *row[5:]])
+    return row_type, converted
 
 
 def _show_key_kind(statement: exp.Expression) -> str | None:
@@ -1083,6 +1100,23 @@ def _execute_show_misc(
     return _result_columns(cursor)
 
 
+_DECLARED_TYPE_OVERRIDE = re.compile(r"^(VARCHAR|CHAR|STRING|TEXT|BINARY|VARBINARY)\(\d+\)$")
+
+
+def _prefer_declared_type(
+    declared: Any, duckdb_type: Any
+) -> str | None:
+    """Return the declared Snowflake type only where DuckDB loses information.
+
+    DuckDB keeps numeric precision/scale, so ``INT`` must still report as
+    ``NUMBER(38,0)``; only character/binary lengths are dropped, so ``VARCHAR(255)``
+    is the one case worth restoring from the side table.
+    """
+    if not isinstance(declared, str):
+        return None
+    return declared if _DECLARED_TYPE_OVERRIDE.match(declared.upper()) else None
+
+
 def _execute_snowflake_describe(
     cursor: Any,
     session: SessionContext,
@@ -1107,27 +1141,41 @@ def _execute_snowflake_describe(
     cursor.execute(
         f"""
         SELECT
-            column_name AS "name",
-            data_type AS "type",
+            c.column_name AS "name",
+            c.data_type AS "type",
+            e.declared_type AS "declared_type",
             'COLUMN' AS "kind",
-            CASE WHEN is_nullable THEN 'Y' ELSE 'N' END AS "null?",
-            column_default AS "default",
+            CASE WHEN c.is_nullable THEN 'Y' ELSE 'N' END AS "null?",
+            c.column_default AS "default",
             NULL::VARCHAR AS "primary key",
             NULL::VARCHAR AS "unique key",
             NULL::VARCHAR AS "check",
             NULL::VARCHAR AS "expression",
-            comment AS "comment",
+            c.comment AS "comment",
             NULL::VARCHAR AS "policy name"
-        FROM duckdb_columns()
-        WHERE lower(database_name) = lower('{database}')
-          AND lower(schema_name) = lower('{schema}')
-          AND lower(table_name) = lower('{table_name}')
-        ORDER BY column_index
+        FROM duckdb_columns() c
+        LEFT JOIN "{database}".{INFORMATION_SCHEMA_SCHEMA}._sf_columns_ext e
+          ON lower(e.table_catalog) = lower(c.database_name)
+         AND lower(e.table_schema) = lower(c.schema_name)
+         AND lower(e.table_name) = lower(c.table_name)
+         AND lower(e.column_name) = lower(c.column_name)
+        WHERE lower(c.database_name) = lower('{database}')
+          AND lower(c.schema_name) = lower('{schema}')
+          AND lower(c.table_name) = lower('{table_name}')
+        ORDER BY c.column_index
         """
     )
     row_type, rows = _result_columns(cursor)
-    rows = _convert_describe_types(rows)
-    return row_type, rows
+    # Drop the helper "declared_type" column (index 2) from metadata and rows, and use
+    # the declared Snowflake type when present, else map the DuckDB type.
+    row_type = [row_type[0], row_type[1], *row_type[3:]]
+    converted: list[list[Any]] = []
+    for row in rows:
+        sf_type = _prefer_declared_type(row[2], row[1]) or duckdb_type_to_snowflake_sql_type(
+            str(row[1])
+        )
+        converted.append([row[0], sf_type, *row[3:]])
+    return row_type, converted
 
 
 def _is_ddl_status_artifact(statement: exp.Expression, description: list[Any]) -> bool:
@@ -1237,6 +1285,32 @@ def _execute_file_format_ddl(
             rows,
         )
     return None
+
+
+def _record_declared_columns(
+    manager: DuckDBManager, session: SessionContext, statement: exp.Create
+) -> None:
+    """Persist the declared Snowflake column types for a freshly created table.
+
+    DuckDB drops ``VARCHAR`` lengths, so the type as written is kept in the
+    per-catalog side table so ``DESCRIBE`` / ``INFORMATION_SCHEMA.COLUMNS`` can report it.
+    """
+    schema = statement.this
+    if not (isinstance(schema, exp.Schema) and isinstance(schema.this, exp.Table)):
+        return
+    table = schema.this
+    catalog = table.args.get("catalog")
+    db = table.args.get("db")
+    database = catalog.name if isinstance(catalog, exp.Identifier) else session.database
+    table_schema = db.name if isinstance(db, exp.Identifier) else session.schema
+    columns: list[tuple[str, str | None, str | None]] = []
+    for column in schema.expressions:
+        if isinstance(column, exp.ColumnDef):
+            kind = column.args.get("kind")
+            declared = kind.sql(dialect="snowflake") if kind is not None else None
+            columns.append((column.this.name, declared, None))
+    if columns:
+        manager.record_columns(database, table_schema, table.name, columns)
 
 
 def _execute_stage_command(

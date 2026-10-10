@@ -101,3 +101,28 @@ def test_show_sequences_scoped_to_current_schema(client):
     _post(client, "CREATE SEQUENCE other_s.seq_x")
     rows = _post(client, "SHOW SEQUENCES").json()["data"]
     assert "SEQ_X" not in {row[1] for row in rows}
+
+
+def test_varchar_length_preserved_in_describe_and_show_columns(client):
+    _post(client, "CREATE TABLE vc (name VARCHAR(255), n INT, amount NUMBER(10,2))")
+    describe = {row[0]: row[1] for row in _post(client, "DESCRIBE TABLE vc").json()["data"]}
+    assert describe == {"NAME": "VARCHAR(255)", "N": "NUMBER(38,0)", "AMOUNT": "NUMBER(10,2)"}
+    show = {row[2]: row[3] for row in _post(client, "SHOW COLUMNS IN TABLE vc").json()["data"]}
+    assert show["NAME"] == "VARCHAR(255)"
+
+
+def test_information_schema_columns_view(client):
+    _post(client, "CREATE TABLE isc (name VARCHAR(50), n INT)")
+    resp = _post(
+        client,
+        "SELECT COLUMN_NAME, DATA_TYPE FROM EMULATOR_DB.INFORMATION_SCHEMA.COLUMNS "
+        "WHERE TABLE_NAME = 'ISC' ORDER BY ORDINAL_POSITION",
+    )
+    assert resp.json()["data"] == [["NAME", "VARCHAR(50)"], ["N", "NUMBER(38,0)"]]
+
+
+def test_create_or_replace_refreshes_declared_length(client):
+    _post(client, "CREATE OR REPLACE TABLE rl (name VARCHAR(10))")
+    _post(client, "CREATE OR REPLACE TABLE rl (name VARCHAR(300))")
+    describe = {row[0]: row[1] for row in _post(client, "DESCRIBE TABLE rl").json()["data"]}
+    assert describe["NAME"] == "VARCHAR(300)"

@@ -113,6 +113,83 @@ class DuckDBManager:
             WHERE database_name = '{database}'
             """
         )
+        # Snowflake-only column metadata DuckDB discards: the declared SQL type
+        # (notably VARCHAR(n) lengths) and column comments.
+        self._connection.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {db_ident}.{schema}._sf_columns_ext (
+                table_catalog VARCHAR,
+                table_schema VARCHAR,
+                table_name VARCHAR,
+                column_name VARCHAR,
+                declared_type VARCHAR,
+                comment VARCHAR,
+                PRIMARY KEY (table_catalog, table_schema, table_name, column_name)
+            )
+            """
+        )
+        self._connection.execute(
+            f"""
+            CREATE OR REPLACE VIEW {db_ident}.{schema}.columns AS
+            SELECT
+                c.database_name AS TABLE_CATALOG,
+                c.schema_name AS TABLE_SCHEMA,
+                c.table_name AS TABLE_NAME,
+                c.column_name AS COLUMN_NAME,
+                c.column_index + 1 AS ORDINAL_POSITION,
+                CASE
+                    WHEN e.declared_type LIKE 'VARCHAR(%' OR e.declared_type LIKE 'CHAR(%'
+                      OR e.declared_type LIKE 'STRING(%' OR e.declared_type LIKE 'TEXT(%'
+                      OR e.declared_type LIKE 'BINARY(%' THEN e.declared_type
+                    WHEN c.data_type LIKE 'VARCHAR%' THEN 'VARCHAR'
+                    WHEN c.data_type LIKE 'DECIMAL%' THEN 'NUMBER' || substr(c.data_type, 8)
+                    WHEN c.data_type IN ('BIGINT','INTEGER','SMALLINT','TINYINT','HUGEINT','UINTEGER','UBIGINT','USMALLINT','UTINYINT','UHUGEINT') THEN 'NUMBER(38,0)'
+                    WHEN c.data_type IN ('DOUBLE','FLOAT','REAL') THEN 'FLOAT'
+                    WHEN c.data_type LIKE 'TIMESTAMP%' THEN 'TIMESTAMP_NTZ'
+                    ELSE c.data_type
+                END AS DATA_TYPE,
+                CASE WHEN c.is_nullable THEN 'YES' ELSE 'NO' END AS IS_NULLABLE,
+                c.column_default AS COLUMN_DEFAULT,
+                e.comment AS COMMENT
+            FROM duckdb_columns() c
+            LEFT JOIN {db_ident}.{schema}._sf_columns_ext e
+              ON lower(e.table_catalog) = lower(c.database_name)
+             AND lower(e.table_schema) = lower(c.schema_name)
+             AND lower(e.table_name) = lower(c.table_name)
+             AND lower(e.column_name) = lower(c.column_name)
+            WHERE c.database_name = '{database}'
+            """
+        )
+
+    def record_columns(
+        self,
+        database: str,
+        schema: str,
+        table: str,
+        columns: list[tuple[str, str | None, str | None]],
+    ) -> None:
+        """Record the declared Snowflake types for a table's columns.
+
+        DuckDB stores ``VARCHAR`` without its length, so the type as written is kept in
+        the per-catalog ``_sf_columns_ext`` side table and surfaced by ``DESCRIBE`` /
+        ``INFORMATION_SCHEMA.COLUMNS``.
+        """
+        db_ident = _quote_ident(database)
+        # The side table lives in the emulator's information schema, not the table's schema.
+        ext_ident = _quote_ident(INFORMATION_SCHEMA_SCHEMA)
+        with self._lock:
+            self._connection.execute(
+                f"DELETE FROM {db_ident}.{ext_ident}._sf_columns_ext "
+                "WHERE lower(table_catalog) = lower(?) AND lower(table_schema) = lower(?) "
+                "AND lower(table_name) = lower(?)",
+                [database, schema, table],
+            )
+            for name, declared_type, comment in columns:
+                self._connection.execute(
+                    f"INSERT INTO {db_ident}.{ext_ident}._sf_columns_ext "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    [database, schema, table, name, declared_type, comment],
+                )
 
     def cursor(self) -> duckdb.DuckDBPyConnection:
         """Return an isolated cursor so concurrent requests don't clobber each other's state."""
