@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import APIRouter, Header
 
 from snowflake_emulator import statement_types
+from snowflake_emulator.arrow import encode_arrow
 from snowflake_emulator.bindings import decode_bindings
 from snowflake_emulator.database import get_manager
 from snowflake_emulator.errors import error_code_pair
@@ -125,7 +126,17 @@ def query_request(
         return {"success": True, "message": None, "data": data}
 
     rowtype = [column_wire_metadata(col) for col in result.row_type]
-    rowset = encode_rows(result.rows, result.row_type)
+    if result.statement_type_id in statement_types.DML_TYPE_IDS:
+        # DML keeps the JSON rowset: clients read affected rows from it.
+        result_format: dict[str, Any] = {
+            "queryResultFormat": "json",
+            "rowset": encode_rows(result.rows, result.row_type),
+        }
+    else:
+        result_format = {
+            "queryResultFormat": "arrow",
+            "rowsetBase64": encode_arrow(result.row_type, result.rows),
+        }
 
     return {
         "success": True,
@@ -133,13 +144,12 @@ def query_request(
         "data": {
             "parameters": [],
             "rowtype": rowtype,
-            "rowset": rowset,
-            "total": len(rowset),
-            "returned": len(rowset),
+            "total": len(result.rows),
+            "returned": len(result.rows),
             "queryId": result.handle,
             "sqlState": "00000",
-            "queryResultFormat": "json",
             "statementTypeId": result.statement_type_id,
+            **result_format,
             **_final_names(session),
         },
     }

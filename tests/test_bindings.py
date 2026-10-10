@@ -83,14 +83,21 @@ def test_no_bindings_is_empty():
 
 def test_named_binding_via_wire_protocol(client):
     """A named (non-numeric-keyed) binding is passed to DuckDB as a named parameter."""
+    import base64
+
+    import pyarrow as pa
+
     token = client.post("/session/token").json()["token"]
-    resp = client.post(
+    body = client.post(
         "/queries/v1/query-request",
         json={"sqlText": "SELECT $a AS x", "bindings": {"a": {"type": "FIXED", "value": "1"}}},
         headers={"Authorization": f"Bearer {token}"},
-    )
-    assert resp.json()["success"] is True, resp.json()
-    assert resp.json()["data"]["rowset"] == [["1"]]
+    ).json()
+    assert body["success"] is True, body
+    table = pa.ipc.open_stream(
+        pa.BufferReader(base64.b64decode(body["data"]["rowsetBase64"]))
+    ).read_all()
+    assert [str(value) for value in table.column(0).to_pylist()] == ["1"]
 
 
 def test_timestamp_ntz_binding_is_naive_wall_clock():

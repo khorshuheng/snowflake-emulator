@@ -229,6 +229,7 @@ rejected with a Snowflake-shaped error rather than failing silently).
 | `statementTypeId`, `describeOnly`, `finalDatabaseName/Schema/Warehouse/Role` | ✅ |
 | `GET /monitoring/queries/{sfqid}` | ✅ |
 | Typed / named / array bind parameters (`executemany`) | ✅ |
+| Arrow result format (`fetch_arrow_all`, `fetch_pandas_all`) | ✅ |
 | Error `errno`/`sqlState` classification | ✅ |
 | `USE DATABASE/SCHEMA/WAREHOUSE/ROLE`, `ALTER SESSION` no-op, transactions | ✅ |
 | Session variables (`SET`, `SHOW VARIABLES`, `$name`) | ✅ |

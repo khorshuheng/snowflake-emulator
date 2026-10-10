@@ -420,3 +420,27 @@ def test_timestamp_ntz_bind_roundtrips_without_shift(emulator_port):
         assert cur.fetchall() == [(datetime.datetime(2024, 1, 1, 10, 20, 30),)]
     finally:
         con.close()
+
+
+def test_fetch_arrow_all_returns_arrow_table(connection):
+    """The connector takes the Arrow path; fetch_arrow_all must decode it."""
+    import pyarrow as pa
+
+    cur = connection.cursor()
+    cur.execute("CREATE OR REPLACE TABLE arrow_t (a INT, b VARCHAR, c DOUBLE)")
+    cur.execute("INSERT INTO arrow_t VALUES (1, 'x', 1.5), (2, 'y', 2.5)")
+    cur.execute("SELECT * FROM arrow_t ORDER BY a")
+    table = cur.fetch_arrow_all()
+    assert isinstance(table, pa.Table)
+    assert table.num_rows == 2
+    assert table.column("A").to_pylist() == [1, 2]
+    assert table.column("B").to_pylist() == ["x", "y"]
+
+
+def test_fetch_arrow_all_empty_result(connection):
+    cur = connection.cursor()
+    cur.execute("CREATE OR REPLACE TABLE arrow_empty (a INT, b VARCHAR)")
+    cur.execute("SELECT * FROM arrow_empty")
+    # An empty result carries an empty Arrow payload, so the connector returns None.
+    assert cur.fetch_arrow_all() is None
+    assert cur.fetchall() == []

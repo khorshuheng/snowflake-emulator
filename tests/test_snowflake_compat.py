@@ -279,7 +279,16 @@ def test_json_path_extraction_on_bound_variant_operand(client):
         "SELECT data:a AS a, data:b.c AS c, data:a::int AS n FROM v_t"
     ).json()
     assert resp["success"], resp
-    assert resp["data"]["rowset"] == [["1", "2", "1"]]
+    import base64
+
+    import pyarrow as pa
+
+    table = pa.ipc.open_stream(
+        pa.BufferReader(base64.b64decode(resp["data"]["rowsetBase64"]))
+    ).read_all()
+    assert [str(value) for value in table.column(0).to_pylist()] == ["1"]
+    assert [str(value) for value in table.column(1).to_pylist()] == ["2"]
+    assert table.column(2).to_pylist() == [1]
 
 
 def test_timestamp_precision_translation_and_metadata(client):
