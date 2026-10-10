@@ -4,13 +4,21 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Header, HTTPException, status
 
+from snowflake_emulator.bindings import decode_bindings
 from snowflake_emulator.database import get_manager
-from snowflake_emulator.executor import ExecutionError, ExecutionResult, execute_sql
+from snowflake_emulator.errors import error_code_pair
+from snowflake_emulator.executor import ExecutionResult, execute_sql
 from snowflake_emulator.schemas import ResultSetMetaData, RowType, StatementRequest, StatementResponse
 from snowflake_emulator.sessions import SessionContext, get_session_manager
 from snowflake_emulator.statement_store import get_statement_store
 
 router = APIRouter(prefix="/api/v2/statements", tags=["statements"])
+
+
+def _error_detail(exc: BaseException) -> dict:
+    """Build the SQL API v2 error detail with the classified errno/sqlState."""
+    errno, sqlstate = error_code_pair(exc)
+    return {"message": str(exc), "sqlState": sqlstate, "code": errno}
 
 
 def _extract_token(authorization: str | None) -> str | None:
@@ -58,16 +66,18 @@ def submit_statement(
 
     manager = get_manager()
     try:
-        result = execute_sql(manager, session, body.statement)
-    except ExecutionError as exc:
+        decoded = decode_bindings(body.bindings)
+        result = execute_sql(
+            manager,
+            session,
+            body.statement,
+            bind_params=decoded.positional if decoded.positional is not None else decoded.named,
+            bind_batch=decoded.batch,
+        )
+    except Exception as exc:  # noqa: BLE001 - always answer in Snowflake's error shape
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail={"message": str(exc), "sqlState": "42000", "code": "100132"},
-        ) from exc
-    except Exception as exc:  # noqa: BLE001 - surface any bug as a Snowflake-shaped error
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail={"message": str(exc), "sqlState": "42000", "code": "100132"},
+            detail=_error_detail(exc),
         ) from exc
 
     get_statement_store().put(result)

@@ -78,6 +78,10 @@ async def login(
                 {"name": "AUTOCOMMIT", "value": True},
                 {"name": "TIMEZONE", "value": "UTC"},
                 {"name": "CLIENT_PREFETCH_THREADS", "value": 4},
+                # The connector reads this before an executemany/array-binding insert.
+                # 0 keeps array binds inline (sent in the request) rather than staged
+                # via PUT, which the emulator does not need for local execution.
+                {"name": "CLIENT_STAGE_ARRAY_BINDING_THRESHOLD", "value": 0},
             ],
         },
     }

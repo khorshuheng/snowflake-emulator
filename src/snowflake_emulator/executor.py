@@ -11,6 +11,7 @@ from typing import Any
 from sqlglot import exp
 
 from snowflake_emulator.database import DuckDBManager
+from snowflake_emulator.errors import classify_exception
 from snowflake_emulator.sessions import SessionContext
 from snowflake_emulator.stages import (
     StageError,
@@ -43,7 +44,33 @@ from snowflake_emulator.type_mapping import (
 
 
 class ExecutionError(RuntimeError):
-    """Raised when a translated statement fails to execute against DuckDB."""
+    """Raised when a translated statement fails to execute against DuckDB.
+
+    Carries the Snowflake ``errno``/``sqlstate`` pair so routers can answer with the
+    same error classification Snowflake clients branch on. Defaults to the generic
+    compilation-error pair for failures the emulator raises itself (stages, duplicate
+    databases).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        errno: str = "100132",
+        sqlstate: str = "42000",
+    ) -> None:
+        super().__init__(message)
+        self.errno = errno
+        self.sqlstate = sqlstate
+
+
+def _as_execution_error(exc: BaseException) -> ExecutionError:
+    """Wrap a failure as an ``ExecutionError`` with a Snowflake error classification."""
+    if isinstance(exc, TranslationError):
+        # sqlglot could not parse or transpile the statement: a SQL compilation error.
+        return ExecutionError(str(exc), errno="001003", sqlstate="42000")
+    errno, sqlstate = classify_exception(exc)
+    return ExecutionError(str(exc), errno=errno, sqlstate=sqlstate)
 
 
 @dataclass
@@ -78,14 +105,16 @@ def execute_sql(
     manager: DuckDBManager,
     session: SessionContext,
     raw_sql: str,
-    bind_params: list[Any] | None = None,
+    bind_params: list[Any] | dict[str, Any] | None = None,
+    bind_batch: list[tuple[Any, ...]] | None = None,
 ) -> ExecutionResult:
     """Execute one or more (semicolon-separated) Snowflake statements.
 
     Session-scoped ``USE ...`` statements update `session` in place instead of being
     sent to DuckDB. Only the result of the final statement is returned, matching
-    Snowflake's own multi-statement behaviour. `bind_params`, when given, are only
-    applied when `raw_sql` contains a single statement (positional ``?`` binding).
+    Snowflake's own multi-statement behaviour. `bind_params` (a positional list or a
+    named mapping) and `bind_batch` (one tuple per row, for an array binding) are only
+    applied when `raw_sql` contains a single statement.
     """
     manager.ensure_namespace(session.database, session.schema)
     cursor = manager.cursor()
@@ -98,7 +127,7 @@ def execute_sql(
     try:
         statements = split_statements(raw_sql)
     except TranslationError as exc:
-        raise ExecutionError(str(exc)) from exc
+        raise _as_execution_error(exc) from exc
 
     row_type: list[ColumnMeta] = []
     rows: list[list[Any]] = []
@@ -145,26 +174,41 @@ def execute_sql(
         try:
             duckdb_sql = transpile_to_duckdb(statement)
         except TranslationError as exc:
-            raise ExecutionError(str(exc)) from exc
+            raise _as_execution_error(exc) from exc
 
         stage_copy = None
         if isinstance(statement, exp.Copy):
             stage_copy = copy_stage_source(statement)
 
+        batch = bind_batch if len(statements) == 1 else None
+        batch_affected = 0
         try:
             if stage_copy is not None:
                 table_sql, stage_ref, file_format = stage_copy
                 duckdb_sql = build_copy_sql(session, table_sql, stage_ref, file_format)
-            if bind_params is not None and len(statements) == 1:
+            if batch is not None:
+                # An array binding (executemany) runs the statement once per row.
+                for row in batch:
+                    cursor.execute(duckdb_sql, list(row))
+                    if cursor.description:
+                        fetched = cursor.fetchone()
+                        if fetched and isinstance(fetched[0], int):
+                            batch_affected += fetched[0]
+            elif bind_params is not None and len(statements) == 1:
                 cursor.execute(duckdb_sql, bind_params)
             else:
                 cursor.execute(duckdb_sql)
         except StageError as exc:
             raise ExecutionError(str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - re-raised as a typed execution error
-            raise ExecutionError(f"{exc}") from exc
+            raise _as_execution_error(exc) from exc
 
-        if cursor.description:
+        if batch is not None:
+            # Report the total affected rows across the batch, as Snowflake does for a
+            # multi-row DML, instead of the last row's count.
+            row_type = [ColumnMeta(name="Count", type="fixed", duckdb_type="BIGINT")]
+            rows = [[batch_affected]]
+        elif cursor.description:
             description = cursor.description
             if _is_ddl_status_artifact(statement, description):
                 # DuckDB DDL (CREATE/DROP/ALTER) reports a bare Count/Success column;

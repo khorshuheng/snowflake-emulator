@@ -8,8 +8,10 @@ from typing import Any
 
 from fastapi import APIRouter, Header
 
+from snowflake_emulator.bindings import decode_bindings
 from snowflake_emulator.database import get_manager
-from snowflake_emulator.executor import ExecutionError, execute_sql
+from snowflake_emulator.errors import error_code_pair
+from snowflake_emulator.executor import execute_sql
 from snowflake_emulator.routers.auth import _extract_token
 from snowflake_emulator.sessions import get_session_manager
 from snowflake_emulator.statement_store import get_statement_store
@@ -18,13 +20,15 @@ from snowflake_emulator.wire_format import column_wire_metadata, encode_rows
 router = APIRouter(prefix="/queries", tags=["wire-protocol"])
 
 
-def _extract_bind_params(bindings: dict[str, Any] | None) -> list[Any] | None:
-    """Convert the connector's ``{"1": {"type": ..., "value": ...}}`` bindings into a
-    positional list suitable for DuckDB's ``?`` parameter substitution."""
-    if not bindings:
-        return None
-    ordered_keys = sorted(bindings, key=lambda k: int(k))
-    return [bindings[k].get("value") for k in ordered_keys]
+def _error_response(exc: BaseException) -> dict:
+    """Build a Snowflake-shaped failure payload carrying the classified errno/sqlState."""
+    errno, sqlstate = error_code_pair(exc)
+    return {
+        "success": False,
+        "message": str(exc),
+        "code": errno,
+        "data": {"errorCode": errno, "sqlState": sqlstate, "queryId": str(uuid.uuid4())},
+    }
 
 
 @router.post("/v1/query-request")
@@ -37,27 +41,21 @@ def query_request(
     session = get_session_manager().get_or_create(token)
 
     sql_text: str = body.get("sqlText", "")
-    bind_params = _extract_bind_params(body.get("bindings"))
 
     manager = get_manager()
     try:
-        result = execute_sql(manager, session, sql_text, bind_params=bind_params)
-    except ExecutionError as exc:
-        return {
-            "success": False,
-            "message": str(exc),
-            "code": "100132",
-            "data": {"sqlState": "42000", "queryId": str(uuid.uuid4())},
-        }
-    except Exception as exc:  # noqa: BLE001 - surface any bug as a Snowflake-shaped error
+        decoded = decode_bindings(body.get("bindings"))
+        result = execute_sql(
+            manager,
+            session,
+            sql_text,
+            bind_params=decoded.positional if decoded.positional is not None else decoded.named,
+            bind_batch=decoded.batch,
+        )
+    except Exception as exc:  # noqa: BLE001 - always answer in Snowflake's error shape
         # Without this, an unexpected exception (e.g. an invalid identifier) escapes
         # as an HTTP 500 and clients retry indefinitely instead of failing fast.
-        return {
-            "success": False,
-            "message": str(exc),
-            "code": "100132",
-            "data": {"sqlState": "42000", "queryId": str(uuid.uuid4())},
-        }
+        return _error_response(exc)
 
     get_statement_store().put(result)
 

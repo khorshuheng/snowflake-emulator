@@ -379,3 +379,44 @@ def test_copy_into_file_format_options(connection, tmp_path):
     assert cur.fetchall() == [(1,)]
     cur.execute("SELECT * FROM tt")
     assert cur.fetchall() == [(5, "q")]
+
+
+def test_executemany_array_binding(emulator_port):
+    """`executemany` sends an array binding; the emulator must run one INSERT per row."""
+    con = _connect(emulator_port, paramstyle="qmark")
+    try:
+        cur = con.cursor()
+        cur.execute("CREATE OR REPLACE TABLE batch_t (a INT, b VARCHAR)")
+        cur.executemany("INSERT INTO batch_t VALUES (?, ?)", [(1, "x"), (2, "y"), (3, "z")])
+        cur.execute("SELECT * FROM batch_t ORDER BY a")
+        assert cur.fetchall() == [(1, "x"), (2, "y"), (3, "z")]
+    finally:
+        con.close()
+
+
+def test_typed_numeric_bind_decodes(emulator_port):
+    """A FIXED bind arrives as the string "7"; it must compare as the integer 7."""
+    con = _connect(emulator_port, paramstyle="qmark")
+    try:
+        cur = con.cursor()
+        cur.execute("CREATE OR REPLACE TABLE typed_t (a INT)")
+        cur.execute("INSERT INTO typed_t VALUES (7)")
+        cur.execute("SELECT * FROM typed_t WHERE a = ?", (7,))
+        assert cur.fetchall() == [(7,)]
+    finally:
+        con.close()
+
+
+def test_timestamp_ntz_bind_roundtrips_without_shift(emulator_port):
+    """A bound naive timestamp must come back unchanged, not shifted into the session zone."""
+    con = _connect(emulator_port, paramstyle="qmark")
+    try:
+        cur = con.cursor()
+        cur.execute("CREATE OR REPLACE TABLE ts_bind (ts TIMESTAMP_NTZ)")
+        cur.execute(
+            "INSERT INTO ts_bind VALUES (?)", (datetime.datetime(2024, 1, 1, 10, 20, 30),)
+        )
+        cur.execute("SELECT ts FROM ts_bind")
+        assert cur.fetchall() == [(datetime.datetime(2024, 1, 1, 10, 20, 30),)]
+    finally:
+        con.close()
