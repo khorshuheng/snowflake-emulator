@@ -625,6 +625,13 @@ def _execute_create_database(
     """
     if not (isinstance(statement, exp.Create) and str(statement.args.get("kind") or "").upper() == "DATABASE"):
         return None
+    if isinstance(statement.args.get("clone"), exp.Clone):
+        # Snowflake can clone a database; the emulator cannot rebuild the catalog's
+        # contents, so it fails loudly instead of creating an empty database.
+        raise ExecutionError(
+            "CREATE DATABASE ... CLONE is not supported by the emulator "
+            "(only CREATE TABLE ... CLONE is)."
+        )
     this = statement.args.get("this")
     ident = this.this if isinstance(this, exp.Table) else this
     if not isinstance(ident, exp.Identifier) or not ident.name:

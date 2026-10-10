@@ -436,6 +436,40 @@ def _rewrite_snowflake_specifics(node: exp.Expression) -> exp.Expression:
     return node
 
 
+def _rewrite_clone(statement: exp.Expression) -> exp.Expression:
+    """Rewrite ``CREATE TABLE b CLONE a`` as ``CREATE TABLE b AS SELECT * FROM a``.
+
+    Snowflake's CLONE is a zero-copy metadata operation and DuckDB has no equivalent,
+    so the rows are copied instead (functionally equivalent for local testing). A
+    time-travel clause (``AT``/``BEFORE``) is rejected: the emulator keeps no
+    historical state, so it cannot rebuild a past version of the source.
+    """
+    if not isinstance(statement, exp.Create):
+        return statement
+    clone = statement.args.get("clone")
+    if not isinstance(clone, exp.Clone):
+        return statement
+    kind = str(statement.args.get("kind") or "").upper()
+    if kind != "TABLE":
+        # Rejected loudly rather than silently creating an empty object.
+        raise TranslationError(
+            f"CREATE {kind} ... CLONE is not supported by the emulator "
+            "(only CREATE TABLE ... CLONE is)."
+        )
+    source = clone.this
+    if not isinstance(source, exp.Table):
+        return statement
+    if source.args.get("when") is not None:
+        raise TranslationError(
+            "CREATE TABLE ... CLONE ... AT/BEFORE (time travel) is not supported "
+            "by the emulator."
+        )
+    rewritten = statement.copy()
+    rewritten.set("clone", None)
+    rewritten.set("expression", exp.select("*").from_(source.copy()))
+    return rewritten
+
+
 def _reject_unsupported_function(statement: exp.Expression) -> None:
     """Raise for ``CREATE FUNCTION`` statements the emulator can't faithfully emulate.
 
@@ -462,6 +496,7 @@ def transpile_to_duckdb(statement: exp.Expression) -> str:
     """Transpile a single parsed Snowflake statement into its DuckDB equivalent."""
     try:
         _reject_unsupported_function(statement)
+        statement = _rewrite_clone(statement)
         statement = statement.transform(_uppercase_unquoted_identifiers)
         statement = statement.transform(_rewrite_information_schema)
         statement = statement.transform(_rewrite_snowflake_specifics)
