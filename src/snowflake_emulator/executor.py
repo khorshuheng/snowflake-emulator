@@ -215,6 +215,11 @@ def execute_sql(
             row_type, rows = show_result
             continue
 
+        show_columns = _execute_show_columns(cursor, session, statement)
+        if show_columns is not None:
+            row_type, rows = show_columns
+            continue
+
         describe_result = _execute_snowflake_describe(cursor, session, statement)
         if describe_result is not None:
             row_type, rows = describe_result
@@ -763,6 +768,80 @@ def _execute_snowflake_show(
         sql += f" LIMIT {limit}"
     cursor.execute(sql)
     return _result_columns(cursor)
+
+
+def _execute_show_columns(
+    cursor: Any,
+    session: SessionContext,
+    statement: exp.Expression,
+) -> tuple[list[ColumnMeta], list[list[Any]]] | None:
+    """Handle ``SHOW COLUMNS`` with Snowflake's column names (used by dbt).
+
+    Scopes onto the current schema by default, or a named table/schema/database when
+    the statement carries ``IN``. Returns ``None`` for SHOW forms this handler does
+    not own.
+    """
+    if not (
+        isinstance(statement, exp.Show)
+        and str(statement.args.get("this") or "").upper() == "COLUMNS"
+    ):
+        return None
+    scope_kind = statement.args.get("scope_kind")
+    scope = statement.args.get("scope")
+    database = session.database
+    schema = session.schema
+    table_name = None
+    if scope_kind == "DATABASE" and isinstance(scope, exp.Table):
+        database, schema = scope.name, None
+    elif scope_kind == "SCHEMA" and isinstance(scope, exp.Table):
+        db = scope.args.get("db")
+        database = db.name if isinstance(db, exp.Identifier) else session.database
+        schema = scope.name
+    elif scope_kind in ("TABLE", "VIEW") and isinstance(scope, exp.Table):
+        catalog = scope.args.get("catalog")
+        db = scope.args.get("db")
+        database = catalog.name if isinstance(catalog, exp.Identifier) else session.database
+        schema = db.name if isinstance(db, exp.Identifier) else session.schema
+        table_name = scope.name
+    elif scope_kind is not None:
+        return None
+
+    # Bound as parameters so an identifier containing a quote cannot break the SQL.
+    params: list[Any] = [database]
+    where = ["lower(database_name) = lower(?)"]
+    if schema is not None:
+        where.append("lower(schema_name) = lower(?)")
+        params.append(schema)
+    if table_name is not None:
+        where.append("lower(table_name) = lower(?)")
+        params.append(table_name)
+    cursor.execute(
+        f"""
+        SELECT
+            table_name AS "table_name",
+            schema_name AS "schema_name",
+            column_name AS "column_name",
+            data_type AS "data_type",
+            CASE WHEN is_nullable THEN 'Y' ELSE 'N' END AS "null?",
+            column_default AS "default",
+            'COLUMN' AS "kind",
+            NULL::VARCHAR AS "expression",
+            comment AS "comment",
+            database_name AS "database_name",
+            NULL::VARCHAR AS "autoincrement",
+            NULL::VARCHAR AS "schema_evolution_record"
+        FROM duckdb_columns()
+        WHERE {' AND '.join(where)}
+        ORDER BY table_name, column_index
+        """,
+        params,
+    )
+    row_type, rows = _result_columns(cursor)
+    # data_type is column 3 here (unlike DESCRIBE, where it is column 1).
+    rows = [
+        [*row[:3], duckdb_type_to_snowflake_sql_type(str(row[3])), *row[4:]] for row in rows
+    ]
+    return row_type, rows
 
 
 def _execute_snowflake_describe(
