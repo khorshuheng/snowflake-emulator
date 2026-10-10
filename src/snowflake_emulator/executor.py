@@ -12,6 +12,11 @@ from sqlglot import exp
 
 from snowflake_emulator.database import DuckDBManager
 from snowflake_emulator.errors import classify_exception
+from snowflake_emulator.file_formats import (
+    FileFormatError,
+    get_file_format_manager,
+    resolve_file_format,
+)
 from snowflake_emulator.sessions import SessionContext
 from snowflake_emulator.statement_types import (
     number_of_binds,
@@ -195,6 +200,11 @@ def execute_sql(
             row_type, rows = _execute_stage_ddl(manager, session, statement, stage_ddl)
             continue
 
+        file_format_ddl = _execute_file_format_ddl(session, statement)
+        if file_format_ddl is not None:
+            row_type, rows = file_format_ddl
+            continue
+
         create_db = _execute_create_database(manager, statement)
         if create_db is not None:
             row_type, rows = create_db
@@ -224,6 +234,7 @@ def execute_sql(
         try:
             if stage_copy is not None:
                 table_sql, stage_ref, file_format = stage_copy
+                file_format = resolve_file_format(session, file_format)
                 duckdb_sql = build_copy_sql(session, table_sql, stage_ref, file_format)
             if batch is not None:
                 # An array binding (executemany) runs the statement once per row.
@@ -237,7 +248,7 @@ def execute_sql(
                 cursor.execute(duckdb_sql, bind_params)
             else:
                 cursor.execute(duckdb_sql)
-        except StageError as exc:
+        except (StageError, FileFormatError) as exc:
             raise ExecutionError(str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - re-raised as a typed execution error
             raise _as_execution_error(exc) from exc
@@ -847,6 +858,67 @@ def _execute_create_database(
         [[f"Database {name} successfully created."]],
     )
 
+
+
+def _file_format_options(statement: exp.Expression) -> dict[str, str]:
+    """Extract the ``TYPE = CSV, SKIP_HEADER = 1, ...`` options from a CREATE node."""
+    options: dict[str, str] = {}
+    properties = statement.args.get("properties")
+    for prop in properties.expressions if properties else []:
+        if not isinstance(prop, exp.Property):
+            continue
+        value = prop.args.get("value")
+        if value is None:
+            continue
+        if isinstance(value, exp.Literal) and value.is_string:
+            options[str(prop.this).upper()] = str(value.this)
+        else:
+            options[str(prop.this).upper()] = value.sql(dialect="snowflake")
+    return options
+
+
+def _execute_file_format_ddl(
+    session: SessionContext, statement: exp.Expression
+) -> tuple[list[ColumnMeta], list[list[Any]]] | None:
+    """Handle CREATE/DROP FILE FORMAT and SHOW FILE FORMATS."""
+    kind = str(statement.args.get("kind") or "").upper()
+    if isinstance(statement, exp.Create) and kind == "FILE FORMAT":
+        name = statement.this.name if isinstance(statement.this, exp.Table) else ""
+        if not name:
+            return None
+        get_file_format_manager().create(
+            session,
+            name,
+            _file_format_options(statement),
+            replace=bool(statement.args.get("replace")),
+            if_not_exists=bool(statement.args.get("exists")),
+        )
+        return [ColumnMeta(name="status", type="text")], [
+            [f"File format {name.upper()} successfully created."]
+        ]
+    if isinstance(statement, exp.Drop) and kind == "FILE FORMAT":
+        name = statement.this.name if isinstance(statement.this, exp.Table) else ""
+        if not name:
+            return None
+        get_file_format_manager().drop(session, name, if_exists=bool(statement.args.get("exists")))
+        return [ColumnMeta(name="status", type="text")], [
+            [f"File format {name.upper()} successfully dropped."]
+        ]
+    if isinstance(statement, exp.Show) and str(statement.args.get("this") or "").upper() == "FILE FORMATS":
+        rows = [
+            [fmt.name, fmt.database, fmt.schema, fmt.options.get("TYPE", "")]
+            for fmt in get_file_format_manager().list(session)
+        ]
+        return (
+            [
+                ColumnMeta(name="name", type="text"),
+                ColumnMeta(name="database_name", type="text"),
+                ColumnMeta(name="schema_name", type="text"),
+                ColumnMeta(name="type", type="text"),
+            ],
+            rows,
+        )
+    return None
 
 
 def _execute_stage_command(

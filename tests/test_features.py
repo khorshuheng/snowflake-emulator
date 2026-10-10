@@ -124,3 +124,48 @@ def test_set_expression_variable_expands_expression_not_string(client):
     headers = _auth(client)
     _post(client, "SET x = 1 + 1", headers)
     assert _post(client, "SELECT $x AS v", headers).json()["data"] == [[2]]
+
+
+def _write_csv(path, text):
+    path.write_text(text)
+
+
+def test_named_file_format_used_by_copy_into(client, tmp_path):
+    csv = tmp_path / "data.csv"
+    _write_csv(csv, "a,b\n1,x\n2,y\n")
+    headers = _auth(client)
+    _post(client, "CREATE FILE FORMAT ff TYPE = CSV SKIP_HEADER = 1", headers)
+    _post(client, f"PUT file://{csv} @~/ffstage", headers)
+    _post(client, "CREATE TABLE fft (a INT, b VARCHAR)", headers)
+    resp = _post(
+        client, "COPY INTO fft FROM @~/ffstage FILE_FORMAT = (FORMAT_NAME = 'ff')", headers
+    )
+    assert resp.status_code == 200
+    assert _post(client, "SELECT * FROM fft ORDER BY a", headers).json()["data"] == [[1, "x"], [2, "y"]]
+
+
+def test_show_file_formats(client):
+    headers = _auth(client)
+    _post(client, "CREATE FILE FORMAT sf TYPE = JSON", headers)
+    resp = _post(client, "SHOW FILE FORMATS", headers)
+    assert {row[0] for row in resp.json()["data"]} == {"SF"}
+
+
+def test_drop_file_format(client):
+    headers = _auth(client)
+    _post(client, "CREATE FILE FORMAT df TYPE = CSV", headers)
+    _post(client, "DROP FILE FORMAT df", headers)
+    assert _post(client, "SHOW FILE FORMATS", headers).json()["data"] == []
+
+
+def test_copy_into_missing_named_format_errors(client, tmp_path):
+    csv = tmp_path / "d.csv"
+    _write_csv(csv, "a\n1\n")
+    headers = _auth(client)
+    _post(client, f"PUT file://{csv} @~/mf", headers)
+    _post(client, "CREATE TABLE mft (a INT)", headers)
+    resp = _post(
+        client, "COPY INTO mft FROM @~/mf FILE_FORMAT = (FORMAT_NAME = 'nope')", headers
+    )
+    assert resp.status_code == 422
+    assert "does not exist" in resp.json()["detail"]["message"]

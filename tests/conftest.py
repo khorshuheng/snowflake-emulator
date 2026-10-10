@@ -12,12 +12,14 @@ def client():
     before each test so tests don't leak state into one another.
     """
     import snowflake_emulator.database as database_module
+    import snowflake_emulator.file_formats as file_formats_module
     import snowflake_emulator.sessions as sessions_module
     import snowflake_emulator.stages as stages_module
     import snowflake_emulator.statement_store as statement_store_module
     from snowflake_emulator.main import app
 
     database_module._manager = None
+    file_formats_module._manager = None
     sessions_module._manager = None
     stages_module._manager = None
     statement_store_module._store = None
