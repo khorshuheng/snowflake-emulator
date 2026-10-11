@@ -117,7 +117,12 @@ class DuckDBManager:
         with self._lock:
             if database.lower() not in self._attached_catalogs:
                 path = self._catalog_path(database).replace("'", "''")
-                self._connection.execute(f"ATTACH '{path}' AS {db_ident}")
+                # VARIANT columns require storage version v1.5.0 or newer, while DuckDB
+                # defaults new files to an older version; passing it here also upgrades
+                # a file created before this option was used.
+                self._connection.execute(
+                    f"ATTACH '{path}' AS {db_ident} (STORAGE_VERSION '{_STORAGE_VERSION}')"
+                )
                 self._attached_catalogs.add(database.lower())
                 self._ensure_information_schema(db_ident, database)
             self._connection.execute(f"CREATE SCHEMA IF NOT EXISTS {db_ident}.{schema_ident}")
@@ -446,6 +451,8 @@ class DuckDBManager:
 
 _STORAGE_SUFFIX = ".d"  # dedicated directory: <database_path>.d
 _DATABASE_FILE_SUFFIX = ".duckdb"  # one file per database inside that directory
+# Minimum DuckDB storage version that supports VARIANT columns (its default is older).
+_STORAGE_VERSION = "v1.5.0"
 
 _manager: DuckDBManager | None = None
 _manager_lock = threading.Lock()

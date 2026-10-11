@@ -108,6 +108,20 @@ def test_memory_mode_writes_no_files(tmp_path):
     manager.connection.close()
 
 
+def test_variant_columns_work_in_file_backed_database(persistent_db):
+    """VARIANT needs storage version >= v1.5.0; the default for new files is older."""
+    path = persistent_db
+    manager = DuckDBManager(path)
+    manager.ensure_namespace("MY_DB", "PUBLIC")
+    manager.connection.execute('CREATE TABLE "MY_DB"."PUBLIC".v (x VARIANT)')
+    manager.connection.execute("INSERT INTO \"MY_DB\".\"PUBLIC\".v VALUES ('1'::VARIANT)")
+    manager.connection.close()
+
+    reopened = DuckDBManager(path)
+    assert reopened.connection.execute('SELECT COUNT(*) FROM "MY_DB"."PUBLIC".v').fetchall() == [(1,)]
+    reopened.connection.close()
+
+
 def test_foreign_matching_file_outside_storage_dir_is_not_attached(persistent_db):
     """Only the dedicated directory is scanned; parent-directory files are ignored."""
     path = persistent_db
