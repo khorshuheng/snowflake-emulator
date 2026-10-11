@@ -381,6 +381,20 @@ def test_copy_into_file_format_options(connection, tmp_path):
     assert cur.fetchall() == [(5, "q")]
 
 
+def test_semi_structured_text_cast(connection):
+    """`col:path::VARCHAR` is the string itself, not the JSON text with its quotes."""
+    cur = connection.cursor()
+    cur.execute("CREATE OR REPLACE TABLE txt_types (j VARIANT)")
+    cur.execute("""INSERT INTO txt_types SELECT PARSE_JSON('{"s": "y", "o": {"k": 1}}')""")
+
+    cur.execute("SELECT j:s::VARCHAR AS s FROM txt_types")
+    assert cur.fetchall() == [("y",)]
+    assert cur.description[0].type_code == FIELD_ID_TO_NAME_LOOKUP["TEXT"]
+
+    cur.execute("SELECT TO_VARCHAR(j:o) AS o FROM txt_types")
+    assert cur.fetchall() == [('{"k":1}',)]
+
+
 def test_select_from_staged_file(connection, tmp_path):
     """Query staged files directly (SELECT ... FROM @stage/file), as Snowflake allows."""
     json_path = tmp_path / "data.json"

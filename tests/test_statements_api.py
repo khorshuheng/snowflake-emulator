@@ -389,6 +389,57 @@ def test_flatten_over_a_variant_column(client):
         assert {row[0] for row in resp.json()["data"]} == {'"a"', '"b"'}
 
 
+def test_semi_structured_text_cast_returns_the_value(client):
+    """`col:path::VARCHAR` returns the string itself, not DuckDB's JSON serialization (`'"y"'`)."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    assert post("CREATE TABLE txt (j VARIANT)").status_code == 200
+    assert (
+        post(
+            "INSERT INTO txt SELECT "
+            "PARSE_JSON('{\"s\":\"y\",\"n\":1,\"o\":{\"k\":1},\"a\":[1,2],\"nl\":null}')"
+        ).status_code
+        == 200
+    )
+
+    for statement, expected in (
+        ("SELECT j:s::VARCHAR FROM txt", [["y"]]),
+        ("SELECT TO_VARCHAR(j:s) FROM txt", [["y"]]),
+        ("SELECT CAST(j:s AS VARCHAR) FROM txt", [["y"]]),
+        ("SELECT j:s::VARCHAR(1) FROM txt", [["y"]]),
+        ("SELECT j:s::CHAR(3) FROM txt", [["y"]]),
+        ("SELECT CAST(PARSE_JSON('\"y\"') AS VARCHAR)", [["y"]]),
+        # A number is its text, and a JSON null or missing path is NULL as in Snowflake.
+        ("SELECT j:n::VARCHAR FROM txt", [["1"]]),
+        ("SELECT j:nl::VARCHAR FROM txt", [[None]]),
+        ("SELECT j:missing::VARCHAR FROM txt", [[None]]),
+        # An object or array keeps its document text.
+        ("SELECT j:o::VARCHAR FROM txt", [["{\"k\":1}"]]),
+        ("SELECT j:a::VARCHAR FROM txt", [["[1,2]"]]),
+        # The cast is usable in an expression.
+        ("SELECT j:s::VARCHAR = 'y' FROM txt", [[True]]),
+        ("SELECT LENGTH(j:s::VARCHAR) FROM txt", [[1]]),
+    ):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        assert resp.json()["data"] == expected, statement
+
+
+def test_semi_structured_text_cast_over_staged_json(client, tmp_path):
+    json_path = tmp_path / "doc.json"
+    json_path.write_text(json.dumps({"s": "y", "o": {"k": 1}}) + "\n")
+    headers = _stage_headers(client)
+    _stage(client, headers, json_path, "@~/staged")
+
+    selected = _select(
+        client,
+        headers,
+        "SELECT $1:s::VARCHAR AS s, TO_VARCHAR($1:o) AS o FROM @~/staged/doc.json",
+    )
+    assert selected["data"] == [["y", '{"k":1}']]
+
+
 def test_uninterpreted_function_is_left_to_duckdb(client):
     """A function sqlglot does not know must pass through, not crash the array rewrite."""
     resp = client.post(

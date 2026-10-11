@@ -239,9 +239,12 @@ Caveats:
   results the emulator did not produce.
 - `ESCAPE_UNENCLOSED_FIELD` (Snowflake's default is `\`) has no DuckDB equivalent and is
   rejected when set explicitly; use `ESCAPE` for enclosed fields.
-- `:` on a JSON string yields the JSON form (`$1:s` -> `"  padded  "`) rather than
-  Snowflake's unquoted string; this is the emulator's existing `col:path` behaviour for
-  VARIANT columns.
+- selecting a JSON string *without* a cast (`SELECT $1:s`) returns its JSON form (`"y"`)
+  where Snowflake returns `y`; a text cast or `TO_VARCHAR` does return the text
+  (`$1:s::VARCHAR` -> `y`, `$1:o::VARCHAR` -> the object's document text);
+- a **bare VARIANT column** cast to text (`SELECT variant_col::VARCHAR`) uses DuckDB's own
+  VARIANT text form: right for a string, but an object shows as the variant's internal
+  form, so use `variant_col::JSON::VARCHAR` when you need the document text.
 - A `:` path on a non-JSON column (`$1:key` over CSV/Parquet) yields NULL rather than
   Snowflake's compile error.
 - The stage's own `FILE_FORMAT` (`CREATE STAGE ... FILE_FORMAT = ...`) is not modelled,

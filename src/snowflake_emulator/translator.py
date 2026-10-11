@@ -806,11 +806,65 @@ def _rewrite_json_array_functions(statement: exp.Expression) -> exp.Expression:
     return root
 
 
+# Types Snowflake casts a semi-structured value to for its text form.
+_TEXT_TYPES = (
+    exp.DataType.Type.VARCHAR,
+    exp.DataType.Type.CHAR,
+    exp.DataType.Type.NCHAR,
+    exp.DataType.Type.NVARCHAR,
+    exp.DataType.Type.TEXT,
+)
+
+
+def _is_text_type(data_type: exp.Expression | None) -> bool:
+    """True for a text type, with or without a length (``VARCHAR``, ``VARCHAR(10)``)."""
+    return isinstance(data_type, exp.DataType) and data_type.this in _TEXT_TYPES
+
+
+def _json_root_extract(operand: exp.Expression) -> exp.Expression:
+    """``operand ->> '$'``: the text of a JSON value (a string without its quotes)."""
+    return exp.JSONExtractScalar(
+        this=operand, expression=exp.JSONPath(expressions=[exp.JSONPathRoot()])
+    )
+
+
+def _rewrite_semi_structured_text_cast(node: exp.Expression) -> exp.Expression:
+    """Make ``col:path::VARCHAR`` return the value's text, not DuckDB's JSON serialization.
+
+    ``col:path`` evaluates to a DuckDB JSON value, and ``CAST(<json> AS VARCHAR)`` serializes
+    it -- a JSON string keeps its quotes (``'"y"'`` where Snowflake returns ``y``).
+    ``->> '$'`` yields the text of a JSON scalar instead, and of a JSON object/array the
+    document text, as Snowflake does. An explicit VARIANT is serialized to JSON first for
+    the same reason; a bare VARIANT column is left alone, since DuckDB's own VARIANT cast
+    already returns a string variant's text (whether a bare column holds one is not known
+    until run time).
+
+    The operand is rewritten here rather than serialized: replacing a node stops the walk
+    from descending into its children, and a ``col:path`` operand is not yet a JSON value.
+    """
+    operand = node.this
+    if not (_is_json_value(operand) or _is_variant_value(operand)):
+        return node
+    inner = operand.transform(_rewrite_snowflake_specifics)
+    if _is_variant_value(inner):
+        inner = exp.cast(inner, exp.DataType.build("JSON"), dialect=WRITE_DIALECT)
+    extracted = _json_root_extract(inner)
+    if isinstance(node, exp.ToChar):
+        return extracted  # its DuckDB rendering is already a text cast
+    return exp.Cast(this=extracted, to=node.to)
+
+
 def _rewrite_snowflake_specifics(node: exp.Expression) -> exp.Expression:
     """Rewrite Snowflake nodes that sqlglot can't fully transpile to DuckDB."""
     # ``CURRENT_VERSION()`` -> a Snowflake-style dotted-numeric version literal.
     if isinstance(node, exp.CurrentVersion):
         return exp.Literal.string(EMULATED_SNOWFLAKE_VERSION)
+
+    # ``col:path::VARCHAR`` / ``TO_VARCHAR(col:path)``.
+    if isinstance(node, exp.Cast) and _is_text_type(node.to):
+        return _rewrite_semi_structured_text_cast(node)
+    if isinstance(node, exp.ToChar) and node.args.get("format") is None:
+        return _rewrite_semi_structured_text_cast(node)
 
     # Snowflake JSON path extraction (``col:path``, ``GET_PATH``) transpiles to
     # DuckDB's ``->``/``->>``, which parses its operand as JSON on the fly. A VALUE
