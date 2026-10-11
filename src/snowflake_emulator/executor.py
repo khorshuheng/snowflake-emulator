@@ -296,10 +296,10 @@ def execute_sql(
         batch_affected = 0
         try:
             if stage_copy is not None:
-                table_sql, stage_ref, file_format, pattern = stage_copy
+                table_sql, stage_ref, file_format, pattern, projection = stage_copy
                 file_format = resolve_file_format(session, file_format)
                 duckdb_sql = build_copy_sql(
-                    session, table_sql, stage_ref, file_format, pattern
+                    session, table_sql, stage_ref, file_format, pattern, projection
                 )
             if batch is not None:
                 # An array binding (executemany) runs the statement once per row.

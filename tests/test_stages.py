@@ -269,11 +269,31 @@ def test_copy_stage_source_extracts_file_format_and_pattern():
         "PATTERN = '.*part.*'",
         read="snowflake",
     )
-    table_sql, stage_ref, file_format, pattern = copy_stage_source(node)
+    table_sql, stage_ref, file_format, pattern, projection = copy_stage_source(node)
     assert table_sql == "t"
     assert stage_ref == "@stage"
     assert file_format == {"TYPE": "CSV", "SKIP_HEADER": "1"}
     assert pattern == ".*part.*"
+    assert projection is None
+
+
+def test_copy_stage_source_carries_subquery_projection():
+    node = sqlglot.parse_one(
+        "COPY INTO t FROM (SELECT $1:name AS name, $1:age AS age FROM @stage/file.json)",
+        read="snowflake",
+    )
+    table_sql, stage_ref, _file_format, _pattern, projection = copy_stage_source(node)
+    assert table_sql == "t"
+    assert stage_ref == "@stage/file.json"
+    # `$N` is rewritten to the quoted positional column the raw staged relation exposes.
+    assert projection == '"$1" -> \'$.name\' AS name, "$1" -> \'$.age\' AS age'
+
+
+def test_copy_stage_source_subquery_without_stage_is_none():
+    node = sqlglot.parse_one(
+        "COPY INTO t FROM (SELECT a FROM some_table)", read="snowflake"
+    )
+    assert copy_stage_source(node) is None
 
 
 def test_copy_stage_source_without_pattern_or_stage():

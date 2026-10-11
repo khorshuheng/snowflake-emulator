@@ -518,20 +518,70 @@ def show_stages(manager: StageManager, session: SessionContext) -> list[tuple[st
     return rows
 
 
-def copy_stage_source(copy_node: exp.Copy) -> tuple[str, str, dict[str, Any], str | None] | None:
-    """If ``COPY INTO t FROM @stage``, return (table_sql, stage_ref, file_format, pattern).
+def copy_stage_source(
+    copy_node: exp.Copy,
+) -> tuple[str, str, dict[str, Any], str | None, str | None] | None:
+    """Resolve ``COPY INTO t FROM <source>`` into the pieces ``build_copy_sql`` needs.
 
-    Returns None when the COPY does not reference a stage.
+    Returns ``(table_sql, stage_ref, file_format, pattern, projection)``. ``projection``
+    is the SELECT list of a ``FROM (SELECT ... FROM @stage)`` source, carried so the
+    staged rows are transformed on load rather than copied column-for-column; it is
+    ``None`` for a plain ``FROM @stage`` source. Returns ``None`` when the COPY does not
+    reference a stage.
     """
     files = copy_node.args.get("files") or []
     if not files:
         return None
-    source_sql = files[0].sql(dialect="snowflake").strip()
-    if not source_sql.startswith("@"):
-        return None
+    source = files[0]
+    projection: str | None
+    if isinstance(source, exp.Subquery):
+        resolved = _subquery_stage_source(source)
+        if resolved is None:
+            return None
+        stage_ref, projection = resolved
+    else:
+        stage_ref = source.sql(dialect="snowflake").strip()
+        if not stage_ref.startswith("@"):
+            return None
+        projection = None
     table_sql = copy_node.this.sql(dialect="duckdb")
     file_format = _extract_file_format(copy_node)
-    return table_sql, source_sql, file_format, _copy_param(copy_node, "PATTERN")
+    return table_sql, stage_ref, file_format, _copy_param(copy_node, "PATTERN"), projection
+
+
+def _subquery_stage_source(subquery: exp.Subquery) -> tuple[str, str] | None:
+    """Resolve ``(SELECT <projection> FROM @stage)`` to ``(stage_ref, projection_sql)``.
+
+    Only the SELECT list is carried: it is rewritten from Snowflake's positional ``$N``
+    references to the quoted ``"$N"`` columns the raw staged relation exposes, then
+    rendered as DuckDB SQL for ``build_copy_sql`` to place over that relation. The FROM
+    entry must be a bare stage reference; anything else is not a stage COPY source.
+    """
+    select = subquery.this
+    if not isinstance(select, exp.Select):
+        return None
+    from_ = select.args.get("from_")
+    table = from_.this if from_ is not None else None
+    if not isinstance(table, exp.Table) or not isinstance(table.this, exp.Var):
+        return None
+    stage_ref = table.this.name or ""
+    if not stage_ref.startswith("@"):
+        return None
+    projection = ", ".join(
+        _stage_positional_expression(expression).sql(dialect="duckdb")
+        for expression in select.expressions
+    )
+    return stage_ref, projection
+
+
+def _stage_positional_expression(expression: exp.Expression) -> exp.Expression:
+    """Rewrite a staged-file projection's ``$N`` references to quoted ``"$N"`` columns."""
+
+    def replace(node: exp.Expression) -> exp.Expression:
+        index = _positional_index(node)
+        return exp.column(f"${index}", quoted=True) if index is not None else node
+
+    return expression.transform(replace, copy=True)
 
 
 def _filter_matches(
@@ -589,6 +639,7 @@ def build_copy_sql(
     stage_ref_sql: str,
     file_format: dict[str, Any],
     pattern: str | None = None,
+    projection: str | None = None,
 ) -> str:
     """Build DuckDB SQL that loads the staged files into ``table_sql``."""
     stage = parse_stage_ref(stage_ref_sql)
@@ -630,7 +681,7 @@ def build_copy_sql(
     if groups["CSV"]:
         statements.append(_copy_csv_sql(table_sql, groups["CSV"], file_format))
     if groups["JSON"]:
-        statements.append(_copy_json_sql(table_sql, groups["JSON"]))
+        statements.append(_copy_json_sql(table_sql, groups["JSON"], stage_ref_sql, projection))
     if groups["PARQUET"]:
         statements.append(_copy_parquet_sql(table_sql, groups["PARQUET"]))
     if not statements:
@@ -677,8 +728,36 @@ def _copy_csv_sql(table_sql: str, files: list[str], file_format: dict[str, Any])
     return f"INSERT INTO {table_sql} SELECT * FROM {read_call}"
 
 
-def _copy_json_sql(table_sql: str, files: list[str]) -> str:
-    return f"INSERT INTO {table_sql} SELECT * FROM read_json_auto({_format_file_list(files)})"
+def _copy_json_sql(
+    table_sql: str, files: list[str], ref: str, projection: str | None = None
+) -> str:
+    if projection is None:
+        return (
+            f"INSERT INTO {table_sql} SELECT * "
+            f"FROM read_json_auto({_format_file_list(files)})"
+        )
+    # A projected `FROM (SELECT ... FROM @stage)` addresses each record as `$1`, so the
+    # reader must expose the raw document as that single value (read_json_auto flattens
+    # the keys into columns instead).
+    return (
+        f"INSERT INTO {table_sql} SELECT {projection} "
+        f"FROM ({_raw_json_relation(files, ref)})"
+    )
+
+
+def _raw_json_relation(files: list[str], ref: str) -> str:
+    """DuckDB relation exposing each staged JSON record as a single ``$1`` value."""
+    _check_newline_delimited_json(files, ref)
+    # `CAST` (not `TRY_CAST`): a malformed record must fail loudly rather than silently
+    # becoming a NULL row. Blank lines are removed by the filter, which is evaluated
+    # before the projection.
+    return (
+        'SELECT CAST(column0 AS JSON) AS "$1" '
+        f"FROM read_csv({_format_file_list(files)}, header=false, quote='', "
+        "delim='\\x01', columns={'column0': 'VARCHAR'}, auto_detect=false, "
+        f"max_line_size={_MAX_RECORD_BYTES}) "
+        "WHERE trim(column0) <> ''"
+    )
 
 
 def _copy_parquet_sql(table_sql: str, files: list[str]) -> str:
@@ -1311,17 +1390,7 @@ def resolve_stage_file_source(
                 f"FROM read_blob({_format_file_list(files)})"
             )
         else:
-            _check_newline_delimited_json(files, ref)
-            # `CAST` (not `TRY_CAST`): a malformed record must fail loudly rather than
-            # silently becoming a NULL row. Blank lines are removed by the filter, which
-            # is evaluated before the projection.
-            relation_sql = (
-                'SELECT CAST(column0 AS JSON) AS "$1" '
-                f"FROM read_csv({_format_file_list(files)}, header=false, quote='', "
-                "delim='\\x01', columns={'column0': 'VARCHAR'}, auto_detect=false, "
-                f"max_line_size={_MAX_RECORD_BYTES}) "
-                "WHERE trim(column0) <> ''"
-            )
+            relation_sql = _raw_json_relation(files, ref)
         return StageFileSource(ref, file_format, files, relation_sql, {1: "$1"})
 
     if file_format == "CSV":

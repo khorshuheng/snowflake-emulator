@@ -1161,6 +1161,27 @@ def test_copy_into_stage_source_is_not_rewritten_as_a_query(client, tmp_path):
     assert copied["data"] == [[2]]
 
 
+def test_copy_into_stage_subquery_applies_projection(client, tmp_path):
+    """`COPY INTO t FROM (SELECT ... FROM @stage)` transforms each record on load."""
+    json_path = tmp_path / "data.json"
+    _write_json(json_path, [{"name": "a", "age": 3}, {"name": "b", "age": 4}])
+    headers = _stage_headers(client)
+    _stage(client, headers, json_path, "@~/staged")
+
+    _select(client, headers, "CREATE TABLE projected (n VARCHAR, a INT)")
+    copied = _select(
+        client,
+        headers,
+        "COPY INTO projected FROM (SELECT $1:name AS n, $1:age AS a "
+        "FROM @~/staged/data.json) FILE_FORMAT = (TYPE = JSON)",
+    )
+    assert copied["data"] == [[2]]
+
+    # The projection, not a 1:1 column copy, is what landed in the table.
+    stored = _select(client, headers, "SELECT * FROM projected ORDER BY a")
+    assert stored["data"] == [["\"a\"", 3], ["\"b\"", 4]]
+
+
 def test_insert_select_from_staged_file(client, tmp_path):
     json_path = tmp_path / "data.json"
     _write_json(json_path, [{"col": 7}])
