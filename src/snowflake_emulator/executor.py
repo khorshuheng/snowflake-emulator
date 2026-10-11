@@ -50,11 +50,19 @@ from snowflake_emulator.translator import (
     is_transaction_control,
     match_use_statement,
     split_statements,
+    translate_create_function,
     transpile_to_duckdb,
 )
 from snowflake_emulator.type_mapping import (
     duckdb_type_to_snowflake,
     duckdb_type_to_snowflake_sql_type,
+)
+from snowflake_emulator.user_functions import (
+    SessionUserFunctionResolver,
+    UserFunctionError,
+    execute_create_function,
+    execute_drop_function,
+    query_user_functions,
 )
 
 
@@ -145,6 +153,10 @@ def execute_sql(
     cursor = manager.cursor()
     cursor.execute(f'USE "{session.database}"."{session.schema}"')
 
+    # Resolves user-defined function calls to the DuckDB macros backing them; loads
+    # lazily so a session with no ``CREATE FUNCTION`` never touches the side table.
+    user_functions = SessionUserFunctionResolver(manager, session)
+
     stage_command = match_stage_command(raw_sql)
     if stage_command is not None:
         return _execute_stage_command(manager, session, raw_sql, stage_command)
@@ -228,7 +240,12 @@ def execute_sql(
             row_type, rows = create_db
             continue
 
-        show_result = _execute_snowflake_show(cursor, session, statement)
+        function_ddl = _execute_function_ddl(manager, cursor, session, statement)
+        if function_ddl is not None:
+            row_type, rows = function_ddl
+            continue
+
+        show_result = _execute_snowflake_show(manager, cursor, session, statement)
         if show_result is not None:
             row_type, rows = show_result
             continue
@@ -243,9 +260,14 @@ def execute_sql(
             row_type, rows = show_keys
             continue
 
-        show_misc = _execute_show_misc(cursor, session, statement)
+        show_misc = _execute_show_misc(manager, cursor, session, statement)
         if show_misc is not None:
             row_type, rows = show_misc
+            continue
+
+        describe_result = _execute_function_describe(manager, session, statement)
+        if describe_result is not None:
+            row_type, rows = describe_result
             continue
 
         describe_result = _execute_snowflake_describe(cursor, session, statement)
@@ -260,7 +282,7 @@ def execute_sql(
                 raise ExecutionError(str(exc)) from exc
 
         try:
-            duckdb_sql = transpile_to_duckdb(statement)
+            duckdb_sql = transpile_to_duckdb(statement, user_functions)
         except TranslationError as exc:
             raise _as_execution_error(exc) from exc
 
@@ -720,6 +742,7 @@ def _name_prefix_filter(column: str, prefix: str | None) -> str:
 
 
 def _execute_snowflake_show(
+    manager: DuckDBManager,
     cursor: Any,
     session: SessionContext,
     statement: exp.Expression,
@@ -732,26 +755,18 @@ def _execute_snowflake_show(
     Returns ``None`` for SHOW forms this handler doesn't own.
     """
     if isinstance(statement, exp.Command):
-        text = (statement.args.get("expression") or "").upper()
-        if any(kind in text for kind in ("USER FUNCTIONS IN", "ALL FUNCTIONS IN", "EXTERNAL FUNCTIONS IN")):
-            # No user functions are emulated; return the Snowflake SHOW FUNCTIONS
-            # shape with zero rows (dbt filters ``is_builtin = 'N'``).
-            cursor.execute(
-                """
-                SELECT
-                    NULL::TIMESTAMP AS created_on,
-                    NULL::VARCHAR AS name,
-                    NULL::VARCHAR AS schema_name,
-                    NULL::VARCHAR AS catalog_name,
-                    'N'::VARCHAR AS is_builtin,
-                    'N'::VARCHAR AS is_secure,
-                    NULL::VARCHAR AS arguments,
-                    NULL::VARCHAR AS result_type,
-                    NULL::VARCHAR AS description
-                WHERE FALSE
-                """
+        text = str(statement.args.get("expression") or "")
+        upper = text.upper()
+        if any(
+            kind in upper
+            for kind in ("USER FUNCTIONS", "ALL FUNCTIONS", "EXTERNAL FUNCTIONS")
+        ):
+            # sqlglot cannot parse ``SHOW USER FUNCTIONS IN ...``, so this form arrives as
+            # a raw command and its scope/LIKE clause is parsed from the text.
+            database, schema = _function_show_scope(text, session)
+            return _user_function_show(
+                manager, cursor, database, schema, _show_like_pattern(text)
             )
-            return _result_columns(cursor)
         return None
     if not isinstance(statement, exp.Show):
         return None
@@ -1033,6 +1048,7 @@ def _execute_show_keys(
 
 
 def _execute_show_misc(
+    manager: DuckDBManager,
     cursor: Any,
     session: SessionContext,
     statement: exp.Expression,
@@ -1105,9 +1121,14 @@ def _execute_show_misc(
             "SELECT NULL::VARCHAR AS name, NULL::VARCHAR AS schema_name, NULL::VARCHAR AS catalog_name WHERE FALSE"
         )
     elif obj == "FUNCTIONS":
-        cursor.execute(
-            "SELECT NULL::VARCHAR AS name, NULL::VARCHAR AS schema_name, NULL::VARCHAR AS catalog_name WHERE FALSE"
-        )
+        scope = _show_scope(statement, session) if isinstance(statement, exp.Show) else None
+        database, schema = scope or (session.database, session.schema)
+        like = None
+        if isinstance(statement, exp.Show):
+            pattern = statement.args.get("like")
+            if isinstance(pattern, exp.Literal) and pattern.is_string:
+                like = str(pattern.this)
+        return _user_function_show(manager, cursor, database, schema, like)
     elif obj == "USERS":
         cursor.execute("SELECT NULL::VARCHAR AS name, NULL::TIMESTAMP AS created_on WHERE FALSE")
     else:
@@ -1130,6 +1151,203 @@ def _prefer_declared_type(
     if not isinstance(declared, str):
         return None
     return declared if _DECLARED_TYPE_OVERRIDE.match(declared.upper()) else None
+
+
+# Snowflake's ``SHOW FUNCTIONS`` column set. The metadata is derived from a typed,
+# empty query so the declared Snowflake types (and the DuckDB types the wire encoders
+# use) match the rest of the SHOW surface; the rows are built from recorded functions.
+_USER_FUNCTION_SHOW_SQL = """
+    SELECT
+        NULL::TIMESTAMP AS created_on,
+        NULL::VARCHAR AS name,
+        NULL::VARCHAR AS schema_name,
+        NULL::VARCHAR AS catalog_name,
+        NULL::VARCHAR AS is_builtin,
+        NULL::VARCHAR AS is_secure,
+        NULL::VARCHAR AS arguments,
+        NULL::VARCHAR AS result_type,
+        NULL::VARCHAR AS description
+    WHERE FALSE
+"""
+
+# ``DESCRIBE FUNCTION`` adds the signature bounds a caller needs to tell overloads
+# apart. Snowflake reports both as the number of declared arguments.
+_USER_FUNCTION_DESCRIBE_SQL = """
+    SELECT
+        NULL::TIMESTAMP AS created_on,
+        NULL::VARCHAR AS name,
+        NULL::VARCHAR AS schema_name,
+        NULL::VARCHAR AS catalog_name,
+        NULL::VARCHAR AS is_builtin,
+        NULL::VARCHAR AS is_aggregate,
+        NULL::VARCHAR AS is_ansi,
+        NULL::INTEGER AS min_num_arguments,
+        NULL::INTEGER AS max_num_arguments,
+        NULL::VARCHAR AS arguments,
+        NULL::VARCHAR AS description,
+        NULL::VARCHAR AS language,
+        NULL::VARCHAR AS body
+    WHERE FALSE
+"""
+
+# ``SHOW USER FUNCTIONS IN <scope>`` is a raw command (sqlglot cannot parse it), so its
+# optional ``LIKE``/``IN`` clauses are matched out of the statement text.
+_FUNCTION_SHOW_LIKE_RE = re.compile(r"LIKE\s+'((?:[^']|'')*)'", re.IGNORECASE)
+_FUNCTION_SHOW_SCOPE_RE = re.compile(
+    r"\bIN\s+(?:DATABASE\s+|SCHEMA\s+)?([A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)?)",
+    re.IGNORECASE,
+)
+_FUNCTION_SHOW_DATABASE_RE = re.compile(r"\bIN\s+DATABASE\b", re.IGNORECASE)
+
+
+def _show_like_pattern(text: str) -> str | None:
+    """Extract the ``LIKE '<pattern>'`` filter from a raw SHOW statement."""
+    match = _FUNCTION_SHOW_LIKE_RE.search(text)
+    return match.group(1).replace("''", "'") if match else None
+
+
+def _function_show_scope(
+    text: str, session: SessionContext
+) -> tuple[str, str | None]:
+    """Extract the ``(database, schema)`` a raw ``SHOW ... FUNCTIONS IN ...`` targets.
+
+    ``None`` for the schema means every schema in the database
+    (``SHOW FUNCTIONS IN DATABASE db``); an unscoped statement uses the session's current
+    database and schema.
+    """
+    match = _FUNCTION_SHOW_SCOPE_RE.search(text)
+    if match is None:
+        return session.database, session.schema
+    parts = match.group(1).split(".")
+    if _FUNCTION_SHOW_DATABASE_RE.search(text):
+        return parts[0], None
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    return session.database, parts[0]
+
+
+def _user_function_show(
+    manager: DuckDBManager,
+    cursor: Any,
+    database: str,
+    schema: str | None,
+    like: str | None = None,
+) -> tuple[list[ColumnMeta], list[list[Any]]]:
+    """Build Snowflake-shaped ``SHOW FUNCTIONS`` output from the recorded functions."""
+    cursor.execute(_USER_FUNCTION_SHOW_SQL)
+    row_type = _result_columns(cursor)[0]
+    rows = [
+        [
+            fn.created_on,
+            fn.name,
+            fn.schema,
+            fn.database,
+            "N",  # is_builtin: only user functions are recorded
+            "N",  # is_secure: SECURE is accepted but not enforced
+            fn.show_signature,
+            fn.return_type,
+            None,  # description
+        ]
+        for fn in query_user_functions(manager, database, schema, like=like)
+    ]
+    return row_type, rows
+
+
+def _execute_function_ddl(
+    manager: DuckDBManager,
+    cursor: Any,
+    session: SessionContext,
+    statement: exp.Expression,
+) -> tuple[list[ColumnMeta], list[list[Any]]] | None:
+    """Handle ``CREATE FUNCTION`` / ``DROP FUNCTION`` for user-defined functions.
+
+    Snowflake UDFs are emulated as DuckDB macros, with the Snowflake-side metadata kept
+    in the catalog's side table (see ``user_functions``). Returns ``None`` for other DDL.
+    """
+    kind = str(statement.args.get("kind") or "").upper()
+    status = [ColumnMeta(name="status", type="text")]
+    if isinstance(statement, exp.Create) and kind == "FUNCTION":
+        try:
+            spec = translate_create_function(statement)
+            message = execute_create_function(manager, cursor, session, spec)
+        except (TranslationError, UserFunctionError) as exc:
+            raise _as_execution_error(exc) from exc
+        return status, [[message]]
+    if isinstance(statement, exp.Drop) and kind == "FUNCTION":
+        this = statement.args.get("this")
+        if not isinstance(this, exp.Table):
+            return None
+        # `DROP FUNCTION f(a, b)` carries the signature; only its length is used, since
+        # Snowflake and DuckDB spell the argument types differently (STRING vs VARCHAR).
+        arity = len(statement.expressions) if statement.expressions else None
+        try:
+            message = execute_drop_function(
+                manager,
+                cursor,
+                session,
+                this.name,
+                arity,
+                if_exists=bool(statement.args.get("exists")),
+            )
+        except UserFunctionError as exc:
+            raise _as_execution_error(exc) from exc
+        return status, [[message]]
+    return None
+
+
+def _execute_function_describe(
+    manager: DuckDBManager,
+    session: SessionContext,
+    statement: exp.Expression,
+) -> tuple[list[ColumnMeta], list[list[Any]]] | None:
+    """Execute ``DESCRIBE FUNCTION`` from the recorded user functions.
+
+    An omitted argument list lists every overload, matching Snowflake's behaviour for a
+    function whose name is unambiguous. Returns ``None`` for other DESCRIBE forms.
+    """
+    if not (
+        isinstance(statement, exp.Describe)
+        and str(statement.args.get("kind") or "").upper() == "FUNCTION"
+    ):
+        return None
+    this = statement.args.get("this")
+    arity = None
+    if isinstance(this, exp.Schema):
+        arity = len(this.expressions)
+        this = this.this
+    if not isinstance(this, exp.Table):
+        return None
+
+    functions = query_user_functions(
+        manager, session.database, session.schema, name=this.name
+    )
+    if arity is not None:
+        functions = [fn for fn in functions if fn.arity == arity]
+    if not functions:
+        raise ExecutionError(f"Function {this.name.upper()} does not exist.")
+
+    cursor = manager.cursor()
+    cursor.execute(_USER_FUNCTION_DESCRIBE_SQL)
+    row_type = _result_columns(cursor)[0]
+    rows = [
+        [
+            fn.created_on,
+            fn.name,
+            fn.schema,
+            fn.database,
+            "N",  # is_builtin
+            "N",  # is_aggregate: aggregate UDFs are not emulated
+            "N",  # is_ansi
+            fn.arity,
+            fn.arity,
+            fn.describe_signature,
+            None,  # description
+            fn.language,
+            fn.body,
+        ]
+        for fn in functions
+    ]
+    return row_type, rows
 
 
 def _execute_snowflake_describe(

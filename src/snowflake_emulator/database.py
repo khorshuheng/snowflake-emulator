@@ -56,6 +56,9 @@ class DuckDBManager:
         # addresses.
         self._connection = duckdb.connect(":memory:")
         self._attached_catalogs: set[str] = set()
+        # {UPPER(function name): {arity: macro name}} per (database, schema), loaded
+        # from the side table on first use and dropped whenever a function changes.
+        self._function_arity_cache: dict[tuple[str, str], dict[str, dict[int, str]]] = {}
         if self._persistent:
             self._storage_dir.mkdir(parents=True, exist_ok=True)
             # Re-attach databases left behind by a previous run so they are usable (and
@@ -193,6 +196,27 @@ class DuckDBManager:
             )
             """
         )
+        # User-defined functions (``CREATE FUNCTION``) are emulated as DuckDB macros,
+        # which store no Snowflake-side metadata. The declared signature and body are
+        # kept here so ``SHOW FUNCTIONS`` / ``DESCRIBE FUNCTION`` can report them, and so
+        # the macro can be re-resolved after a restart with a persistent database.
+        self._connection.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {db_ident}.{schema}._sf_functions_ext (
+                function_catalog VARCHAR,
+                function_schema VARCHAR,
+                function_name VARCHAR,
+                num_arguments INTEGER,
+                macro_name VARCHAR,
+                arguments VARCHAR,
+                return_type VARCHAR,
+                language VARCHAR,
+                body VARCHAR,
+                created_on TIMESTAMP,
+                PRIMARY KEY (function_catalog, function_schema, function_name, num_arguments)
+            )
+            """
+        )
         self._connection.execute(
             f"""
             CREATE OR REPLACE VIEW {db_ident}.{schema}.columns AS
@@ -256,6 +280,129 @@ class DuckDBManager:
                     [database, schema, table, name, declared_type, comment],
                 )
 
+    def save_function(
+        self,
+        database: str,
+        schema: str,
+        name: str,
+        num_arguments: int,
+        macro_name: str,
+        arguments: str,
+        return_type: str,
+        language: str,
+        body: str,
+    ) -> None:
+        """Record a user-defined function's Snowflake-side metadata.
+
+        Keyed by (name, arity): the emulator supports one function per name/arity pair,
+        because a DuckDB macro name cannot be overloaded (see ``translator``).
+        """
+        db_ident = _quote_ident(database)
+        ext_ident = _quote_ident(INFORMATION_SCHEMA_SCHEMA)
+        with self._lock:
+            self._connection.execute(
+                f"DELETE FROM {db_ident}.{ext_ident}._sf_functions_ext "
+                "WHERE lower(function_catalog) = lower(?) AND lower(function_schema) = lower(?) "
+                "AND lower(function_name) = lower(?) AND num_arguments = ?",
+                [database, schema, name, num_arguments],
+            )
+            self._connection.execute(
+                f"INSERT INTO {db_ident}.{ext_ident}._sf_functions_ext VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, now())",
+                [
+                    database,
+                    schema,
+                    name,
+                    num_arguments,
+                    macro_name,
+                    arguments,
+                    return_type,
+                    language,
+                    body,
+                ],
+            )
+            self._function_arity_cache.pop(self._function_cache_key(database, schema), None)
+
+    def delete_functions(
+        self, database: str, schema: str, name: str, num_arguments: int | None = None
+    ) -> list[tuple[str, int, str]]:
+        """Delete a function's metadata, returning the removed (name, arity, macro) rows.
+
+        With no ``num_arguments`` every overload of the name is removed, matching
+        Snowflake's ``DROP FUNCTION f`` without a signature.
+        """
+        db_ident = _quote_ident(database)
+        ext_ident = _quote_ident(INFORMATION_SCHEMA_SCHEMA)
+        where = (
+            "WHERE lower(function_catalog) = lower(?) AND lower(function_schema) = lower(?) "
+            "AND lower(function_name) = lower(?)"
+        )
+        params: list[Any] = [database, schema, name]
+        if num_arguments is not None:
+            where += " AND num_arguments = ?"
+            params.append(num_arguments)
+        with self._lock:
+            rows = self._connection.execute(
+                f"SELECT function_name, num_arguments, macro_name FROM "
+                f"{db_ident}.{ext_ident}._sf_functions_ext {where}",
+                params,
+            ).fetchall()
+            self._connection.execute(
+                f"DELETE FROM {db_ident}.{ext_ident}._sf_functions_ext {where}", params
+            )
+            self._function_arity_cache.pop(self._function_cache_key(database, schema), None)
+        return [(str(row[0]), int(row[1]), str(row[2])) for row in rows]
+
+    def query_functions(
+        self,
+        database: str,
+        schema: str | None = None,
+        name: str | None = None,
+        like: str | None = None,
+    ) -> list[tuple[Any, ...]]:
+        """Return recorded functions as (name, schema, catalog, arity, macro, args, return, language, body, created_on)."""
+        db_ident = _quote_ident(database)
+        ext_ident = _quote_ident(INFORMATION_SCHEMA_SCHEMA)
+        where = "WHERE lower(function_catalog) = lower(?)"
+        params: list[Any] = [database]
+        if schema is not None:
+            where += " AND lower(function_schema) = lower(?)"
+            params.append(schema)
+        if name is not None:
+            where += " AND lower(function_name) = lower(?)"
+            params.append(name)
+        if like is not None:
+            where += " AND lower(function_name) LIKE lower(?)"
+            params.append(like)
+        with self._lock:
+            return self._connection.execute(
+                "SELECT function_name, function_schema, function_catalog, num_arguments, "
+                "macro_name, arguments, return_type, language, body, created_on "
+                f"FROM {db_ident}.{ext_ident}._sf_functions_ext {where} "
+                "ORDER BY lower(function_name), num_arguments",
+                params,
+            ).fetchall()
+
+    def function_arities(self, database: str, schema: str) -> dict[str, dict[int, str]]:
+        """Return ``{UPPERCASE(function name): {arity: macro name}}`` for a schema.
+
+        Used to resolve user-defined function calls to their mangled macro names while
+        translating a query.
+        """
+        key = self._function_cache_key(database, schema)
+        with self._lock:
+            cached = self._function_arity_cache.get(key)
+            if cached is None:
+                cached = {}
+                for row in self.query_functions(database, schema):
+                    cached.setdefault(str(row[0]).upper(), {})[int(row[3])] = str(row[4])
+                self._function_arity_cache[key] = cached
+            return cached
+
+    @staticmethod
+    def _function_cache_key(database: str, schema: str) -> tuple[str, str]:
+        return (database.lower(), schema.lower())
+
     def cursor(self) -> duckdb.DuckDBPyConnection:
         """Return an isolated cursor so concurrent requests don't clobber each other's state."""
         return self._connection.cursor()
@@ -280,6 +427,11 @@ class DuckDBManager:
             if database.lower() in self._attached_catalogs:
                 self._connection.execute(f"DETACH {db_ident}")
                 self._attached_catalogs.discard(database.lower())
+            self._function_arity_cache = {
+                key: value
+                for key, value in self._function_arity_cache.items()
+                if key[0] != database.lower()
+            }
             if self._persistent:
                 # Remove the backing file (and any write-ahead log) so re-attaching
                 # does not resurrect the replaced database's contents.

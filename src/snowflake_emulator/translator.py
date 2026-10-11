@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Protocol
 
 import sqlglot
 from sqlglot import exp
 from sqlglot.tokens import TokenType
+
+from snowflake_emulator.type_mapping import duckdb_type_to_snowflake_sql_type
 
 READ_DIALECT = "snowflake"
 WRITE_DIALECT = "duckdb"
@@ -993,12 +996,300 @@ def _rewrite_clone(statement: exp.Expression) -> exp.Expression:
     return rewritten
 
 
+def _apply_transforms(statement: exp.Expression) -> exp.Expression:
+    """Apply the Snowflake-to-DuckDB AST rewrites shared by statements and UDF bodies.
+
+    A ``CREATE FUNCTION`` body is Snowflake SQL in its own right, so it has to go
+    through exactly the same rewrites as a top-level statement -- that is what turns
+    e.g. ``EQUAL_NULL(a, b)`` into DuckDB's ``a IS NOT DISTINCT FROM b``.
+    """
+    statement = statement.transform(_uppercase_unquoted_identifiers)
+    statement = statement.transform(_rewrite_information_schema)
+    statement = statement.transform(_rewrite_snowflake_specifics)
+    # After the rewrites above: an array call is rebuilt from its operands' SQL, so
+    # those operands must already be in their final DuckDB form.
+    return _rewrite_json_array_functions(statement)
+
+
+# User-defined functions are emulated as DuckDB macros. A DuckDB macro name cannot be
+# overloaded -- a second ``CREATE MACRO f(...)`` with a different signature is a
+# "Macro Function with name f already exists" error -- while Snowflake resolves UDFs by
+# signature. Each function is therefore stored under a name mangled with its arity, and
+# call sites are rewritten to match. ``__SFUDF_`` keeps the emulator's own macros
+# distinguishable from DuckDB built-ins and user tables.
+USER_FUNCTION_MACRO_PREFIX = "__SFUDF_"
+
+
+def user_function_macro_name(name: str, arity: int) -> str:
+    """Return the DuckDB macro name backing the Snowflake function `name`."""
+    return f"{USER_FUNCTION_MACRO_PREFIX}{name}__{arity}"
+
+
+def _identifier(name: str) -> exp.Identifier:
+    """Build an identifier node, quoting it only when it is not a plain identifier."""
+    if _SIMPLE_IDENTIFIER_RE.match(name):
+        return exp.to_identifier(name)
+    return exp.to_identifier(name, quoted=True)
+
+
+def _snowflake_name(identifier: exp.Identifier) -> str:
+    """Return an identifier's name in Snowflake casing (unquoted names are uppercased)."""
+    return identifier.name if identifier.args.get("quoted") else identifier.name.upper()
+
+
+def _render_identifier(name: str) -> str:
+    """Render an identifier as SQL text, quoted only when it needs to be."""
+    return _identifier(name).sql(dialect=WRITE_DIALECT)
+
+
+@dataclass(frozen=True)
+class UserFunctionArgument:
+    """A user-defined function's parameter, in Snowflake identifier casing.
+
+    ``name`` is the *effective* name after Snowflake's identifier casing is applied
+    (unquoted names are uppercased), so it matches the names the translated body refers
+    to.
+    """
+
+    name: str
+    declared_type: str | None
+
+
+@dataclass(frozen=True)
+class UserFunctionSpec:
+    """A Snowflake SQL UDF, translated into the DuckDB macro that emulates it."""
+
+    name: str
+    arguments: tuple[UserFunctionArgument, ...]
+    return_type: str
+    language: str
+    body: str
+    body_sql: str
+    database: str | None = None
+    schema: str | None = None
+    replace: bool = False
+    if_not_exists: bool = False
+
+    @property
+    def arity(self) -> int:
+        return len(self.arguments)
+
+    @property
+    def macro_name(self) -> str:
+        return user_function_macro_name(self.name, self.arity)
+
+    @property
+    def signature(self) -> str:
+        """The argument list as Snowflake's ``SHOW FUNCTIONS`` reports it."""
+        types = [argument.declared_type or "VARCHAR" for argument in self.arguments]
+        return f"{self.name}({', '.join(types)}) RETURN {self.return_type}"
+
+
+def _function_properties(statement: exp.Create) -> tuple[exp.DataType | None, str, bool]:
+    """Return a ``CREATE FUNCTION``'s declared ``(return type, language, is_table)``."""
+    returns: exp.DataType | None = None
+    language = "SQL"
+    is_table = False
+    properties = statement.args.get("properties")
+    for prop in properties.expressions if properties else []:
+        if isinstance(prop, exp.ReturnsProperty):
+            is_table = bool(prop.args.get("is_table"))
+            if isinstance(prop.this, exp.DataType):
+                returns = prop.this
+        elif isinstance(prop, exp.LanguageProperty) and prop.this is not None:
+            language = (prop.this.name or "SQL").upper() or "SQL"
+    return returns, language, is_table
+
+
+def _function_body_text(statement: exp.Create) -> str:
+    """Return a ``CREATE FUNCTION``'s body as written.
+
+    Snowflake accepts the body either dollar-quoted (``AS $$ ... $$``, parsed as a
+    ``RawString``) or as a plain string literal (``AS 'x + 1'``).
+    """
+    body = statement.args.get("expression")
+    if isinstance(body, exp.RawString):
+        return str(body.this)
+    if isinstance(body, exp.Literal) and body.is_string:
+        return str(body.this)
+    raise TranslationError("CREATE FUNCTION requires a body (AS $$ ... $$).")
+
+
+def _translate_function_body(body: str) -> str:
+    """Translate a SQL UDF body into a DuckDB scalar expression.
+
+    Snowflake allows the body to be either a bare expression (``AS $$ x + 1 $$``) or a
+    single-column ``SELECT`` (``AS $$ SELECT x + 1 $$``). A body selecting more than one
+    column is a table function, which is rejected here because the emulator only
+    emulates scalar UDFs.
+    """
+    if not body.strip():
+        raise TranslationError("CREATE FUNCTION requires a non-empty body.")
+    try:
+        parsed = sqlglot.parse_one(preprocess_array_flatten(body), read=READ_DIALECT)
+    except Exception as exc:  # noqa: BLE001 - reported as a translation error
+        raise TranslationError(
+            f"Failed to parse the function body as SQL: {exc}"
+        ) from exc
+    if parsed is None:
+        raise TranslationError("CREATE FUNCTION requires a non-empty body.")
+    if isinstance(parsed, exp.Select):
+        if len(parsed.expressions) != 1:
+            raise TranslationError(
+                "A SQL UDF body selecting more than one column is a table function, "
+                "which the emulator does not support (only scalar UDFs are)."
+            )
+        parsed = parsed.expressions[0]
+        if isinstance(parsed, exp.Alias):
+            parsed = parsed.this
+    return _apply_transforms(parsed).sql(dialect=WRITE_DIALECT)
+
+
+def translate_create_function(statement: exp.Expression) -> UserFunctionSpec:
+    """Translate a ``CREATE [OR REPLACE] FUNCTION`` into a DuckDB-macro spec.
+
+    Raises :class:`TranslationError` for anything the emulator cannot emulate
+    faithfully, rather than letting DuckDB create a function that silently returns the
+    body text (DuckDB reads ``CREATE FUNCTION f(x) AS 'x + 1'`` as a reference to a
+    native function named ``x + 1``).
+    """
+    if not (
+        isinstance(statement, exp.Create)
+        and str(statement.args.get("kind") or "").upper() == "FUNCTION"
+    ):
+        raise TranslationError("Not a CREATE FUNCTION statement.")
+    udf = statement.this
+    if not isinstance(udf, exp.UserDefinedFunction) or not isinstance(udf.this, exp.Table):
+        raise TranslationError("Unsupported CREATE FUNCTION form.")
+    table = udf.this
+
+    returns, language, is_table = _function_properties(statement)
+    if language != "SQL":
+        raise TranslationError(
+            f"{language} UDFs are not supported by the emulator "
+            f"(no {language.lower()} runtime available)."
+        )
+    if is_table:
+        raise TranslationError(
+            "Table-returning user-defined functions (RETURNS TABLE ...) are not "
+            "supported by the emulator (only scalar SQL UDFs are)."
+        )
+    if returns is None:
+        raise TranslationError("CREATE FUNCTION requires a RETURNS <type> clause.")
+
+    arguments: list[UserFunctionArgument] = []
+    for argument in udf.expressions:
+        kind = argument.args.get("kind") if isinstance(argument, exp.ColumnDef) else None
+        identifier = argument.this
+        if not isinstance(identifier, exp.Identifier):
+            raise TranslationError("Unsupported CREATE FUNCTION argument list.")
+        name = _snowflake_name(identifier)
+        # Rendered through DuckDB first so the reported argument types match the
+        # reported return type (``NUMBER`` -> ``DECIMAL(38, 0)`` -> ``NUMBER(38,0)``).
+        declared = (
+            duckdb_type_to_snowflake_sql_type(kind.sql(dialect=WRITE_DIALECT))
+            if isinstance(kind, exp.DataType)
+            else None
+        )
+        arguments.append(UserFunctionArgument(name=name, declared_type=declared))
+
+    catalog = table.args.get("catalog")
+    db = table.args.get("db")
+    # The function name (and any qualifier) needs Snowflake's identifier casing here:
+    # ``CREATE FUNCTION`` is handled before the generic transpile path, so the
+    # uppercase-identifiers transform never sees this statement.
+    function_name = (
+        _snowflake_name(table.this)
+        if isinstance(table.this, exp.Identifier)
+        else table.name
+    )
+    body = _function_body_text(statement)
+    return UserFunctionSpec(
+        name=function_name,
+        arguments=tuple(arguments),
+        # Report the return type the way ``DESCRIBE``/``SHOW FUNCTIONS`` do for tables,
+        # normalising DuckDB's spelling back to Snowflake's (DECIMAL -> NUMBER).
+        return_type=duckdb_type_to_snowflake_sql_type(returns.sql(dialect=WRITE_DIALECT)),
+        language=language,
+        body=body,
+        body_sql=_translate_function_body(body),
+        database=_snowflake_name(catalog) if isinstance(catalog, exp.Identifier) else None,
+        schema=_snowflake_name(db) if isinstance(db, exp.Identifier) else None,
+        replace=bool(statement.args.get("replace")),
+        if_not_exists=bool(statement.args.get("exists")),
+    )
+
+
+def render_create_macro(spec: UserFunctionSpec, database: str, schema: str) -> str:
+    """Render the DuckDB ``CREATE MACRO`` statement that backs a SQL UDF.
+
+    The macro is catalog/schema-qualified so it lands in the function's Snowflake
+    namespace regardless of what the executing cursor's current schema happens to be.
+    """
+    clauses = ""
+    if spec.replace:
+        clauses = " OR REPLACE"
+    elif spec.if_not_exists:
+        clauses = " IF NOT EXISTS"
+    params = ", ".join(_render_identifier(argument.name) for argument in spec.arguments)
+    name = ".".join(
+        (
+            _render_identifier(database),
+            _render_identifier(schema),
+            _render_identifier(spec.macro_name),
+        )
+    )
+    return f"CREATE{clauses} MACRO {name}({params}) AS ({spec.body_sql})"
+
+
+def render_drop_macro(
+    macro_name: str, database: str, schema: str, *, if_exists: bool = False
+) -> str:
+    """Render the DuckDB ``DROP MACRO`` statement removing a user-defined function."""
+    clause = " IF EXISTS" if if_exists else ""
+    name = ".".join(
+        (
+            _render_identifier(database),
+            _render_identifier(schema),
+            _render_identifier(macro_name),
+        )
+    )
+    return f"DROP MACRO{clause} {name}"
+
+
+class UserFunctionResolver(Protocol):
+    """Resolves a Snowflake UDF call to the DuckDB macro that emulates it."""
+
+    def resolve(self, name: str, arity: int) -> str | None:
+        """Return the DuckDB macro name for `name` called with `arity` arguments."""
+        ...
+
+
+def _rewrite_user_function_calls(
+    statement: exp.Expression, resolver: UserFunctionResolver
+) -> exp.Expression:
+    """Point calls to user-defined functions at their arity-mangled macro names.
+
+    Only ``Anonymous`` calls are considered: a UDF whose name matches a function sqlglot
+    models natively (``COALESCE``, ``ARRAY_SIZE``, ...) is parsed into that node instead
+    and keeps its built-in behaviour.
+    """
+    for call in list(statement.find_all(exp.Anonymous)):
+        macro = resolver.resolve(call.name, len(call.expressions))
+        if macro is not None:
+            call.set("this", _identifier(macro))
+    return statement
+
+
 def _reject_unsupported_function(statement: exp.Expression) -> None:
     """Raise for ``CREATE FUNCTION`` statements the emulator can't faithfully emulate.
 
     DuckDB has no JavaScript/Python/Java/Scala runtime, so a Snowflake UDF with a
     non-SQL ``LANGUAGE`` clause would be silently translated into a broken function
     (the body becomes a string literal). Reject it loudly instead.
+
+    Kept as a guard for the generic transpile path: ``CREATE FUNCTION`` is normally
+    handled by :func:`translate_create_function` before reaching it.
     """
     if not (isinstance(statement, exp.Create) and statement.args.get("kind") == "FUNCTION"):
         return
@@ -1015,17 +1306,21 @@ def _reject_unsupported_function(statement: exp.Expression) -> None:
                 )
 
 
-def transpile_to_duckdb(statement: exp.Expression) -> str:
-    """Transpile a single parsed Snowflake statement into its DuckDB equivalent."""
+def transpile_to_duckdb(
+    statement: exp.Expression,
+    user_functions: UserFunctionResolver | None = None,
+) -> str:
+    """Transpile a single parsed Snowflake statement into its DuckDB equivalent.
+
+    `user_functions` resolves calls to user-defined functions (``CREATE FUNCTION``) to
+    the DuckDB macro backing them; pass ``None`` when no functions can be in scope.
+    """
     try:
         _reject_unsupported_function(statement)
         statement = _rewrite_clone(statement)
-        statement = statement.transform(_uppercase_unquoted_identifiers)
-        statement = statement.transform(_rewrite_information_schema)
-        statement = statement.transform(_rewrite_snowflake_specifics)
-        # After the rewrites above: an array call is rebuilt from its operands' SQL, so
-        # those operands must already be in their final DuckDB form.
-        statement = _rewrite_json_array_functions(statement)
+        statement = _apply_transforms(statement)
+        if user_functions is not None:
+            statement = _rewrite_user_function_calls(statement, user_functions)
 
         # Snowflake's ``INSERT OVERWRITE`` clears the table then inserts; DuckDB has
         # no such statement (it would be mis-serialized as ``INSERT OVERWRITE TABLE``).
