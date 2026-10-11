@@ -171,11 +171,12 @@ Not translated, and left as a loud error rather than a guess:
   `v::VARIANT`, or `PARSE_JSON('[...]')::VARIANT`): DuckDB's `list_sort`/`list_max`/
   `list_min` do not order `VARIANT[]` the way their own `<` operator does — for strings it
   goes by length, so `['aa','ab','b']` comes back `['b','aa','ab']` where Snowflake sorts it
-  lexicographically. Reach the array through a JSON path (`col:path`, which stays `JSON[]`
-  and sorts correctly) or write it as an `ARRAY_CONSTRUCT` list;
-- a **mixed pair** where one operand is a JSON array and the other a native list
-  (`ARRAY_EXCEPT(j:n, ARRAY_CONSTRUCT('a'))`): DuckDB has no common list type for them, and
-  casting a `VARCHAR[]` to `JSON[]` silently loses its values;
+  lexicographically. Write the array as an `ARRAY_CONSTRUCT` list instead. A `col:path`
+  stays `JSON[]` and sorts lexicographically — right for strings, but wrong for numbers
+  (`[10,2,33]` stays `[10,2,33]`);
+- a **mixed pair** where one operand is a JSON/VARIANT array and the other a native list
+  (`ARRAY_EXCEPT(j:n, ARRAY_CONSTRUCT('a'))`, `ARRAYS_OVERLAP(v, ARRAY_CONSTRUCT(2))`):
+  DuckDB has no common element type for them, so the comparison would be silently unequal;
 - an `ARRAY_SLICE` index given as a `?` bind — the 0-based adjustment has to name the index
   twice, so it would consume two values; a literal, a column or a JSON value all work;
 - a lambda *body* that compares or extracts without encoding (`FILTER(j:n, x -> x = 'a')`):

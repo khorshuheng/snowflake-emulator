@@ -476,16 +476,22 @@ def test_array_functions_over_a_bare_variant_array(client):
     DuckDB rejects a VARIANT where its list functions want a LIST (``Binder Error: length
     can only be used on arrays or lists``), so the operand is cast through VARIANT to
     ``VARIANT[]`` -- a real list whose elements keep Snowflake's VARIANT comparison
-    semantics (``'1'`` and ``1`` are different values).
+    semantics (``'1'`` and ``1`` are different values). A searched value is round-tripped
+    ``VARIANT`` -> ``JSON`` -> ``VARIANT`` so a VARIANT number (an ``INT32``) matches the
+    ``UINT64`` a ``PARSE_JSON`` array element has.
     """
     def post(statement):
         return client.post("/api/v2/statements", json={"statement": statement})
 
-    assert post("CREATE TABLE bare (names VARIANT, nums VARIANT)").status_code == 200
+    assert (
+        post("CREATE TABLE bare (names VARIANT, nums VARIANT, deep VARIANT, two VARIANT)")
+        .status_code
+        == 200
+    )
     assert (
         post(
             "INSERT INTO bare SELECT PARSE_JSON('[\"ada\",\"bob\"]'), "
-            "PARSE_JSON('[3,1,2]')"
+            "PARSE_JSON('[3,1,2]'), PARSE_JSON('[[1,2],[3]]'), TO_VARIANT(2)"
         ).status_code
         == 200
     )
@@ -499,11 +505,19 @@ def test_array_functions_over_a_bare_variant_array(client):
         ("SELECT ARRAY_CONTAINS(2, nums) FROM bare", [[True]]),
         # A string is not the number it spells, as in Snowflake.
         ("SELECT ARRAY_CONTAINS('2', nums) FROM bare", [[False]]),
+        # A VARIANT-typed value keeps its numeric width; normalizing it matches the array.
+        ("SELECT ARRAY_CONTAINS(two, nums) FROM bare", [[True]]),
+        ("SELECT ARRAY_CONTAINS(2::VARIANT, nums) FROM bare", [[True]]),
+        ("SELECT ARRAY_POSITION(two, nums) FROM bare", [[2]]),
+        ("SELECT ARRAY_REMOVE(nums, two) FROM bare", [[[3, 1]]]),
+        ("SELECT ARRAY_CONTAINS(TO_VARIANT(ARRAY_CONSTRUCT(1,2)), deep) FROM bare", [[True]]),
         ("SELECT ARRAY_SIZE(names) FROM bare", [[2]]),
         ("SELECT ARRAY_POSITION('bob', names) FROM bare", [[1]]),
         ("SELECT ARRAY_POSITION('zoe', names) FROM bare", [[0]]),
         ("SELECT ARRAY_SLICE(names, 0, 0) FROM bare", [[['ada']]]),
         ("SELECT ARRAY_CONTAINS('ada', ARRAY_SLICE(names, 0, 0)) FROM bare", [[True]]),
+        # Flatten follows an ARRAY_SLICE result, which is a call rather than a CAST.
+        ("SELECT ARRAY_FLATTEN(ARRAY_SLICE(deep, 0, 0), 1) FROM bare", [[[1, 2]]]),
         ("SELECT ARRAY_EXCEPT(names, names) FROM bare", [[[]]]),
         ("SELECT ARRAYS_OVERLAP(names, names) FROM bare", [[True]]),
         ("SELECT ARRAY_TO_STRING(names, '|') FROM bare", [['ada|bob']]),
@@ -514,12 +528,49 @@ def test_array_functions_over_a_bare_variant_array(client):
         assert resp.json()["data"] == expected, statement
 
 
+def test_array_set_operation_rejects_a_mixed_pair(client):
+    """A JSON/VARIANT operand and a native list have no common element type.
+
+    DuckDB compares a JSON/VARIANT element against an ``INT``/``VARCHAR`` element as unequal,
+    so the pair is rejected instead of answered wrong (`ARRAYS_OVERLAP(v, ARRAY_CONSTRUCT(2))`
+    used to return FALSE for a shared ``2``).
+    """
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    assert post("CREATE TABLE mix (nums VARIANT, j VARIANT)").status_code == 200
+    assert (
+        post(
+            "INSERT INTO mix SELECT PARSE_JSON('[3,1,2]'), PARSE_JSON('{\"n\":[3,1,2]}')"
+        ).status_code
+        == 200
+    )
+
+    for statement in (
+        "SELECT ARRAYS_OVERLAP(nums, ARRAY_CONSTRUCT(2)) FROM mix",
+        "SELECT ARRAY_EXCEPT(nums, ARRAY_CONSTRUCT(2)) FROM mix",
+        "SELECT ARRAY_EXCEPT(ARRAY_CONSTRUCT(2,3), nums) FROM mix",
+        "SELECT ARRAYS_OVERLAP(j:n, ARRAY_CONSTRUCT(2)) FROM mix",
+    ):
+        resp = post(statement)
+        assert resp.status_code == 422, (statement, resp.json())
+        assert "same kind" in resp.json()["detail"]["message"]
+
+    # Both operands the same kind still work, native pairs included.
+    assert post("SELECT ARRAYS_OVERLAP(nums, nums) FROM mix").json()["data"] == [[True]]
+    assert post("SELECT ARRAY_EXCEPT(nums, nums) FROM mix").json()["data"] == [[[]]]
+    assert post(
+        "SELECT ARRAY_EXCEPT(ARRAY_CONSTRUCT('a','b'), ARRAY_CONSTRUCT('b'))"
+    ).json()["data"] == [[['a']]]
+
+
 def test_array_ordering_over_a_variant_array_is_rejected(client):
     """DuckDB's list_sort/list_max/list_min order VARIANT by length, not by the ``<`` operator.
 
     ``['aa','ab','b']`` comes back ``['b','aa','ab']`` where Snowflake sorts it
     lexicographically, so an ordering function over a VARIANT array is a loud error rather
-    than a silently wrong order. A JSON path (a ``JSON[]`` list) still sorts correctly.
+    than a silently wrong order. A JSON path (a ``JSON[]`` list) sorts lexicographically,
+    which matches Snowflake for strings but not for numbers.
     """
     def post(statement):
         return client.post("/api/v2/statements", json={"statement": statement})
