@@ -296,6 +296,60 @@ def test_copy_stage_source_subquery_without_stage_is_none():
     assert copy_stage_source(node) is None
 
 
+def test_copy_stage_source_subquery_rejects_dropped_clauses():
+    # Each clause changes the rows or their shape; silently dropping one would load the
+    # wrong data, so the subquery form rejects them instead.
+    for select in (
+        "SELECT $1:a FROM @stage WHERE $1:b = 1",
+        "SELECT DISTINCT $1:a FROM @stage",
+        "SELECT $1:a FROM @stage LIMIT 3",
+        "SELECT $1:a FROM @stage GROUP BY $1:a",
+        "SELECT $1:a FROM @stage ORDER BY $1:a",
+    ):
+        node = sqlglot.parse_one(f"COPY INTO t FROM ({select})", read="snowflake")
+        with pytest.raises(StageError, match="unsupported clause"):
+            copy_stage_source(node)
+
+
+def test_copy_stage_source_subquery_rejects_joins_and_ctes():
+    joined = sqlglot.parse_one(
+        "COPY INTO t FROM (SELECT $1:a FROM @stage, (SELECT 1 AS z))",
+        read="snowflake",
+    )
+    with pytest.raises(StageError, match="JOIN"):
+        copy_stage_source(joined)
+    cte = sqlglot.parse_one(
+        "COPY INTO t FROM (WITH c AS (SELECT 1) SELECT $1:a FROM @stage)",
+        read="snowflake",
+    )
+    with pytest.raises(StageError, match="WITH"):
+        copy_stage_source(cte)
+
+
+def test_copy_stage_source_subquery_rewrites_qualified_positional():
+    node = sqlglot.parse_one(
+        "COPY INTO t FROM (SELECT s.$1:a AS a FROM @stage s)", read="snowflake"
+    )
+    _table, stage_ref, _fmt, _pattern, projection = copy_stage_source(node)
+    assert stage_ref == "@stage"
+    # The subquery alias cannot be resolved by the rebuilt relation, so it is dropped.
+    assert projection == '"$1" -> \'$.a\' AS a'
+
+
+def test_copy_stage_source_subquery_rejects_missing_positional():
+    node = sqlglot.parse_one(
+        "COPY INTO t FROM (SELECT $2 AS a FROM @stage)", read="snowflake"
+    )
+    with pytest.raises(StageError, match=r"\$2 does not exist"):
+        copy_stage_source(node)
+
+
+def test_copy_stage_source_subquery_rejects_empty_select():
+    node = sqlglot.parse_one("COPY INTO t FROM (SELECT FROM @stage)", read="snowflake")
+    with pytest.raises(StageError, match="requires a select list"):
+        copy_stage_source(node)
+
+
 def test_copy_stage_source_without_pattern_or_stage():
     plain = sqlglot.parse_one("COPY INTO t FROM @stage", read="snowflake")
     assert copy_stage_source(plain)[3] is None

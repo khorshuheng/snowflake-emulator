@@ -549,17 +549,58 @@ def copy_stage_source(
     return table_sql, stage_ref, file_format, _copy_param(copy_node, "PATTERN"), projection
 
 
+# Only these SELECT clauses are carried into the staged reader. Every other clause
+# (WHERE, DISTINCT, joins, ...) changes which rows are read or how they are shaped, and
+# build_copy_sql rebuilds the FROM from scratch, so silently dropping one would load the
+# wrong data; they are rejected instead, naming the SQL keyword.
+_SUPPORTED_SUBQUERY_CLAUSES = frozenset({"expressions", "from_"})
+_SUBQUERY_CLAUSE_NAMES = {
+    "with_": "WITH",
+    "distinct": "DISTINCT",
+    "where": "WHERE",
+    "group": "GROUP BY",
+    "having": "HAVING",
+    "qualify": "QUALIFY",
+    "order": "ORDER BY",
+    "limit": "LIMIT",
+    "offset": "OFFSET",
+    "joins": "JOIN",
+    "windows": "WINDOW",
+    "cluster": "CLUSTER BY",
+    "distribute": "DISTRIBUTE BY",
+    "sort": "SORT BY",
+    "sample": "SAMPLE",
+    "locks": "LOCK",
+    "into": "INTO",
+    "top": "TOP",
+}
+
+
 def _subquery_stage_source(subquery: exp.Subquery) -> tuple[str, str] | None:
     """Resolve ``(SELECT <projection> FROM @stage)`` to ``(stage_ref, projection_sql)``.
 
     Only the SELECT list is carried: it is rewritten from Snowflake's positional ``$N``
-    references to the quoted ``"$N"`` columns the raw staged relation exposes, then
+    references to the quoted ``"$N"`` column the raw staged relation exposes, then
     rendered as DuckDB SQL for ``build_copy_sql`` to place over that relation. The FROM
     entry must be a bare stage reference; anything else is not a stage COPY source.
     """
     select = subquery.this
     if not isinstance(select, exp.Select):
         return None
+    unsupported = [
+        key
+        for key, value in select.args.items()
+        if value and key not in _SUPPORTED_SUBQUERY_CLAUSES
+    ]
+    if unsupported:
+        clauses = ", ".join(
+            _SUBQUERY_CLAUSE_NAMES.get(key, key.rstrip("_").upper())
+            for key in unsupported
+        )
+        raise StageError(
+            "COPY INTO ... FROM (SELECT ...) supports only a SELECT list over a single "
+            f"stage reference; unsupported clause(s): {clauses}."
+        )
     from_ = select.args.get("from_")
     table = from_.this if from_ is not None else None
     if not isinstance(table, exp.Table) or not isinstance(table.this, exp.Var):
@@ -567,21 +608,44 @@ def _subquery_stage_source(subquery: exp.Subquery) -> tuple[str, str] | None:
     stage_ref = table.this.name or ""
     if not stage_ref.startswith("@"):
         return None
+    if not select.expressions:
+        raise StageError(
+            "COPY INTO ... FROM (SELECT ...) requires a select list over the stage."
+        )
     projection = ", ".join(
-        _stage_positional_expression(expression).sql(dialect="duckdb")
+        _stage_positional_expression(expression, stage_ref).sql(dialect="duckdb")
         for expression in select.expressions
     )
     return stage_ref, projection
 
 
-def _stage_positional_expression(expression: exp.Expression) -> exp.Expression:
-    """Rewrite a staged-file projection's ``$N`` references to quoted ``"$N"`` columns."""
+def _stage_positional_expression(expression: exp.Expression, ref: str) -> exp.Expression:
+    """Rewrite a staged-file projection's ``$N`` references to the raw ``"$1"`` column."""
 
     def replace(node: exp.Expression) -> exp.Expression:
-        index = _positional_index(node)
-        return exp.column(f"${index}", quoted=True) if index is not None else node
+        # A qualified `alias.$N` nests the parameter in a Column; matching the Column
+        # itself drops the qualifier, which the rebuilt COPY relation cannot resolve.
+        inner = node.this if isinstance(node, exp.Column) else node
+        index = _positional_index(inner)
+        return node if index is None else _projected_positional_column(index, ref)
 
     return expression.transform(replace, copy=True)
+
+
+def _projected_positional_column(index: int, ref: str) -> exp.Column:
+    """The ``"$1"`` column for ``$index``, rejecting positions the reader lacks.
+
+    A projected staged source exposes one raw record value (``$1``), so ``$2`` and up do
+    not exist. Failing here reproduces the direct ``SELECT ... FROM @stage`` message
+    instead of a raw DuckDB binder error; a table qualifier on ``$N`` is dropped because
+    the COPY rebuilds the relation and the subquery's own alias has no meaning here.
+    """
+    if index != 1:
+        raise StageError(
+            f"${index} does not exist in {ref}: a projected staged source exposes "
+            "only $1."
+        )
+    return exp.column("$1", quoted=True)
 
 
 def _filter_matches(
@@ -677,11 +741,27 @@ def build_copy_sql(
         sorted(groups["CSV"] + groups["JSON"] + groups["PARQUET"]), stage_ref_sql
     )
 
+    # A projection is carried only for JSON, whose raw reader exposes it as `$1`; the
+    # CSV/Parquet readers are copy-only, so accepting one there would silently drop it.
+    if projection is not None and (groups["CSV"] or groups["PARQUET"]):
+        raise StageError(
+            "COPY INTO ... FROM (SELECT ...) supports a projection only for staged "
+            "JSON files; CSV and Parquet sources must be copied without one."
+        )
+
     statements: list[str] = []
     if groups["CSV"]:
         statements.append(_copy_csv_sql(table_sql, groups["CSV"], file_format))
     if groups["JSON"]:
-        statements.append(_copy_json_sql(table_sql, groups["JSON"], stage_ref_sql, projection))
+        statements.append(
+            _copy_json_sql(
+                table_sql,
+                groups["JSON"],
+                stage_ref_sql,
+                projection,
+                _bool_option(file_format, "STRIP_OUTER_ARRAY"),
+            )
+        )
     if groups["PARQUET"]:
         statements.append(_copy_parquet_sql(table_sql, groups["PARQUET"]))
     if not statements:
@@ -729,7 +809,11 @@ def _copy_csv_sql(table_sql: str, files: list[str], file_format: dict[str, Any])
 
 
 def _copy_json_sql(
-    table_sql: str, files: list[str], ref: str, projection: str | None = None
+    table_sql: str,
+    files: list[str],
+    ref: str,
+    projection: str | None = None,
+    strip_outer_array: bool = False,
 ) -> str:
     if projection is None:
         return (
@@ -739,14 +823,29 @@ def _copy_json_sql(
     # A projected `FROM (SELECT ... FROM @stage)` addresses each record as `$1`, so the
     # reader must expose the raw document as that single value (read_json_auto flattens
     # the keys into columns instead).
-    return (
-        f"INSERT INTO {table_sql} SELECT {projection} "
-        f"FROM ({_raw_json_relation(files, ref)})"
-    )
+    relation = _raw_json_relation(files, ref, strip_outer_array)
+    return f"INSERT INTO {table_sql} SELECT {projection} FROM ({relation})"
 
 
-def _raw_json_relation(files: list[str], ref: str) -> str:
-    """DuckDB relation exposing each staged JSON record as a single ``$1`` value."""
+def _raw_json_relation(files: list[str], ref: str, strip_outer_array: bool = False) -> str:
+    """DuckDB relation exposing each staged JSON record as a single ``$1`` value.
+
+    With ``strip_outer_array`` each file is one JSON document whose outer array is
+    exploded; otherwise the files are read as newline-delimited records.
+    """
+    if strip_outer_array:
+        compressed = [
+            path for path in files if path.lower().endswith(_COMPRESSION_EXTENSIONS)
+        ]
+        if compressed:
+            raise StageError(
+                "STRIP_OUTER_ARRAY is not supported for compressed staged files "
+                f"({os.path.basename(compressed[0])})."
+            )
+        return (
+            'SELECT UNNEST(CAST(decode(content) AS JSON[])) AS "$1" '
+            f"FROM read_blob({_format_file_list(files)})"
+        )
     _check_newline_delimited_json(files, ref)
     # `CAST` (not `TRY_CAST`): a malformed record must fail loudly rather than silently
     # becoming a NULL row. Blank lines are removed by the filter, which is evaluated
@@ -1376,21 +1475,9 @@ def resolve_stage_file_source(
     _check_file_format_options(options, file_format, ref)
 
     if file_format == "JSON":
-        # STRIP_OUTER_ARRAY=TRUE reads each file as one JSON document and explodes the
-        # outer array; the default (FALSE) keeps one record per line.
-        if _bool_option(options, "STRIP_OUTER_ARRAY"):
-            compressed = [path for path in files if path.lower().endswith(_COMPRESSION_EXTENSIONS)]
-            if compressed:
-                raise StageError(
-                    "STRIP_OUTER_ARRAY is not supported for compressed staged files "
-                    f"({os.path.basename(compressed[0])})."
-                )
-            relation_sql = (
-                'SELECT UNNEST(CAST(decode(content) AS JSON[])) AS "$1" '
-                f"FROM read_blob({_format_file_list(files)})"
-            )
-        else:
-            relation_sql = _raw_json_relation(files, ref)
+        relation_sql = _raw_json_relation(
+            files, ref, _bool_option(options, "STRIP_OUTER_ARRAY")
+        )
         return StageFileSource(ref, file_format, files, relation_sql, {1: "$1"})
 
     if file_format == "CSV":

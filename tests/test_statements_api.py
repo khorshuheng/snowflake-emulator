@@ -1251,6 +1251,69 @@ def test_copy_into_stage_subquery_applies_projection(client, tmp_path):
     assert stored["data"] == [["\"a\"", 3], ["\"b\"", 4]]
 
 
+def test_copy_into_stage_subquery_honours_strip_outer_array(client, tmp_path):
+    """A projected copy of an outer-array JSON file explodes the array, as the straight
+    copy does, instead of reading the whole array as one NULL record."""
+    json_path = tmp_path / "array.json"
+    json_path.write_text(json.dumps([{"a": 1}, {"a": 2}]) + "\n")
+    headers = _stage_headers(client)
+    _stage(client, headers, json_path, "@~/staged")
+
+    _select(client, headers, "CREATE TABLE projected (a INT)")
+    copied = _select(
+        client,
+        headers,
+        "COPY INTO projected FROM (SELECT $1:a AS a FROM @~/staged/array.json) "
+        "FILE_FORMAT = (TYPE = JSON, STRIP_OUTER_ARRAY = TRUE)",
+    )
+    assert copied["data"] == [[2]]
+    assert _select(client, headers, "SELECT * FROM projected ORDER BY a")["data"] == [
+        [1],
+        [2],
+    ]
+
+
+def test_copy_into_stage_subquery_rejects_csv_projection(client, tmp_path):
+    """The projection is JSON-only; a CSV source must not silently drop it."""
+    csv_path = tmp_path / "data.csv"
+    _write_csv(csv_path)
+    headers = _stage_headers(client)
+    _stage(client, headers, csv_path, "@~/staged")
+
+    _select(client, headers, "CREATE TABLE projected (a INT, b VARCHAR)")
+    resp = client.post(
+        "/api/v2/statements",
+        json={
+            "statement": "COPY INTO projected FROM (SELECT $1 FROM @~/staged/data.csv) "
+            "FILE_FORMAT = (TYPE = CSV, SKIP_HEADER = 1)"
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 422
+    assert "projection only for staged JSON" in resp.json()["detail"]["message"]
+
+
+def test_copy_into_stage_subquery_rejects_dropped_clause(client, tmp_path):
+    """A WHERE (or any non-projection clause) must be rejected, not silently ignored."""
+    json_path = tmp_path / "data.json"
+    _write_json(json_path, [{"a": 1, "b": 10}, {"a": 2, "b": 20}])
+    headers = _stage_headers(client)
+    _stage(client, headers, json_path, "@~/staged")
+
+    _select(client, headers, "CREATE TABLE projected (a INT)")
+    resp = client.post(
+        "/api/v2/statements",
+        json={
+            "statement": "COPY INTO projected FROM "
+            "(SELECT $1:a AS a FROM @~/staged/data.json WHERE $1:b = 10) "
+            "FILE_FORMAT = (TYPE = JSON)"
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 422
+    assert "unsupported clause" in resp.json()["detail"]["message"]
+
+
 def test_insert_select_from_staged_file(client, tmp_path):
     json_path = tmp_path / "data.json"
     _write_json(json_path, [{"col": 7}])
