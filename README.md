@@ -31,7 +31,7 @@ each Snowflake "database" becomes an attached DuckDB catalog, and each Snowflake
 uv sync
 uv run snowflake-emulator          # starts the dev server on http://localhost:8000
 # or, equivalently:
-uv run uvicorn snowflake_emulator.main:app --reload
+uv run uvicorn snowflake_emulator.main:app
 ```
 
 ## Configuration

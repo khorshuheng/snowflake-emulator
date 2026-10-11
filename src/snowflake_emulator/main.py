@@ -58,13 +58,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Database isolation mode (default: config).",
     )
-    parser.add_argument(
-        "--no-reload",
-        dest="reload",
-        action="store_false",
-        default=None,
-        help="Disable uvicorn auto-reload.",
-    )
     return parser
 
 
@@ -92,7 +85,6 @@ def main(argv: list[str] | None = None) -> None:
         "snowflake_emulator.main:app",
         host=settings.host,
         port=settings.port,
-        reload=True if args.reload is None else args.reload,
     )
 
 

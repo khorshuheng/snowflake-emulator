@@ -85,7 +85,6 @@ def test_cli_parser_applies_overrides(restore_settings):
             "/tmp/stages",
             "--isolation",
             "isolated",
-            "--no-reload",
         ]
     )
     apply_args(args)
@@ -95,7 +94,6 @@ def test_cli_parser_applies_overrides(restore_settings):
     assert settings.persistence.database_path == "/tmp/x.duckdb"
     assert settings.staging.stage_root == "/tmp/stages"
     assert settings.persistence.isolation == "isolated"
-    assert args.reload is False
 
 
 def test_cli_defaults_leave_settings_untouched(restore_settings):
