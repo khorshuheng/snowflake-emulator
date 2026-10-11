@@ -53,8 +53,10 @@ default_warehouse = "EMULATOR_WH"
 default_role = "ACCOUNTADMIN"
 
 [persistence]
-# Path to a DuckDB database file for durable storage across restarts.
-# Use ":memory:" (the default) for an ephemeral, in-process database.
+# Anchor path for durable storage across restarts. When set to a file path, a
+# directory "<database_path>.d" is created next to it holding one DuckDB file per
+# Snowflake database, e.g. emulator.duckdb.d/MY_DB.duckdb. Use ":memory:" (the
+# default) for an ephemeral, in-process database.
 database_path = ":memory:"
 
 [statements]
@@ -72,6 +74,28 @@ persist data to disk (set `persistence.database_path` to a file path, e.g.
 `"/var/lib/sfemu/emulator.duckdb"`, instead of `":memory:"`). Set
 `staging.stage_root` to a directory to keep staged files there instead of an
 auto-created temp directory.
+
+DuckDB maps one catalog to one file, so a single file cannot hold several
+Snowflake databases. When `persistence.database_path` is a file path:
+
+- the emulator creates a dedicated directory `<database_path>.d` next to it and
+  stores each Snowflake database there as `<DATABASE>.duckdb` — for
+  `/var/lib/sfemu/emulator.duckdb`, `MY_DB` lives in
+  `/var/lib/sfemu/emulator.duckdb.d/MY_DB.duckdb`;
+- the path named by `database_path` itself is only the anchor for that directory
+  name and is not created;
+- only that directory is scanned, so unrelated files (including other DuckDB
+  files in the parent directory) are never attached;
+- existing database files are re-attached on startup, so tables and
+  `SHOW DATABASES` survive a restart; a database file that cannot be read is
+  skipped with a warning rather than preventing the emulator from starting.
+
+`CREATE OR REPLACE DATABASE` deletes the database's backing file so the replaced
+database starts empty. Database names are matched case-insensitively (a DuckDB
+catalog constraint), so `"my_db"` and `"MY_DB"` are the same database. With
+`":memory:"` nothing is written to disk, and with
+`persistence.isolation = "isolated"` each session gets a private in-memory
+database regardless of `database_path` (the emulator warns when both are set).
 
 Settings can also be overridden with environment variables prefixed with
 `SNOWFLAKE_EMULATOR_`, using `__` to reach nested fields — these take priority

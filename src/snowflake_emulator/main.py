@@ -44,7 +44,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--db-path",
         dest="db_path",
         default=None,
-        help="DuckDB database file (default: config, or :memory:).",
+        help=(
+            "Anchor path for durable storage (default: config, or :memory:); "
+            "databases are stored under '<db-path>.d/'."
+        ),
     )
     parser.add_argument(
         "--stage-root",

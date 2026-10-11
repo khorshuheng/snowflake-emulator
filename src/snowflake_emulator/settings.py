@@ -40,8 +40,10 @@ default_warehouse = "EMULATOR_WH"
 default_role = "ACCOUNTADMIN"
 
 [persistence]
-# Path to a DuckDB database file for durable storage across restarts.
-# Use ":memory:" (the default) for an ephemeral, in-process database.
+# Anchor path for durable storage across restarts. When set to a file path, a
+# directory "<database_path>.d" is created next to it holding one DuckDB file per
+# Snowflake database, e.g. emulator.duckdb.d/MY_DB.duckdb. Use ":memory:" (the
+# default) for an ephemeral, in-process database.
 database_path = ":memory:"
 # Isolation mode. "shared" (default) keeps one database for all sessions;
 # "isolated" gives each session its own private in-memory database.
@@ -82,7 +84,8 @@ class SnowflakeDefaults(BaseModel):
 
 
 class PersistenceSettings(BaseModel):
-    # Path to the DuckDB database file. Use ":memory:" for an ephemeral, in-process database.
+    # Anchor path for durable storage. A file path creates a `<path>.d` directory
+    # holding one DuckDB file per database; ":memory:" is ephemeral.
     database_path: str = ":memory:"
     # "shared" (one database for all sessions) or "isolated" (one per session).
     isolation: str = "shared"
