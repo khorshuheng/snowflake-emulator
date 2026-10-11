@@ -187,6 +187,46 @@ Two behaviours inherited from sqlglot rather than Snowflake, so treat them as un
 `ARRAY_INTERSECTION` keeps duplicate elements (its multiset model), and `ARRAY_POSITION`
 returns 0 for a NULL value as well as for an absent one.
 
+### User-defined functions (`CREATE FUNCTION`)
+
+SQL-bodied scalar UDFs work: `LANGUAGE SQL` (the default) with either a bare expression or
+a single-column `SELECT` as the body. A body is parsed and transpiled as Snowflake SQL
+like any other statement, so Snowflake-only calls inside it behave as they would on
+Snowflake (`EQUAL_NULL(a, b)` becomes `a IS NOT DISTINCT FROM b`). `CREATE OR REPLACE`,
+`IF NOT EXISTS`, `DROP FUNCTION` (with or without a signature), `DESCRIBE FUNCTION` and
+`SHOW [USER|ALL|EXTERNAL] FUNCTIONS` (including `LIKE` and `IN`) are all supported, and
+the declared signatures are recorded per catalog so they survive a restart.
+
+Each function is emulated as a DuckDB macro under a name mangled with its arity, and
+calls are rewritten to match. Two functions that differ only by **argument type** at the
+same arity are dispatched at run time from the argument's SQL type, so this works:
+
+```sql
+CREATE FUNCTION equal_null_case_insensitive(a STRING, b STRING)
+  RETURNS BOOLEAN LANGUAGE SQL AS $$ EQUAL_NULL(UPPER(a), UPPER(b)) $$;
+CREATE FUNCTION equal_null_case_insensitive(a ARRAY, b ARRAY)
+  RETURNS BOOLEAN LANGUAGE SQL AS $$
+    EQUAL_NULL(TRANSFORM(a, x -> UPPER(x)), TRANSFORM(b, x -> UPPER(x))) $$;
+```
+
+An overloaded call must be resolvable from the argument types alone. All overloads of one
+name/arity have to share a return type (the emulator reaches them through a single DuckDB
+function, which needs one declared return type), and a call whose arguments match more
+than one overload is an error rather than a guess. An untyped `NULL` is the one exception:
+it is accepted when the overloads it could mean agree on the answer, which is what keeps a
+NULL-safe function usable on NULL columns.
+
+The trade-offs: a type-overloaded function is dispatched through a Python callback with a
+nested query per row rather than an inlined macro, and stays dispatch-backed once
+overloaded for the life of the process. A function with a *single* ARRAY parameter
+declared inherits the emulator's existing limitation that a bare `ARRAY` column is not
+recognised as a JSON array (the same reason `ARRAY_SIZE(arr_col)` fails); once it is
+overloaded the dispatcher normalizes the argument and it works.
+
+Rejected, rather than guessed at: non-SQL `LANGUAGE` bodies (no JavaScript/Python/Java/
+Scala runtime exists here), `RETURNS TABLE (...)` and multi-column `SELECT` bodies, and a
+missing `RETURNS <type>`.
+
 ## Staging files (PUT / GET / LIST / REMOVE / COPY INTO)
 
 The emulator implements Snowflake's local stage workflow for JSON, CSV and Parquet files.
@@ -370,10 +410,14 @@ rejected with a Snowflake-shaped error rather than failing silently).
 | `LATERAL FLATTEN(...)`, `TABLE(FLATTEN(...))` | ✅ |
 | `DESCRIBE TABLE`, `{db}.INFORMATION_SCHEMA.{SCHEMATA,TABLES}` | ✅ |
 | `SHOW` schemas/tables/views/objects/columns/keys/stages/databases/sequences/… | ✅ |
+| `CREATE FUNCTION` (SQL-bodied scalar UDFs), `DESCRIBE`/`DROP FUNCTION` | ✅ |
+| UDF overloading by arity (always) and by argument type (dispatched at run time) | ✅ |
+| `SHOW FUNCTIONS` of user-defined functions | ✅ |
 | Semi-structured function breadth beyond the list above | ⚠️ |
 | `VARCHAR(n)` lengths in `DESCRIBE`/`SHOW COLUMNS` | ⚠️ reported as `VARCHAR` |
 | `TIMESTAMP_LTZ` precision | ⚠️ mapped to `TIMESTAMP_TZ` at microsecond precision |
-| `SHOW FUNCTIONS` built-in catalogue | ⚠️ returns an empty shape |
+| `SHOW FUNCTIONS` built-in catalogue | ⚠️ user-defined functions only |
+| Type-overloaded UDFs with differing return types | ⚠️ rejected (one declared return type per name/arity) |
 
 ### Staging and files
 
@@ -390,6 +434,7 @@ rejected with a Snowflake-shaped error rather than failing silently).
 | Feature | Behaviour |
 | --- | --- |
 | JavaScript / Python / Java / Scala UDFs | ❌ rejected with a clear error (no runtime) |
+| `RETURNS TABLE (...)` UDFs, and multi-column `SELECT` bodies | ❌ rejected with a clear error |
 | `CREATE TASK`, `CREATE STREAM` | ❌ syntax error |
 | Time travel (`AT`/`BEFORE`, `RESULT_SCAN` of a past state) | ❌ rejected |
 | `CLONE` of a schema or database | ❌ rejected with a clear error |

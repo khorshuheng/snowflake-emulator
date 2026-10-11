@@ -1021,8 +1021,25 @@ USER_FUNCTION_MACRO_PREFIX = "__SFUDF_"
 
 
 def user_function_macro_name(name: str, arity: int) -> str:
-    """Return the DuckDB macro name backing the Snowflake function `name`."""
+    """Return the DuckDB macro name backing a function with a single overload."""
     return f"{USER_FUNCTION_MACRO_PREFIX}{name}__{arity}"
+
+
+def user_function_dispatch_name(database: str, schema: str, name: str, arity: int) -> str:
+    """Return the name of the Python function dispatching an overloaded (name, arity).
+
+    A DuckDB function registered through the Python API is *not* schema-scoped, unlike a
+    macro, so the database and schema are part of the name to keep two schemas that each
+    define the same function from colliding.
+    """
+    return f"{USER_FUNCTION_MACRO_PREFIX}{database}_{schema}_{name}__{arity}"
+
+
+def user_function_sub_macro_name(
+    database: str, schema: str, name: str, arity: int, index: int
+) -> str:
+    """Return the macro name holding one overload's body behind a dispatcher."""
+    return f"{user_function_dispatch_name(database, schema, name, arity)}__{index}"
 
 
 def _identifier(name: str) -> exp.Identifier:
@@ -1040,6 +1057,11 @@ def _snowflake_name(identifier: exp.Identifier) -> str:
 def _render_identifier(name: str) -> str:
     """Render an identifier as SQL text, quoted only when it needs to be."""
     return _identifier(name).sql(dialect=WRITE_DIALECT)
+
+
+def render_qualified_name(*parts: str) -> str:
+    """Render a dotted, per-part-quoted name for use in a DuckDB statement."""
+    return ".".join(_render_identifier(part) for part in parts)
 
 
 @dataclass(frozen=True)
@@ -1062,6 +1084,9 @@ class UserFunctionSpec:
     name: str
     arguments: tuple[UserFunctionArgument, ...]
     return_type: str
+    #: The declared return type in DuckDB's spelling, which is what the Python API needs
+    #: to register the dispatcher for an overloaded function.
+    return_type_duckdb: str
     language: str
     body: str
     body_sql: str
@@ -1079,7 +1104,13 @@ class UserFunctionSpec:
         return user_function_macro_name(self.name, self.arity)
 
     @property
-    def signature(self) -> str:
+    def type_signature(self) -> str:
+        """The declared argument types, identifying one overload of a name/arity."""
+        types = [argument.declared_type or "VARCHAR" for argument in self.arguments]
+        return "|".join(types)
+
+    @property
+    def show_signature(self) -> str:
         """The argument list as Snowflake's ``SHOW FUNCTIONS`` reports it."""
         types = [argument.declared_type or "VARCHAR" for argument in self.arguments]
         return f"{self.name}({', '.join(types)}) RETURN {self.return_type}"
@@ -1115,7 +1146,28 @@ def _function_body_text(statement: exp.Create) -> str:
     raise TranslationError("CREATE FUNCTION requires a body (AS $$ ... $$).")
 
 
-def _translate_function_body(body: str) -> str:
+def normalize_function_signature(type_nodes: list[exp.Expression]) -> str:
+    """Normalize a ``DROP``/``DESCRIBE FUNCTION`` argument list to the stored signature.
+
+    The types in a signature are written the way the client spelled them (``STRING``,
+    ``NUMBER(10,2)``) and may parse as a ``DataType`` or a bare ``Identifier``, so they
+    are pushed through the same Snowflake-to-DuckDB normalization used when the function
+    was recorded. Without this, ``DROP FUNCTION f(STRING, STRING)`` would not match the
+    stored ``VARCHAR|VARCHAR`` and would silently drop the wrong overload -- or none.
+    """
+    parts: list[str] = []
+    for node in type_nodes:
+        if isinstance(node, exp.DataType):
+            duckdb_type = node.sql(dialect=WRITE_DIALECT)
+        else:
+            # ``DESCRIBE FUNCTION f(ARRAY, ARRAY)`` parses the types as identifiers.
+            built = exp.DataType.build(node.sql(dialect=READ_DIALECT), dialect=READ_DIALECT)
+            duckdb_type = built.sql(dialect=WRITE_DIALECT)
+        parts.append(duckdb_type_to_snowflake_sql_type(duckdb_type))
+    return "|".join(parts)
+
+
+def translate_function_body(body: str) -> str:
     """Translate a SQL UDF body into a DuckDB scalar expression.
 
     Snowflake allows the body to be either a bare expression (``AS $$ x + 1 $$``) or a
@@ -1210,9 +1262,10 @@ def translate_create_function(statement: exp.Expression) -> UserFunctionSpec:
         # Report the return type the way ``DESCRIBE``/``SHOW FUNCTIONS`` do for tables,
         # normalising DuckDB's spelling back to Snowflake's (DECIMAL -> NUMBER).
         return_type=duckdb_type_to_snowflake_sql_type(returns.sql(dialect=WRITE_DIALECT)),
+        return_type_duckdb=returns.sql(dialect=WRITE_DIALECT),
         language=language,
         body=body,
-        body_sql=_translate_function_body(body),
+        body_sql=translate_function_body(body),
         database=_snowflake_name(catalog) if isinstance(catalog, exp.Identifier) else None,
         schema=_snowflake_name(db) if isinstance(db, exp.Identifier) else None,
         replace=bool(statement.args.get("replace")),
@@ -1220,11 +1273,15 @@ def translate_create_function(statement: exp.Expression) -> UserFunctionSpec:
     )
 
 
-def render_create_macro(spec: UserFunctionSpec, database: str, schema: str) -> str:
-    """Render the DuckDB ``CREATE MACRO`` statement that backs a SQL UDF.
+def render_create_macro(
+    spec: UserFunctionSpec, database: str, schema: str, macro_name: str | None = None
+) -> str:
+    """Render the DuckDB ``CREATE MACRO`` statement holding a SQL UDF's body.
 
     The macro is catalog/schema-qualified so it lands in the function's Snowflake
     namespace regardless of what the executing cursor's current schema happens to be.
+    `macro_name` overrides the name the macro is created under, which is how one
+    overload of a dispatched function is stored behind its dispatcher.
     """
     clauses = ""
     if spec.replace:
@@ -1232,13 +1289,7 @@ def render_create_macro(spec: UserFunctionSpec, database: str, schema: str) -> s
     elif spec.if_not_exists:
         clauses = " IF NOT EXISTS"
     params = ", ".join(_render_identifier(argument.name) for argument in spec.arguments)
-    name = ".".join(
-        (
-            _render_identifier(database),
-            _render_identifier(schema),
-            _render_identifier(spec.macro_name),
-        )
-    )
+    name = render_qualified_name(database, schema, macro_name or spec.macro_name)
     return f"CREATE{clauses} MACRO {name}({params}) AS ({spec.body_sql})"
 
 
@@ -1247,37 +1298,54 @@ def render_drop_macro(
 ) -> str:
     """Render the DuckDB ``DROP MACRO`` statement removing a user-defined function."""
     clause = " IF EXISTS" if if_exists else ""
-    name = ".".join(
-        (
-            _render_identifier(database),
-            _render_identifier(schema),
-            _render_identifier(macro_name),
-        )
-    )
-    return f"DROP MACRO{clause} {name}"
+    return f"DROP MACRO{clause} {render_qualified_name(database, schema, macro_name)}"
+
+
+@dataclass(frozen=True)
+class UserFunctionCall:
+    """How a resolved Snowflake UDF call is reached in DuckDB."""
+
+    callable_name: str
+    #: A Python dispatcher needs each argument's DuckDB type appended to the call, since
+    #: a generic callback receives values only -- and cannot, for instance, tell a JSON
+    #: array column from a text value (both arrive as ``str``).
+    dispatch: bool
 
 
 class UserFunctionResolver(Protocol):
-    """Resolves a Snowflake UDF call to the DuckDB macro that emulates it."""
+    """Resolves a Snowflake UDF call to the DuckDB callable that emulates it."""
 
-    def resolve(self, name: str, arity: int) -> str | None:
-        """Return the DuckDB macro name for `name` called with `arity` arguments."""
+    def resolve(self, name: str, arity: int) -> UserFunctionCall | None:
+        """Return the callable for `name` called with `arity` arguments."""
         ...
 
 
 def _rewrite_user_function_calls(
     statement: exp.Expression, resolver: UserFunctionResolver
 ) -> exp.Expression:
-    """Point calls to user-defined functions at their arity-mangled macro names.
+    """Point calls to user-defined functions at the macro or dispatcher backing them.
 
     Only ``Anonymous`` calls are considered: a UDF whose name matches a function sqlglot
     models natively (``COALESCE``, ``ARRAY_SIZE``, ...) is parsed into that node instead
     and keeps its built-in behaviour.
     """
     for call in list(statement.find_all(exp.Anonymous)):
-        macro = resolver.resolve(call.name, len(call.expressions))
-        if macro is not None:
-            call.set("this", _identifier(macro))
+        resolved = resolver.resolve(call.name, len(call.expressions))
+        if resolved is None:
+            continue
+        if resolved.dispatch:
+            arguments = list(call.expressions)
+            call.set(
+                "expressions",
+                [
+                    *arguments,
+                    *(
+                        exp.Anonymous(this="typeof", expressions=[argument.copy()])
+                        for argument in arguments
+                    ),
+                ],
+            )
+        call.set("this", _identifier(resolved.callable_name))
     return statement
 
 

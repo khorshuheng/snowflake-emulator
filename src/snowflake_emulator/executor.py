@@ -49,6 +49,7 @@ from snowflake_emulator.translator import (
     is_alter_session,
     is_transaction_control,
     match_use_statement,
+    normalize_function_signature,
     split_statements,
     translate_create_function,
     transpile_to_duckdb,
@@ -1277,16 +1278,18 @@ def _execute_function_ddl(
         this = statement.args.get("this")
         if not isinstance(this, exp.Table):
             return None
-        # `DROP FUNCTION f(a, b)` carries the signature; only its length is used, since
-        # Snowflake and DuckDB spell the argument types differently (STRING vs VARCHAR).
-        arity = len(statement.expressions) if statement.expressions else None
+        # `DROP FUNCTION f(a NUMBER, b NUMBER)` names one overload; the types are
+        # normalized the same way they were recorded so the drop cannot match the wrong
+        # one. Without a signature every overload of the name is dropped.
+        types = list(statement.expressions)
         try:
             message = execute_drop_function(
                 manager,
                 cursor,
                 session,
                 this.name,
-                arity,
+                len(types) if types else None,
+                signature=normalize_function_signature(types) if types else None,
                 if_exists=bool(statement.args.get("exists")),
             )
         except UserFunctionError as exc:
@@ -1311,18 +1314,20 @@ def _execute_function_describe(
     ):
         return None
     this = statement.args.get("this")
-    arity = None
+    types: list[exp.Expression] = []
     if isinstance(this, exp.Schema):
-        arity = len(this.expressions)
+        types = list(this.expressions)
         this = this.this
     if not isinstance(this, exp.Table):
         return None
 
     functions = query_user_functions(
-        manager, session.database, session.schema, name=this.name
+        manager,
+        session.database,
+        session.schema,
+        name=this.name,
+        signature=normalize_function_signature(types) if types else None,
     )
-    if arity is not None:
-        functions = [fn for fn in functions if fn.arity == arity]
     if not functions:
         raise ExecutionError(f"Function {this.name.upper()} does not exist.")
 

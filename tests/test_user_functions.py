@@ -9,12 +9,18 @@ previously it silently created a macro whose value was the body *text*.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from snowflake_emulator.database import DuckDBManager
 from snowflake_emulator.sessions import SessionContext
 from snowflake_emulator.settings import settings
-from snowflake_emulator.translator import split_statements, translate_create_function
+from snowflake_emulator.translator import (
+    INFORMATION_SCHEMA_SCHEMA,
+    split_statements,
+    translate_create_function,
+)
 from snowflake_emulator.user_functions import execute_create_function
 
 CASE_INSENSITIVE_EQUAL = (
@@ -22,6 +28,15 @@ CASE_INSENSITIVE_EQUAL = (
     "RETURNS BOOLEAN "
     "LANGUAGE SQL "
     "AS $$ EQUAL_NULL(UPPER(str), UPPER(str2)) $$"
+)
+
+# The same name and arity as CASE_INSENSITIVE_EQUAL, so the two overloads can only be
+# told apart from their argument types.
+CASE_INSENSITIVE_ARRAY_EQUAL = (
+    "CREATE OR REPLACE FUNCTION EQUAL_NULL_CASE_INSENSITIVE(a ARRAY, b ARRAY) "
+    "RETURNS BOOLEAN "
+    "LANGUAGE SQL "
+    "AS $$ EQUAL_NULL(TRANSFORM(a, x -> UPPER(x)), TRANSFORM(b, x -> UPPER(x))) $$"
 )
 
 
@@ -132,16 +147,136 @@ def test_overloading_by_arity_is_supported(client):
     ]
 
 
-def test_overloading_by_argument_type_is_rejected_loudly(client):
-    # A DuckDB macro cannot be overloaded by name, so the same arity with a different
-    # signature would silently resolve to whichever definition won. Reject instead.
-    _post(client, "CREATE FUNCTION f_ty(a NUMBER, b NUMBER) RETURNS BOOLEAN LANGUAGE SQL AS $$ a = b $$")
+def test_overloading_by_argument_type_dispatches_on_the_value(client):
+    """One name/arity, two argument types: each call reaches the matching body.
+
+    A macro cannot express this -- every branch of a ``CASE`` over ``typeof()`` has to
+    bind for both types, and ``upper(LIST)``/``list_reverse(VARCHAR)`` do not. So the
+    overloads are dispatched from the runtime Python value type instead.
+    """
+    assert _post(client, CASE_INSENSITIVE_EQUAL).status_code == 200
+    assert _post(client, CASE_INSENSITIVE_ARRAY_EQUAL).status_code == 200
+
+    # Scalar strings use the STRING overload...
+    assert _data(client, "SELECT EQUAL_NULL_CASE_INSENSITIVE('aBc', 'ABC')") == [[True]]
+    assert _data(client, "SELECT EQUAL_NULL_CASE_INSENSITIVE('a', 'z')") == [[False]]
+    # ...and arrays use the ARRAY overload, element-wise.
+    assert _data(
+        client,
+        "SELECT EQUAL_NULL_CASE_INSENSITIVE(ARRAY_CONSTRUCT('a','B'), "
+        "ARRAY_CONSTRUCT('A','b'))",
+    ) == [[True]]
+    assert _data(
+        client,
+        "SELECT EQUAL_NULL_CASE_INSENSITIVE(ARRAY_CONSTRUCT('a'), ARRAY_CONSTRUCT('z'))",
+    ) == [[False]]
+
+
+def test_both_overloads_appear_in_the_catalog(client):
+    _post(client, CASE_INSENSITIVE_EQUAL)
+    _post(client, CASE_INSENSITIVE_ARRAY_EQUAL)
+    signatures = [row[6] for row in _data(client, "SHOW FUNCTIONS")]
+    assert signatures == [
+        "EQUAL_NULL_CASE_INSENSITIVE(ARRAY, ARRAY) RETURN BOOLEAN",
+        "EQUAL_NULL_CASE_INSENSITIVE(VARCHAR, VARCHAR) RETURN BOOLEAN",
+    ]
+    assert len(_data(client, "DESCRIBE FUNCTION EQUAL_NULL_CASE_INSENSITIVE")) == 2
+
+
+def test_null_arguments_reach_both_overloads(client):
+    """A NULL carries no type, so it matches both overloads; they agree here.
+
+    This is the case that makes NULL-safe functions work on NULL columns. It also covers
+    the DuckDB null-handling setting: with the default, a NULL argument would skip the
+    Python dispatcher entirely and the whole call would answer NULL rather than TRUE.
+    """
+    _post(client, CASE_INSENSITIVE_EQUAL)
+    _post(client, CASE_INSENSITIVE_ARRAY_EQUAL)
+    assert _data(client, "SELECT EQUAL_NULL_CASE_INSENSITIVE(NULL, NULL)") == [[True]]
+    assert _data(client, "SELECT EQUAL_NULL_CASE_INSENSITIVE('a', NULL)") == [[False]]
+    assert _data(
+        client,
+        "SELECT EQUAL_NULL_CASE_INSENSITIVE(ARRAY_CONSTRUCT('a'), NULL)",
+    ) == [[False]]
+
+
+def test_dispatched_function_works_over_table_columns(client):
+    _post(client, CASE_INSENSITIVE_EQUAL)
+    _post(client, CASE_INSENSITIVE_ARRAY_EQUAL)
+    _post(client, "CREATE TABLE ci_t (id INT, s1 VARCHAR, s2 VARCHAR, a1 ARRAY, a2 ARRAY)")
+    _post(
+        client,
+        "INSERT INTO ci_t VALUES "
+        "(1, 'aB', 'Ab', ARRAY_CONSTRUCT('x'), ARRAY_CONSTRUCT('X')), "
+        "(2, 'a', 'z', ARRAY_CONSTRUCT('x'), ARRAY_CONSTRUCT('Y')), "
+        "(3, NULL, NULL, NULL, NULL)",
+    )
+    # Each row is dispatched separately, so one query mixes both overloads -- including
+    # an all-NULL row, where the overloads agree and the call still answers TRUE.
+    assert _data(
+        client,
+        "SELECT id, EQUAL_NULL_CASE_INSENSITIVE(s1, s2) AS s, "
+        "EQUAL_NULL_CASE_INSENSITIVE(a1, a2) AS a FROM ci_t ORDER BY id",
+    ) == [[1, True, True], [2, False, False], [3, True, True]]
+
+
+def test_unmatchable_arguments_are_reported(client):
+    _post(client, CASE_INSENSITIVE_EQUAL)
+    _post(client, CASE_INSENSITIVE_ARRAY_EQUAL)
+    message = _error(client, "SELECT EQUAL_NULL_CASE_INSENSITIVE(1, 2)")
+    # The passed values are described by category, the overloads by declared type, so the
+    # two halves of the message cannot be confused for each other.
+    assert "no overload matching (number, number)" in message
+    assert "ARRAY, ARRAY" in message and "VARCHAR, VARCHAR" in message
+
+
+def test_overloads_must_share_a_return_type(client):
+    # The dispatcher is one DuckDB function, which needs a single declared return type
+    # (create_function has no ANY), so differing returns cannot be dispatched.
+    _post(
+        client,
+        "CREATE FUNCTION f_ret(a NUMBER, b NUMBER) RETURNS BOOLEAN LANGUAGE SQL AS $$ a = b $$",
+    )
     message = _error(
         client,
-        "CREATE FUNCTION f_ty(a ARRAY, b ARRAY) RETURNS BOOLEAN LANGUAGE SQL "
-        "AS $$ ARRAY_SIZE(a) = ARRAY_SIZE(b) $$",
+        "CREATE FUNCTION f_ret(a ARRAY, b ARRAY) RETURNS NUMBER LANGUAGE SQL "
+        "AS $$ ARRAY_SIZE(a) $$",
     )
-    assert "F_TY" in message and "cannot overload" in message
+    assert "must share a return type" in message
+    assert "BOOLEAN" in message and "NUMBER(38,0)" in message
+
+
+def test_dropping_one_overload_leaves_the_other_callable(client):
+    _post(client, CASE_INSENSITIVE_EQUAL)
+    _post(client, CASE_INSENSITIVE_ARRAY_EQUAL)
+    assert _post(
+        client, "DROP FUNCTION EQUAL_NULL_CASE_INSENSITIVE(ARRAY, ARRAY)"
+    ).status_code == 200
+    # The signature picked out exactly one overload: the STRING one still resolves...
+    assert _data(client, "SELECT EQUAL_NULL_CASE_INSENSITIVE('aB', 'Ab')") == [[True]]
+    # ...and the dropped one is gone, so an array argument no longer has a body to reach.
+    assert _post(
+        client,
+        "SELECT EQUAL_NULL_CASE_INSENSITIVE(ARRAY_CONSTRUCT('a'), ARRAY_CONSTRUCT('A'))",
+    ).status_code == 422
+    assert len(_data(client, "SHOW FUNCTIONS")) == 1
+
+
+def test_replacing_one_overload_keeps_the_other(client):
+    _post(client, CASE_INSENSITIVE_EQUAL)
+    _post(client, CASE_INSENSITIVE_ARRAY_EQUAL)
+    # Same signature, new body: replaces just that overload.
+    assert _post(
+        client,
+        "CREATE OR REPLACE FUNCTION EQUAL_NULL_CASE_INSENSITIVE(a ARRAY, b ARRAY) "
+        "RETURNS BOOLEAN LANGUAGE SQL AS $$ FALSE $$",
+    ).status_code == 200
+    assert _data(
+        client,
+        "SELECT EQUAL_NULL_CASE_INSENSITIVE(ARRAY_CONSTRUCT('a'), ARRAY_CONSTRUCT('A'))",
+    ) == [[False]]
+    assert _data(client, "SELECT EQUAL_NULL_CASE_INSENSITIVE('aB', 'Ab')") == [[True]]
+    assert len(_data(client, "SHOW FUNCTIONS")) == 2
 
 
 def test_array_typed_arguments_are_supported(client):
@@ -299,6 +434,38 @@ def test_describe_missing_function_errors(client):
     assert "does not exist" in message
 
 
+def test_overloaded_function_works_on_array_columns(client):
+    """An ARRAY column is stored as DuckDB JSON, which reaches the dispatcher as text.
+
+    Two things have to hold for this to work: the dispatcher must be told each argument's
+    *SQL* type (the value alone cannot say), and a JSON argument must be presented to the
+    body the same way as an ``ARRAY_CONSTRUCT`` literal, or a comparison of the two fails
+    as ``JSON[] = VARCHAR[]``.
+    """
+    _post(client, CASE_INSENSITIVE_EQUAL)
+    _post(client, CASE_INSENSITIVE_ARRAY_EQUAL)
+    _post(client, "CREATE TABLE arr_t (id INT, a1 ARRAY, a2 ARRAY)")
+    _post(
+        client,
+        "INSERT INTO arr_t VALUES "
+        "(1, ARRAY_CONSTRUCT('a','B'), ARRAY_CONSTRUCT('A','b')), "
+        "(2, ARRAY_CONSTRUCT('a'), ARRAY_CONSTRUCT('z')), "
+        "(3, NULL, NULL)",
+    )
+    # Row 3 matches: a NULL in an ARRAY column still has the column's type, so the array
+    # overload is chosen and both sides are NULL.
+    assert _data(
+        client, "SELECT id FROM arr_t WHERE EQUAL_NULL_CASE_INSENSITIVE(a1, a2) ORDER BY id"
+    ) == [[1], [3]]
+    # A JSON column compared against a plain array literal: both sides must normalize to
+    # the same representation.
+    assert _data(
+        client,
+        "SELECT EQUAL_NULL_CASE_INSENSITIVE(a1, ARRAY_CONSTRUCT('a','B')) FROM arr_t "
+        "WHERE id = 1",
+    ) == [[True]]
+
+
 def test_function_is_scoped_to_its_schema(client):
     headers = _auth_headers(client)
     _post(client, "CREATE SCHEMA other_s", headers)
@@ -357,4 +524,84 @@ def test_udf_macro_and_metadata_survive_a_restart(persistent_udf_db):
         f'SELECT "{session.database}"."{session.schema}"."{spec.macro_name}"('
         "'abc', 'ABC')"
     ).fetchall() == [(True,)]
+    reopened.connection.close()
+
+
+def test_overloaded_function_survives_a_restart(persistent_udf_db, client):
+    """A dispatched overload pair must be callable again in a fresh process.
+
+    The sub-macros live in the DuckDB catalog, but the Python dispatcher does not, so it
+    has to be re-registered from the side table before the first statement resolves it.
+    """
+    import snowflake_emulator.database as database_module
+
+    assert _post(client, CASE_INSENSITIVE_EQUAL).status_code == 200
+    assert _post(client, CASE_INSENSITIVE_ARRAY_EQUAL).status_code == 200
+    assert _data(client, "SELECT EQUAL_NULL_CASE_INSENSITIVE('aB', 'Ab')") == [[True]]
+
+    # Drop the manager as a restart would, keeping the file behind it. The old connection
+    # has to be closed first, or the new one cannot attach the same catalog file.
+    database_module.get_manager().connection.close()
+    database_module._manager = None
+
+    assert _data(client, "SELECT EQUAL_NULL_CASE_INSENSITIVE('aB', 'Ab')") == [[True]]
+    assert _data(
+        client,
+        "SELECT EQUAL_NULL_CASE_INSENSITIVE(ARRAY_CONSTRUCT('a'), ARRAY_CONSTRUCT('A'))",
+    ) == [[True]]
+
+
+def test_metadata_table_from_before_overloading_is_migrated(persistent_udf_db):
+    """A side table written by the pre-overloading version is upgraded in place.
+
+    That shape had no ``signature`` column, so one name/arity could not hold two
+    overloads; the migration derives the signature from the stored JSON argument list.
+    """
+    path = settings.persistence.database_path
+    session = SessionContext(token="migration-test")
+    manager = DuckDBManager(path)
+    manager.ensure_namespace(session.database, session.schema)
+    ext = f'"{session.database}"."{INFORMATION_SCHEMA_SCHEMA}"'
+    manager.connection.execute(f"DROP TABLE {ext}._sf_functions_ext")
+    manager.connection.execute(
+        f"""
+        CREATE TABLE {ext}._sf_functions_ext (
+            function_catalog VARCHAR,
+            function_schema VARCHAR,
+            function_name VARCHAR,
+            num_arguments INTEGER,
+            macro_name VARCHAR,
+            arguments VARCHAR,
+            return_type VARCHAR,
+            language VARCHAR,
+            body VARCHAR,
+            created_on TIMESTAMP,
+            PRIMARY KEY (function_catalog, function_schema, function_name, num_arguments)
+        )
+        """
+    )
+    manager.connection.execute(
+        f"INSERT INTO {ext}._sf_functions_ext VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, now())",
+        [
+            session.database,
+            session.schema,
+            "F_OLD",
+            2,
+            "__SFUDF_F_OLD__2",
+            json.dumps([["A", "VARCHAR"], ["B", "VARCHAR"]]),
+            "BOOLEAN",
+            "SQL",
+            " EQUAL_NULL(UPPER(a), UPPER(b)) ",
+        ],
+    )
+    manager.connection.close()
+
+    reopened = DuckDBManager(path)
+    rows = reopened.query_functions(session.database, session.schema)
+    assert [(row[0], row[4], row[5], row[6]) for row in rows] == [
+        ("F_OLD", "VARCHAR|VARCHAR", "__SFUDF_F_OLD__2", None)
+    ]
+    # The DuckDB return type was not recorded by the old shape, so promoting it to a
+    # dispatcher reports the gap instead of guessing a type.
+    assert rows[0][9] is None
     reopened.connection.close()
