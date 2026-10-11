@@ -732,14 +732,17 @@ def _cast_array_operands(node: exp.Expression) -> exp.Expression:
 def _rewrite_json_array_function(node: exp.Expression) -> exp.Expression:
     """Make a Snowflake array function work over a VARIANT/JSON array.
 
-    A VARIANT array (``col:path``, ``$1:path``, ``PARSE_JSON('[...]')``, ``x::VARIANT``) is
-    stored as DuckDB JSON, which its list functions reject: they take a LIST. The array
-    operand is therefore cast to ``JSON[]``, a searched value is encoded with ``TO_JSON`` so
-    both sides compare as VARIANT values the way Snowflake compares them, and the functions
-    whose sqlglot mapping is wrong for *any* operand (indexing, ``SLICE``, ``ARRAY_UNIQUE``,
-    ``ARRAY_REPEAT``, ``ARRAY_FLATTEN``) are rebuilt. A bare VARIANT column (whose array-ness
-    is only known at run time) is left alone: DuckDB raises, where casting it could silently
-    compare unequal values.
+    A Snowflake array the emulator stores as DuckDB JSON (``col:path``, ``$1:path``,
+    ``PARSE_JSON('[...]')``) is rejected by DuckDB's list functions, which take a LIST. The
+    array operand is therefore cast to ``JSON[]``, a searched value is encoded with
+    ``TO_JSON`` so both sides compare as VARIANT values the way Snowflake compares them, and
+    the functions whose sqlglot mapping is wrong for *any* operand (indexing, ``SLICE``,
+    ``ARRAY_UNIQUE``, ``ARRAY_REPEAT``, ``ARRAY_FLATTEN``) are rebuilt. A VARIANT-typed
+    operand (``x::VARIANT``, ``TO_VARIANT('[...]')``, a bare VARIANT column) is left alone: it
+    is not JSON to DuckDB, and DuckDB's own ``VARIANT`` -> ``JSON[]`` cast is no substitute --
+    for a VARIANT built from text it returns unquoted element text (``ada`` for ``"ada"``),
+    so the search would compare unequal against ``TO_JSON(...)``. Whether a bare column holds
+    an array is known only at run time in any case.
 
     Called only once the operands have had their own rewrites applied (see
     ``_rewrite_json_array_functions``), because the replacement is built from their SQL.
