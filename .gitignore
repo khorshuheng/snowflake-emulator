@@ -9,3 +9,6 @@ wheels/
 # Virtual environments
 .venv
 .pytest_cache/
+
+# Local tool indexes
+.codegraph/
