@@ -126,6 +126,25 @@ including `QUALIFY`, `ILIKE`, `DATEADD`/`DATEDIFF`, semi-structured functions li
 WAREHOUSE/ROLE` statements are intercepted and applied to the emulator's in-memory
 session state rather than being sent to DuckDB.
 
+Semi-structured arrays work with `ARRAY_CONTAINS`, `ARRAY_SIZE` and `ARRAY_SLICE` (plus
+Snowflake's `SLICE` alias): an operand that the emulator stores as JSON (`col:names`,
+`$1:names`, `PARSE_JSON('[...]')`, `x::VARIANT`) is translated onto DuckDB's list
+functions, and a bound search value occupies one parameter. `WHERE ARRAY_CONTAINS('admin', payload:tags)` therefore filters VARIANT rows
+and staged records alike. `ARRAY_SLICE` keeps Snowflake's indexing (0-based, both bounds
+inclusive, a negative bound counting from the end, out-of-range bounds clamping and an
+empty array when the start is past the end) and now does so for native lists as well, where
+it previously came back one element short. Not translated, and left as a loud error rather
+than a guess:
+
+- a **bare VARIANT column** (`ARRAY_CONTAINS('a', variant_col)`) — whether it holds an
+  array is only known at run time, and casting a non-array VARIANT to a list compares
+  silently unequal values;
+- the rest of the family — `ARRAY_POSITION` (needs `0`, not NULL, when the value is
+  absent), `ARRAY_TO_STRING` (would keep each element's JSON quotes), `ARRAY_SORT`,
+  `ARRAY_UNIQUE`, `ARRAY_COMPACT`, `ARRAY_AGG`;
+- an `ARRAY_SLICE` index given as a `?` bind — the 0-based adjustment has to name the index
+  twice, so it would consume two values; a literal, a column or a JSON value all work.
+
 ## Staging files (PUT / GET / LIST / REMOVE / COPY INTO)
 
 The emulator implements Snowflake's local stage workflow for JSON, CSV and Parquet files.

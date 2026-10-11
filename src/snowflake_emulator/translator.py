@@ -11,6 +11,11 @@ from sqlglot import exp
 READ_DIALECT = "snowflake"
 WRITE_DIALECT = "duckdb"
 
+# Snowflake array functions whose array operand the emulator must present to DuckDB as a
+# LIST rather than as the JSON it stores a VARIANT array as (see
+# ``_rewrite_json_array_function``).
+_JSON_ARRAY_FUNCTIONS = (exp.ArrayContains, exp.ArraySize, exp.ArraySlice)
+
 # DuckDB reserves the ``information_schema`` schema name, so Snowflake's
 # ``INFORMATION_SCHEMA`` is exposed under a non-reserved name and references are
 # rewritten at the AST level (see ``_rewrite_information_schema``). The name is
@@ -340,6 +345,195 @@ def _rewrite_information_schema(node: exp.Expression) -> exp.Expression:
     return node
 
 
+def _casts_to(node: exp.Expression, types: tuple[exp.DataType.Type, ...]) -> bool:
+    """True when `node` is a ``CAST`` straight to one of `types`."""
+    return (
+        isinstance(node, exp.Cast)
+        and isinstance(node.to, exp.DataType)
+        and node.to.this in types
+    )
+
+
+def _is_json_value(node: exp.Expression) -> bool:
+    """True for expressions the emulator evaluates to DuckDB's JSON type.
+
+    Snowflake's OBJECT/ARRAY casts are rewritten to JSON before this runs, so a cast to
+    either of those counts too.
+    """
+    if isinstance(node, (exp.JSONExtract, exp.JSONExtractScalar, exp.ParseJSON)):
+        return True
+    return _casts_to(node, (exp.DataType.Type.JSON,))
+
+
+def _is_variant_value(node: exp.Expression) -> bool:
+    """True for expressions the emulator evaluates to DuckDB's VARIANT type."""
+    if isinstance(node, exp.ToVariant):
+        return True
+    return _casts_to(node, (exp.DataType.Type.VARIANT,))
+
+
+def _is_json_list(node: exp.Expression) -> bool:
+    """True for a ``CAST(... AS JSON[])``, the list form these rewrites produce."""
+    return (
+        isinstance(node, exp.Cast)
+        and isinstance(node.to, exp.DataType)
+        and node.to.this == exp.DataType.Type.ARRAY
+        and any(
+            isinstance(inner, exp.DataType) and inner.this == exp.DataType.Type.JSON
+            for inner in node.to.expressions
+        )
+    )
+
+
+def _is_json_array_value(node: exp.Expression) -> bool:
+    """True for expressions the emulator evaluates to DuckDB's JSON[] type.
+
+    Covers an array stored as JSON, and an ``ARRAY_SLICE`` over one -- which this module
+    turns into a JSON[] call, so an enclosing call must treat it as an array too.
+    """
+    if _is_json_value(node) or _is_json_list(node):
+        return True
+    return isinstance(node, exp.ArraySlice) and _is_json_array_value(node.this)
+
+
+def _duckdb_slice_bound(bound: exp.Expression) -> exp.Expression:
+    """Translate one Snowflake ``ARRAY_SLICE`` bound into DuckDB's 1-based indexing.
+
+    Snowflake's bounds are 0-based and inclusive, DuckDB's are 1-based and inclusive, and
+    both count a negative bound from the end -- so only a non-negative bound moves, by one.
+    DuckDB clamps an out-of-range bound and returns an empty list when the start is past
+    the end, which is what Snowflake does too.
+    """
+    if _is_json_value(bound) or _is_variant_value(bound):
+        # Snowflake casts a boundary to an integer for us; DuckDB will not add a JSON value.
+        bound = exp.cast(bound, exp.DataType.build("INTEGER"), dialect=WRITE_DIALECT)
+    if isinstance(bound, exp.Literal) and not bound.is_string:
+        try:
+            value = int(bound.name)
+        except ValueError:
+            pass
+        else:
+            return exp.Literal.number(value + 1 if value >= 0 else value)
+    if isinstance(bound, exp.Placeholder) and bound.this is None:
+        # The sign adjustment has to name the bound twice, so a positional `?` would need
+        # two values for one placeholder. Say so instead of failing on a parameter count.
+        raise TranslationError(
+            "ARRAY_SLICE with a '?' index is not supported by the emulator; pass a literal "
+            "or a column."
+        )
+    # A bound only known at run time needs the same adjustment. This names the bound twice,
+    # which a bound column tolerates (sqlglot's own rendering of a start bound names it
+    # three times).
+    bound_sql = bound.sql(dialect=WRITE_DIALECT)
+    return sqlglot.parse_one(
+        f"{bound_sql} + CAST({bound_sql} >= 0 AS INTEGER)", read=WRITE_DIALECT
+    )
+
+
+def _rewrite_array_slice(node: exp.Expression) -> exp.Expression:
+    """Rewrite ``ARRAY_SLICE`` onto DuckDB's 1-based, inclusive ``array_slice``.
+
+    Applied to every slice, not just a JSON one: sqlglot's own rendering moves only the
+    start bound, so a native list is off by one at the end as well
+    (``ARRAY_SLICE(['a','b','c'], 0, 1)`` returned one element instead of two), while a
+    JSON array silently became a slice of the JSON *text* (``'['``). A JSON array operand
+    is cast to ``JSON[]`` so DuckDB binds its list function.
+    """
+    start, end = node.args.get("start"), node.args.get("end")
+    if start is None or end is None:
+        # Snowflake requires both bounds; without one, DuckDB would return NULL instead.
+        raise TranslationError("ARRAY_SLICE requires both a start and an end index.")
+    operand = _rewrite_json_array_functions(node.this)
+    if _is_json_array_value(operand) and not _is_json_list(operand):
+        operand = exp.cast(operand, exp.DataType.build("JSON[]"), dialect=WRITE_DIALECT)
+    return exp.func(
+        "array_slice",
+        operand,
+        _duckdb_slice_bound(start),
+        _duckdb_slice_bound(end),
+    )
+
+
+def _rewrite_json_array_function(node: exp.Expression) -> exp.Expression:
+    """Make an array function work over a Snowflake VARIANT/JSON array.
+
+    ``ARRAY_CONTAINS(v, col:path)``, ``ARRAY_SIZE(col:path)`` and ``ARRAY_SLICE(col:path,
+    from, to)`` reach DuckDB as calls over JSON, which its list functions reject: they take
+    a LIST, while the emulator stores a semi-structured array as JSON. The array operand is
+    therefore cast to ``JSON[]``; a searched value that is neither a VARIANT nor already
+    JSON is encoded with ``TO_JSON`` so both sides compare as VARIANT values, the way
+    Snowflake compares them; and slice bounds are moved from Snowflake's 0-based indexing
+    to DuckDB's 1-based one. A bare VARIANT column (whose array-ness is only known at run
+    time) is left alone: DuckDB raises, where casting it could silently compare unequal
+    values.
+
+    Called only once the operands have had their own rewrites applied (see
+    ``_rewrite_json_array_functions``), because the replacement is built from their SQL.
+    """
+    if isinstance(node, exp.ArraySlice):
+        return _rewrite_array_slice(node)
+    if not _is_json_array_value(node.this):
+        return node
+    operand = _rewrite_json_array_functions(node.this)
+    array = (
+        operand
+        if _is_json_list(operand)
+        else exp.cast(operand, exp.DataType.build("JSON[]"), dialect=WRITE_DIALECT)
+    )
+    if isinstance(node, exp.ArraySize):
+        node.set("this", array)
+        return node
+
+    value = node.args.get("expression")
+    if value is not None and not (_is_json_value(value) or _is_variant_value(value)):
+        value = exp.func("to_json", value)
+    # sqlglot renders this as `CASE WHEN value IS NULL THEN ... ELSE ARRAY_CONTAINS(...)`,
+    # which evaluates the value expression twice -- a bound `?` then needs two values.
+    # This form is equivalent (checked against that CASE for a found/absent value, a NULL
+    # value, and an array holding NULL) while naming the value once.
+    array_sql = array.sql(dialect=WRITE_DIALECT)
+    value_sql = value.sql(dialect=WRITE_DIALECT) if value is not None else "NULL"
+    return sqlglot.parse_one(
+        f"COALESCE(ARRAY_CONTAINS({array_sql}, {value_sql}), "
+        f"NULLIF(ARRAY_LENGTH({array_sql}) <> LIST_COUNT({array_sql}), FALSE))",
+        read=WRITE_DIALECT,
+    )
+
+
+def _rewrite_json_array_functions(statement: exp.Expression) -> exp.Expression:
+    """Apply ``_rewrite_json_array_function`` to every array call in `statement`.
+
+    A separate pass over a snapshot, because ``transform`` visits a parent before its
+    children: rebuilding a call from its operands' SQL requires those operands to have
+    been rewritten first, so an operand that is itself a rewritten call is handled
+    recursively (``_rewrite_json_array_function``). A node detached by an ancestor's
+    replacement is skipped.
+    """
+    # Snowflake documents SLICE as an alias of ARRAY_SLICE, but sqlglot leaves it as an
+    # uninterpreted call that DuckDB rejects. Nested calls are converted by the loop too:
+    # a converted call holds the live child nodes, so an inner SLICE is still in the tree.
+    for alias in list(statement.find_all(exp.Anonymous)):
+        if alias.name.upper() == "SLICE" and len(alias.expressions) == 3:
+            array, start, end = alias.expressions
+            alias.replace(exp.ArraySlice(this=array, start=start, end=end, zero_based=True))
+
+    root = statement
+    for node in list(statement.find_all(*_JSON_ARRAY_FUNCTIONS)):
+        if node.parent is None and node is not root:
+            continue  # already replaced as part of an enclosing call
+        replacement = _rewrite_json_array_function(node)
+        if replacement is node:
+            continue
+        if node is not root:
+            node.replace(replacement)
+        elif root.parent is not None:
+            node.replace(replacement)  # keep the enclosing node's operand consistent
+            root = replacement
+        else:
+            root = replacement
+    return root
+
+
 def _rewrite_snowflake_specifics(node: exp.Expression) -> exp.Expression:
     """Rewrite Snowflake nodes that sqlglot can't fully transpile to DuckDB."""
     # ``CURRENT_VERSION()`` -> a Snowflake-style dotted-numeric version literal.
@@ -500,6 +694,9 @@ def transpile_to_duckdb(statement: exp.Expression) -> str:
         statement = statement.transform(_uppercase_unquoted_identifiers)
         statement = statement.transform(_rewrite_information_schema)
         statement = statement.transform(_rewrite_snowflake_specifics)
+        # After the rewrites above: an array call is rebuilt from its operands' SQL, so
+        # those operands must already be in their final DuckDB form.
+        statement = _rewrite_json_array_functions(statement)
 
         # Snowflake's ``INSERT OVERWRITE`` clears the table then inserts; DuckDB has
         # no such statement (it would be mis-serialized as ``INSERT OVERWRITE TABLE``).

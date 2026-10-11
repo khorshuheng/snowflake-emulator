@@ -92,6 +92,241 @@ def test_variant_and_array_types(client):
     assert body["data"] == [[{"a": 1, "b": "x"}, [1, 2, 3]]]
 
 
+def test_array_functions_over_variant_arrays(client):
+    """A VARIANT array (`col:path`) must work with ARRAY_CONTAINS/ARRAY_SIZE.
+
+    The emulator stores a semi-structured array as DuckDB JSON, while DuckDB's list
+    functions take a LIST, so `ARRAY_CONTAINS(v, col:path)` used to fail with
+    `No function matches ... 'array_length(JSON)'`.
+    """
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    assert post("CREATE TABLE holds (j VARIANT, x VARIANT)").status_code == 200
+    assert (
+        post(
+            "INSERT INTO holds SELECT PARSE_JSON('{\"names\": [\"ada\", \"bob\"]}'), "
+            "TO_VARIANT('ada')"
+        ).status_code
+        == 200
+    )
+
+    for statement, expected in (
+        ("SELECT ARRAY_CONTAINS('ada', j:names) FROM holds", [[True]]),
+        ("SELECT ARRAY_CONTAINS('zoe', j:names) FROM holds", [[False]]),
+        ("SELECT ARRAY_CONTAINS('ada'::VARIANT, j:names) FROM holds", [[True]]),
+        ("SELECT ARRAY_CONTAINS(TO_VARIANT('ada'), j:names) FROM holds", [[True]]),
+        ("SELECT ARRAY_CONTAINS(x, j:names) FROM holds", [[True]]),
+        ("SELECT ARRAY_CONTAINS('ada', PARSE_JSON('[\"ada\"]'))", [[True]]),
+        ("SELECT ARRAY_CONTAINS('ada', j:missing) FROM holds", [[None]]),
+        ("SELECT ARRAY_SIZE(j:names) FROM holds", [[2]]),
+        ("SELECT ARRAY_SIZE(j:missing) FROM holds", [[None]]),
+        # Native DuckDB lists must keep working untouched.
+        ("SELECT ARRAY_CONTAINS('ada', ARRAY_CONSTRUCT('ada', 'bob'))", [[True]]),
+        ("SELECT ARRAY_SIZE(ARRAY_CONSTRUCT(1, 2, 3))", [[3]]),
+    ):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        assert resp.json()["data"] == expected, statement
+
+
+def test_array_contains_with_a_bound_value(client):
+    """A bound value must be one parameter: sqlglot's own rendering names it twice."""
+    assert (
+        client.post(
+            "/api/v2/statements",
+            json={"statement": "CREATE TABLE bound (j VARIANT)"},
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            "/api/v2/statements",
+            json={
+                "statement": "INSERT INTO bound SELECT "
+                "PARSE_JSON('{\"tags\": [\"ada\", \"bob\"]}')"
+            },
+        ).status_code
+        == 200
+    )
+
+    for value, expected in (("ada", [[True]]), ("zoe", [[False]])):
+        resp = client.post(
+            "/api/v2/statements",
+            json={
+                "statement": "SELECT ARRAY_CONTAINS(?, j:tags) FROM bound",
+                "bindings": {"1": {"type": "TEXT", "value": value}},
+            },
+        )
+        assert resp.status_code == 200, resp.json()
+        assert resp.json()["data"] == expected
+
+    filtered = client.post(
+        "/api/v2/statements",
+        json={
+            "statement": "SELECT ARRAY_SIZE(j:tags) AS n FROM bound "
+            "WHERE ARRAY_CONTAINS(?, j:tags)",
+            "bindings": {"1": {"type": "TEXT", "value": "bob"}},
+        },
+    )
+    assert filtered.status_code == 200, filtered.json()
+    assert filtered.json()["data"] == [[2]]
+
+
+def test_array_slice_over_variant_arrays(client):
+    """ARRAY_SLICE is 0-based and inclusive, with negatives counted from the end.
+
+    sqlglot's own rendering moved only the start bound: a JSON array became a slice of the
+    JSON *text* (`ARRAY_SLICE(j:names, 0, 1)` returned `'['`) and a native list came back
+    one element short.
+    """
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    assert post("CREATE TABLE slices (j VARIANT, idx VARIANT)").status_code == 200
+    assert (
+        post(
+            "INSERT INTO slices SELECT "
+            "PARSE_JSON('{\"names\": [\"a\",\"b\",\"c\",\"d\",\"e\"], \"idx\": 1}'), "
+            "TO_VARIANT(1)"
+        ).status_code
+        == 200
+    )
+
+    for statement, expected in (
+        ("SELECT ARRAY_SLICE(j:names, 0, 4) FROM slices", [[['"a"', '"b"', '"c"', '"d"', '"e"']]]),
+        ("SELECT ARRAY_SLICE(j:names, 1, 3) FROM slices", [[['"b"', '"c"', '"d"']]]),
+        ("SELECT ARRAY_SLICE(j:names, -3, -1) FROM slices", [[['"c"', '"d"', '"e"']]]),
+        ("SELECT ARRAY_SLICE(j:names, 0, 0) FROM slices", [[['"a"']]]),
+        ("SELECT ARRAY_SLICE(j:names, -1, -1) FROM slices", [[['"e"']]]),
+        # Out-of-range bounds clamp, and an empty slice is an empty array, not an error.
+        ("SELECT ARRAY_SLICE(j:names, 0, 99) FROM slices", [[['"a"', '"b"', '"c"', '"d"', '"e"']]]),
+        ("SELECT ARRAY_SLICE(j:names, -100, 100) FROM slices", [[['"a"', '"b"', '"c"', '"d"', '"e"']]]),
+        ("SELECT ARRAY_SLICE(j:names, 10, 20) FROM slices", [[[]]]),
+        ("SELECT ARRAY_SLICE(j:names, 3, 1) FROM slices", [[[]]]),
+        ("SELECT ARRAY_SLICE(j:missing, 0, 1) FROM slices", [[None]]),
+        # A nested call, and a bound that is itself a VARIANT value.
+        ("SELECT ARRAY_CONTAINS('c', ARRAY_SLICE(j:names, 1, 3)) FROM slices", [[True]]),
+        ("SELECT ARRAY_SIZE(ARRAY_SLICE(j:names, 1, 3)) FROM slices", [[3]]),
+        ("SELECT ARRAY_SLICE(j:names, j:idx, 3) FROM slices", [[['"b"', '"c"', '"d"']]]),
+    ):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        assert resp.json()["data"] == expected, statement
+
+
+def test_array_slice_rejects_a_bound_index(client):
+    """A `?` index cannot work (the sign adjustment names it twice); say so clearly."""
+    resp = client.post(
+        "/api/v2/statements",
+        json={
+            "statement": "SELECT ARRAY_SLICE(ARRAY_CONSTRUCT('a','b','c'), ?, 2)",
+            "bindings": {"1": {"type": "FIXED", "value": "1"}},
+        },
+    )
+    assert resp.status_code == 422
+    assert "ARRAY_SLICE with a '?' index" in resp.json()["detail"]["message"]
+
+
+def test_slice_alias_matches_array_slice(client, tmp_path):
+    """`SLICE` is Snowflake's alias of `ARRAY_SLICE`; sqlglot left it as an unknown call."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    assert post("CREATE TABLE alias_t (j VARIANT)").status_code == 200
+    assert (
+        post("INSERT INTO alias_t SELECT PARSE_JSON('{\"n\": [\"a\",\"b\",\"c\",\"d\"]}')")
+    ).status_code == 200
+
+    json_path = tmp_path / "names.json"
+    json_path.write_text(json.dumps({"names": ["a", "b", "c"]}) + "\n")
+    headers = _stage_headers(client)
+    _stage(client, headers, json_path, "@~/staged")
+
+    for statement, expected in (
+        ("SELECT SLICE(j:n, 0, 1) FROM alias_t", [[['"a"', '"b"']]]),
+        ("SELECT SLICE(j:n, -2, -1) FROM alias_t", [[['"c"', '"d"']]]),
+        ("SELECT slice(j:n, 1, 2) FROM alias_t", [[['"b"', '"c"']]]),
+        ("SELECT SLICE(ARRAY_CONSTRUCT('a','b','c'), 0, 1)", [[["a", "b"]]]),
+        ("SELECT ARRAY_SIZE(SLICE(j:n, 0, 1)) FROM alias_t", [[2]]),
+        ("SELECT ARRAY_CONTAINS('a', SLICE(j:n, 0, 1)) FROM alias_t", [[True]]),
+        ("SELECT SLICE(SLICE(j:n, 0, 2), 1, 1) FROM alias_t", [[['"b"']]]),
+    ):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        assert resp.json()["data"] == expected, statement
+
+    staged = client.post(
+        "/api/v2/statements",
+        json={"statement": "SELECT SLICE($1:names, 1, 2) FROM @~/staged/names.json"},
+        headers=headers,
+    )
+    assert staged.status_code == 200, staged.json()
+    assert staged.json()["data"] == [[['"b"', '"c"']]]
+
+
+def test_array_slice_requires_both_bounds(client):
+    """A missing bound is invalid Snowflake; DuckDB would otherwise return NULL."""
+    resp = client.post(
+        "/api/v2/statements",
+        json={"statement": "SELECT ARRAY_SLICE(ARRAY_CONSTRUCT('a','b'), 0)"},
+    )
+    assert resp.status_code == 422
+    assert "requires both a start and an end index" in resp.json()["detail"]["message"]
+
+
+def test_array_slice_over_native_lists(client):
+    """A native list slices correctly too (it used to come back one element short)."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    assert post("CREATE TABLE native (names VARCHAR[])").status_code == 200
+    assert post("INSERT INTO native SELECT ARRAY_CONSTRUCT('a','b','c')").status_code == 200
+
+    for statement, expected in (
+        ("SELECT ARRAY_SLICE(ARRAY_CONSTRUCT('a','b','c'), 0, 1)", [[["a", "b"]]]),
+        ("SELECT ARRAY_SLICE(ARRAY_CONSTRUCT('a','b','c'), 1, 2)", [[["b", "c"]]]),
+        ("SELECT ARRAY_SLICE(names, 0, 2) FROM native", [[["a", "b", "c"]]]),
+        ("SELECT ARRAY_SLICE(names, -2, -1) FROM native", [[["b", "c"]]]),
+        ("SELECT ARRAY_SLICE(names, 0, 9) FROM native", [[["a", "b", "c"]]]),
+        ("SELECT ARRAY_SLICE(names, 5, 9) FROM native", [[[]]]),
+    ):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        assert resp.json()["data"] == expected, statement
+
+
+def test_array_functions_over_a_bare_variant_column_still_error(client):
+    """A bare VARIANT column has no static array type, so this stays a loud error."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    assert post("CREATE TABLE bare (names VARIANT)").status_code == 200
+    assert post("INSERT INTO bare SELECT PARSE_JSON('[\"ada\"]')").status_code == 200
+    resp = post("SELECT ARRAY_CONTAINS('ada', names) FROM bare")
+    assert resp.status_code == 422
+
+
+def test_array_functions_over_staged_json(client, tmp_path):
+    """The same fix covers a staged file's `$1:path` array."""
+    json_path = tmp_path / "names.json"
+    json_path.write_text(json.dumps({"names": ["ada", "bob"]}) + "\n")
+    headers = _stage_headers(client)
+    _stage(client, headers, json_path, "@~/staged")
+
+    resp = client.post(
+        "/api/v2/statements",
+        json={
+            "statement": "SELECT ARRAY_CONTAINS('bob', $1:names) AS hit, "
+            "ARRAY_SIZE($1:names) AS n, "
+            "ARRAY_SLICE($1:names, 1, 1) AS second FROM @~/staged/names.json"
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.json()
+    assert resp.json()["data"] == [[True, 2, ['"bob"']]]
+
+
 def test_snowflake_date_functions(client):
     resp = client.post(
         "/api/v2/statements",
