@@ -956,6 +956,37 @@ def test_select_from_multiple_stages_is_rejected(client, tmp_path):
     assert "only one staged file location" in resp.json()["detail"]["message"]
 
 
+def test_stage_options_accept_spaces_around_equals(client, tmp_path):
+    """`PATTERN = '...'` (Snowflake's spelling) must not be dropped for a no-op pattern."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    parquet_path = tmp_path / "people.parquet"
+    pq.write_table(pa.table({"n": [1, 2]}), parquet_path)
+    csv_path = tmp_path / "data.csv"
+    _write_csv(csv_path)
+    headers = _stage_headers(client)
+    _stage(client, headers, parquet_path, "@~/spaced")
+    _stage(client, headers, csv_path, "@~/spaced")
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    got = _select(
+        client, headers, f"GET @~/spaced file://{out_dir} PATTERN = '.*[.]parquet'"
+    )
+    assert [row[0] for row in got["data"]] == ["spaced/people.parquet"]
+    assert sorted(os.listdir(out_dir)) == ["people.parquet"]
+
+    listed = _select(client, headers, "LIST @~/spaced PATTERN = '.*[.]csv'")
+    assert [row[0] for row in listed["data"]] == ["spaced/data.csv"]
+
+    # A PUT flag written with spaces still overwrites (it used to become `PARQUET`-style junk).
+    again = _select(
+        client, headers, f"PUT file://{csv_path} @~/spaced OVERWRITE = TRUE"
+    )
+    assert again["data"][0][6] == "UPLOADED"
+
+
 def test_copy_into_parquet_file(client, tmp_path):
     """Staged Parquet loads into a table, with or without an explicit TYPE."""
     import pyarrow as pa

@@ -368,6 +368,32 @@ def parse_stage_ref(ref: str) -> StageRef:
     raise StageError(f"Invalid stage reference: {ref!r}")
 
 
+# A PUT/GET/LIST/REMOVE option: `KEY=value`, `KEY = value` (Snowflake's own spelling) or a
+# bare flag. A quoted value may contain spaces, so options cannot be split on whitespace.
+_OPTION_RE = re.compile(
+    r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?:\s*=\s*"
+    r"(?P<value>'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|[^\s,]+)"
+    r")?"
+)
+
+
+def _parse_stage_options(text: str) -> dict[str, str]:
+    """Parse stage-command options, tolerating whitespace around ``=``.
+
+    Snowflake writes these as ``PATTERN = '<regex>'`` / ``PARALLEL = 4``, and a pattern may
+    contain spaces, so a whitespace split would lose the option (or the pattern) rather than
+    report it. A bare key is a flag, as ``OVERWRITE`` is for PUT.
+    """
+    options: dict[str, str] = {}
+    for match in _OPTION_RE.finditer(text):
+        value = match.group("value")
+        options[match.group("key").upper()] = (
+            "TRUE" if value is None else _unquote_literal(value)
+        )
+    return options
+
+
 def match_stage_command(sql: str) -> str | None:
     """Classify a statement as a stage command: PUT, GET, LIST, REMOVE (else None)."""
     stripped = sql.lstrip()
@@ -395,63 +421,46 @@ def parse_put(sql: str) -> PutCommand:
     if not files:
         raise StageError("PUT requires at least one source file.")
 
-    parts = stage_and_opts.split()
+    parts = stage_and_opts.split(maxsplit=1)
     stage = parse_stage_ref(parts[0])
-    options: dict[str, str] = {}
-    for part in parts[1:]:
-        key, sep, value = part.partition("=")
-        if not sep:
-            options[part.upper()] = "TRUE"
-        else:
-            options[key.strip().upper()] = value.strip().strip("'\"")
+    options = _parse_stage_options(parts[1]) if len(parts) > 1 else {}
     return PutCommand(files=files, stage=stage, options=options)
 
 
 def parse_get(sql: str) -> GetCommand:
     """Parse ``GET @<stage> file:///local/dir [PATTERN='...'] [PARALLEL=4]``."""
     rest = sql[3:].strip()
-    parts = rest.split()
+    parts = rest.split(maxsplit=2)
     if not parts:
         raise StageError("GET requires a stage location.")
     stage = parse_stage_ref(parts[0])
     local_dir = parts[1] if len(parts) > 1 else ""
     if local_dir.startswith("file://"):
         local_dir = local_dir[len("file://") :]
-    options: dict[str, str] = {}
-    for part in parts[2:]:
-        key, sep, value = part.partition("=")
-        options[key.strip().upper()] = value.strip().strip("'\"") if sep else "TRUE"
+    options = _parse_stage_options(parts[2]) if len(parts) > 2 else {}
     return GetCommand(stage=stage, local_dir=local_dir, options=options)
 
 
 def parse_list(sql: str) -> ListCommand:
     """Parse ``LIST @<stage> [PATTERN='...']``."""
     rest = sql[4:].strip()
-    parts = rest.split()
+    parts = rest.split(maxsplit=1)
     if not parts:
         raise StageError("LIST requires a stage location.")
     stage = parse_stage_ref(parts[0])
-    pattern = None
-    for part in parts[1:]:
-        key, sep, value = part.partition("=")
-        if key.strip().upper() == "PATTERN" and sep:
-            pattern = value.strip().strip("'\"")
-    return ListCommand(stage=stage, pattern=pattern)
+    options = _parse_stage_options(parts[1]) if len(parts) > 1 else {}
+    return ListCommand(stage=stage, pattern=options.get("PATTERN"))
 
 
 def parse_remove(sql: str) -> RemoveCommand:
     """Parse ``REMOVE @<stage> [PATTERN='...']``."""
     rest = sql[6:].strip()
-    parts = rest.split()
+    parts = rest.split(maxsplit=1)
     if not parts:
         raise StageError("REMOVE requires a stage location.")
     stage = parse_stage_ref(parts[0])
-    pattern = None
-    for part in parts[1:]:
-        key, sep, value = part.partition("=")
-        if key.strip().upper() == "PATTERN" and sep:
-            pattern = value.strip().strip("'\"")
-    return RemoveCommand(stage=stage, pattern=pattern)
+    options = _parse_stage_options(parts[1]) if len(parts) > 1 else {}
+    return RemoveCommand(stage=stage, pattern=options.get("PATTERN"))
 
 
 def match_stage_ddl(statement: exp.Expression) -> str | None:
@@ -683,14 +692,15 @@ def _sql_escape(value: str) -> str:
 
 
 def _unquote_literal(value: str) -> str:
-    """Strip the single pair of quotes enclosing a SQL literal, if any.
+    """Strip the single pair of quotes enclosing a SQL literal, and unescape its quotes.
 
-    Only one pair is removed (unlike ``str.strip``), so a value that *is* a quote
-    character -- ``FIELD_OPTIONALLY_ENCLOSED_BY = '"'`` -- survives intact.
+    Only one pair is removed (unlike ``str.strip``), so a value that *is* a quote character
+    -- ``FIELD_OPTIONALLY_ENCLOSED_BY = '"'`` -- survives intact, while a doubled quote
+    inside the literal (SQL's escape for one) collapses back to a single character.
     """
     text = value.strip()
     if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
-        return text[1:-1]
+        return text[1:-1].replace(text[0] * 2, text[0])
     return text
 
 

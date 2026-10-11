@@ -123,6 +123,27 @@ def test_parse_put_multiple_files_and_options():
     }
 
 
+def test_parse_stage_options_tolerate_whitespace_around_equals():
+    """Snowflake writes `PATTERN = '...'` / `PARALLEL = 4`; a whitespace split loses them."""
+    assert parse_get("GET @~/s file:///tmp/o PATTERN = '.*[.]parquet'").options == {
+        "PATTERN": ".*[.]parquet"
+    }
+    assert parse_get("GET @~/s file:///tmp/o PARALLEL = 4 PATTERN='.*x.*'").options == {
+        "PATTERN": ".*x.*",
+        "PARALLEL": "4",
+    }
+    assert parse_put("PUT file:///a.csv @~/s OVERWRITE = TRUE").options == {"OVERWRITE": "TRUE"}
+    assert parse_put("PUT file:///a.csv @~/s OVERWRITE").options == {"OVERWRITE": "TRUE"}
+    assert parse_put("PUT file:///a.csv @~/s PARALLEL = 8").options == {"PARALLEL": "8"}
+
+
+def test_parse_stage_options_keep_quoted_values_with_spaces():
+    assert parse_list("LIST @~/s PATTERN = '.*a b.*'").pattern == ".*a b.*"
+    assert parse_list("LIST @~/s PATTERN='.*a b.*'").pattern == ".*a b.*"
+    assert parse_remove("REMOVE @~/s PATTERN = '.*it''s.*'").pattern == ".*it's.*"
+    assert parse_remove("REMOVE @~/s PATTERN = '.*[.]csv'").pattern == ".*[.]csv"
+
+
 def test_parse_put_requires_stage():
     with pytest.raises(StageError):
         parse_put("PUT file:///tmp/data.csv")
