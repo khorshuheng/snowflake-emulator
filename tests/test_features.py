@@ -126,6 +126,43 @@ def test_set_expression_variable_expands_expression_not_string(client):
     assert _post(client, "SELECT $x AS v", headers).json()["data"] == [[2]]
 
 
+def test_temporary_table_survives_across_statements(client):
+    """A temporary table is session-scoped, so it outlives the statement creating it."""
+    headers = _auth(client)
+    assert _post(client, "CREATE TEMPORARY TABLE tmp (a INT)", headers).status_code == 200
+    assert _post(client, "INSERT INTO tmp VALUES (1), (2)", headers).status_code == 200
+    assert _post(client, "SELECT a FROM tmp ORDER BY a", headers).json()["data"] == [[1], [2]]
+
+
+def test_volatile_table_is_temporary(client):
+    """``CREATE VOLATILE TABLE`` is Snowflake's synonym for a temporary table."""
+    headers = _auth(client)
+    assert _post(client, "CREATE VOLATILE TABLE vol (a INT)", headers).status_code == 200
+    assert _post(client, "INSERT INTO vol VALUES (5)", headers).status_code == 200
+    assert _post(client, "SELECT a FROM vol", headers).json()["data"] == [[5]]
+    assert _post(client, "SELECT a FROM vol", _auth(client)).status_code == 422
+
+
+def test_temporary_tables_are_session_scoped(client):
+    """Temporary tables are private to their session, permanent ones stay shared."""
+    first = _auth(client)
+    second = _auth(client)
+    _post(client, "CREATE TEMPORARY TABLE private_tmp (a INT)", first)
+    _post(client, "CREATE TABLE shared_perm (a INT)", first)
+    assert _post(client, "INSERT INTO shared_perm VALUES (9)", second).status_code == 200
+    assert _post(client, "SELECT a FROM shared_perm", first).json()["data"] == [[9]]
+    assert _post(client, "SELECT a FROM private_tmp", second).status_code == 422
+
+
+def test_temporary_table_dropped_when_session_closes(client):
+    token = client.post("/session/token").json()["token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    _post(client, "CREATE TEMPORARY TABLE gone (a INT)", headers)
+    assert client.post(f"/session/logout-request?token={token}").json()["success"] is True
+    # The same token now starts a fresh session, without the closed session's table.
+    assert _post(client, "SELECT a FROM gone", headers).status_code == 422
+
+
 def _write_csv(path, text):
     path.write_text(text)
 

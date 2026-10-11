@@ -142,7 +142,22 @@ def execute_sql(
     Snowflake's own multi-statement behaviour. `bind_params` (a positional list or a
     named mapping) and `bind_batch` (one tuple per row, for an array binding) are only
     applied when `raw_sql` contains a single statement.
+
+    The statements of one session are serialized and run on that session's own DuckDB
+    connection, so a ``CREATE TEMPORARY TABLE`` is visible to every later statement in
+    the session and a session never sees another session's temporary tables.
     """
+    with manager.session_scope(session.token):
+        return _execute_sql(manager, session, raw_sql, bind_params, bind_batch)
+
+
+def _execute_sql(
+    manager: DuckDBManager,
+    session: SessionContext,
+    raw_sql: str,
+    bind_params: list[Any] | dict[str, Any] | None = None,
+    bind_batch: list[tuple[Any, ...]] | None = None,
+) -> ExecutionResult:
     if _matches_noop(raw_sql):
         return ExecutionResult(
             handle=str(uuid.uuid4()),
@@ -152,7 +167,7 @@ def execute_sql(
         )
 
     manager.ensure_namespace(session.database, session.schema)
-    cursor = manager.cursor()
+    cursor = manager.cursor(session.token)
     cursor.execute(f'USE "{session.database}"."{session.schema}"')
 
     # Resolves user-defined function calls to the DuckDB macros backing them; loads
@@ -434,6 +449,16 @@ def describe_sql(
     session: SessionContext,
     raw_sql: str,
 ) -> ExecutionResult | None:
+    """Describe a statement's result columns without executing it."""
+    with manager.session_scope(session.token):
+        return _describe_sql(manager, session, raw_sql)
+
+
+def _describe_sql(
+    manager: DuckDBManager,
+    session: SessionContext,
+    raw_sql: str,
+) -> ExecutionResult | None:
     """Describe a statement's result columns without executing it.
 
     Snowflake answers a ``describeOnly`` request with result metadata and no rows, so
@@ -457,7 +482,7 @@ def describe_sql(
         if isinstance(node, (exp.Placeholder, exp.Parameter))
         else node
     )
-    cursor = manager.cursor()
+    cursor = manager.cursor(session.token)
     cursor.execute(f'USE "{session.database}"."{session.schema}"')
     try:
         duckdb_sql = transpile_to_duckdb(statement)
@@ -1332,7 +1357,7 @@ def _execute_function_describe(
     if not functions:
         raise ExecutionError(f"Function {this.name.upper()} does not exist.")
 
-    cursor = manager.cursor()
+    cursor = manager.cursor(session.token)
     cursor.execute(_USER_FUNCTION_DESCRIBE_SQL)
     row_type = _result_columns(cursor)[0]
     rows = [

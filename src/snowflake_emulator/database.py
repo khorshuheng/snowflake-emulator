@@ -23,8 +23,9 @@ import json
 import re
 import threading
 import warnings
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import duckdb
 
@@ -57,6 +58,16 @@ class DuckDBManager:
         # addresses.
         self._connection = duckdb.connect(":memory:")
         self._attached_catalogs: set[str] = set()
+        # One connection per session, created lazily. DuckDB scopes TEMP tables to the
+        # connection rather than to the database instance, so a session has to keep
+        # using the same connection for its temporary tables to survive from one
+        # statement to the next, as they do on Snowflake. Regular tables live in the
+        # attached catalogs and stay visible from every connection either way.
+        self._session_cursors: dict[str, duckdb.DuckDBPyConnection] = {}
+        # Serializes the statements of one session: DuckDB connections are not meant to
+        # be used concurrently, and a Snowflake session executes one statement at a
+        # time anyway. Sessions do not block each other.
+        self._session_locks: dict[str, threading.RLock] = {}
         # Native (Python) functions registered for type-overloaded user functions, keyed
         # by the dispatcher's name. They are per-process, cannot be re-registered under
         # the same name, and cannot be unregistered, so the mapping is mutable and the
@@ -532,9 +543,48 @@ class DuckDBManager:
     def _function_cache_key(database: str, schema: str) -> tuple[str, str]:
         return (database.lower(), schema.lower())
 
-    def cursor(self) -> duckdb.DuckDBPyConnection:
-        """Return an isolated cursor so concurrent requests don't clobber each other's state."""
-        return self._connection.cursor()
+    def cursor(self, session_token: str | None = None) -> duckdb.DuckDBPyConnection:
+        """Return the DuckDB connection to run a statement on.
+
+        With a `session_token` the session's own long-lived connection is returned, so
+        tables created with ``CREATE TEMPORARY TABLE`` (which DuckDB scopes to a
+        connection) survive from one statement to the next and are dropped when the
+        session ends. Without one, an isolated cursor is returned so concurrent callers
+        don't clobber each other's state.
+        """
+        if session_token is None:
+            return self._connection.cursor()
+        key = _session_key(session_token)
+        with self._lock:
+            cursor = self._session_cursors.get(key)
+            if cursor is None:
+                cursor = self._connection.cursor()
+                self._session_cursors[key] = cursor
+            return cursor
+
+    def session_lock(self, session_token: str | None) -> threading.RLock:
+        """Return the lock serializing one session's statements (see `cursor`)."""
+        key = _session_key(session_token)
+        with self._lock:
+            lock = self._session_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                self._session_locks[key] = lock
+            return lock
+
+    @contextmanager
+    def session_scope(self, session_token: str | None) -> Iterator[None]:
+        """Hold a session's statement lock for the duration of one statement."""
+        with self.session_lock(session_token):
+            yield
+
+    def release_session(self, session_token: str | None) -> None:
+        """Drop a closed session's connection, discarding its temporary tables."""
+        key = _session_key(session_token)
+        with self._lock:
+            cursor = self._session_cursors.pop(key, None)
+            self._session_locks.pop(key, None)
+        _close_quietly(cursor)
 
     def has_database(self, database: str) -> bool:
         """Return True if a Snowflake database is already attached as a catalog.
@@ -573,6 +623,21 @@ class DuckDBManager:
             self.ensure_namespace(database, "PUBLIC")
 
 
+def _session_key(session_token: str | None) -> str:
+    """Key session-scoped state by token, treating an absent token as one anonymous session."""
+    return session_token or "<anonymous>"
+
+
+def _close_quietly(cursor: duckdb.DuckDBPyConnection | None) -> None:
+    """Close a connection, ignoring an already-closed one."""
+    if cursor is None:
+        return
+    try:
+        cursor.close()
+    except Exception:  # noqa: BLE001 - best-effort cleanup
+        pass
+
+
 _STORAGE_SUFFIX = ".d"  # dedicated directory: <database_path>.d
 _DATABASE_FILE_SUFFIX = ".duckdb"  # one file per database inside that directory
 # Minimum DuckDB storage version that supports VARIANT columns (its default is older).
@@ -594,6 +659,21 @@ def release_isolated_manager(token: str) -> None:
             manager.connection.close()
         except Exception:  # noqa: BLE001 - best-effort cleanup
             pass
+
+
+def release_session(token: str | None) -> None:
+    """Drop a closed session's connection from the manager serving it.
+
+    In ``isolated`` mode the session's whole private database is released by
+    :func:`release_isolated_manager`, which drops the connection with it. In ``shared``
+    mode there is one common manager whose per-session connection -- and with it the
+    session's temporary tables -- has to be closed here.
+    """
+    if settings.isolation == "isolated":
+        return
+    global _manager
+    if _manager is not None:
+        _manager.release_session(token)
 
 
 def get_manager(session: Any | None = None) -> DuckDBManager:

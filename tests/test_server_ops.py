@@ -70,6 +70,15 @@ def test_shared_mode_shares_tables(client, restore_settings):
     assert _post(client, "SELECT COUNT(*) AS n FROM shared_t", second).status_code == 200
 
 
+def test_temporary_table_survives_in_isolated_mode(client, restore_settings):
+    settings.persistence.isolation = "isolated"
+    headers = _auth(client)
+
+    assert _post(client, "CREATE TEMPORARY TABLE iso_tmp (a INT)", headers).status_code == 200
+    assert _post(client, "INSERT INTO iso_tmp VALUES (3)", headers).status_code == 200
+    assert _post(client, "SELECT a FROM iso_tmp", headers).json()["data"] == [[3]]
+
+
 def test_cli_parser_applies_overrides(restore_settings):
     from snowflake_emulator.main import apply_args, build_parser
 
