@@ -46,6 +46,7 @@ from snowflake_emulator.translator import (
     INFORMATION_SCHEMA_SCHEMA,
     TranslationError,
     UseStatement,
+    drop_target_table,
     is_alter_session,
     is_transaction_control,
     match_use_statement,
@@ -1275,8 +1276,8 @@ def _execute_function_ddl(
             raise _as_execution_error(exc) from exc
         return status, [[message]]
     if isinstance(statement, exp.Drop) and kind == "FUNCTION":
-        this = statement.args.get("this")
-        if not isinstance(this, exp.Table):
+        this = drop_target_table(statement)
+        if this is None:
             return None
         # `DROP FUNCTION f(a NUMBER, b NUMBER)` names one overload; the types are
         # normalized the same way they were recorded so the drop cannot match the wrong
@@ -1501,7 +1502,8 @@ def _execute_file_format_ddl(
             [f"File format {name.upper()} successfully created."]
         ]
     if isinstance(statement, exp.Drop) and kind == "FILE FORMAT":
-        name = statement.this.name if isinstance(statement.this, exp.Table) else ""
+        target = drop_target_table(statement)
+        name = target.name if target is not None else ""
         if not name:
             return None
         get_file_format_manager().drop(session, name, if_exists=bool(statement.args.get("exists")))
@@ -1698,10 +1700,10 @@ def _execute_stage_ddl(
                 [[f"Stage {statement.this.name} successfully created."]],
             )
         if kind == "DROP_STAGE":
-            drop_stage(stages, session, statement)
+            name = drop_stage(stages, session, statement)
             return (
                 [ColumnMeta(name="status", type="text")],
-                [[f"Stage {statement.this.name} successfully dropped."]],
+                [[f"Stage {name} successfully dropped."]],
             )
         if kind == "ALTER_STAGE":
             return (

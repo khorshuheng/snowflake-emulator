@@ -107,3 +107,32 @@ def test_create_or_replace_resets_autoincrement_sequence(client):
         json={"statement": "SELECT * FROM replace_t ORDER BY id"},
     )
     assert resp.json()["data"] == [[100, "b"]]
+
+
+def test_create_or_replace_ordered_autoincrement_keeps_table(client):
+    """The ``ORDER`` identity option must not drop the table name from the rewrite.
+
+    ``CREATE OR REPLACE TABLE`` is rewritten as ``DROP TABLE IF EXISTS <name>`` plus a
+    sequence-backed ``CREATE TABLE``; a regression there emitted the drop without any
+    table name and failed at execution.
+    """
+    statement = (
+        "CREATE OR REPLACE TABLE ordered_t "
+        "(id NUMBER(38, 0) AUTOINCREMENT START 1 INCREMENT 1 ORDER, name STRING)"
+    )
+    assert client.post("/api/v2/statements", json={"statement": statement}).status_code == 200
+    client.post(
+        "/api/v2/statements",
+        json={"statement": "INSERT INTO ordered_t (name) VALUES ('a')"},
+    )
+    client.post(
+        "/api/v2/statements",
+        json={"statement": "INSERT INTO ordered_t (name) VALUES ('b')"},
+    )
+
+    resp = client.post(
+        "/api/v2/statements",
+        json={"statement": "SELECT CAST(id AS INT) AS id, name FROM ordered_t ORDER BY id"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["data"] == [[1, "a"], [2, "b"]]

@@ -8,12 +8,24 @@ from typing import Protocol
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.dialects import Snowflake
 from sqlglot.tokens import TokenType
 
 from snowflake_emulator.type_mapping import duckdb_type_to_snowflake_sql_type
 
 READ_DIALECT = "snowflake"
 WRITE_DIALECT = "duckdb"
+
+# sqlglot 30.21 began decoding backslash escapes in Snowflake string literals: an
+# unknown escape (``\d``, ``\.``, ``\U``) lost its backslash, and numeric escapes
+# (``\x41``, ``\u0041``, octal ``\101``) were decoded to their character. Snowflake
+# keeps unknown escapes literal and does not decode those numeric forms, so restoring
+# the pre-30.21 tokenizer settings here keeps regex patterns and paths intact (e.g.
+# ``REGEXP_REPLACE(x, '\d', ...)`` and ``'C:\Users\me'``). Set on the imported
+# ``Snowflake.Tokenizer`` rather than a subclass: ``sqlglot.parse(..., read="snowflake")``
+# resolves the dialect class, so replacing ``Tokenizer`` afterwards has no effect.
+Snowflake.Tokenizer.DROP_UNKNOWN_ESCAPES = False
+Snowflake.Tokenizer.NUMERIC_ESCAPES = {}
 
 # ``ARRAY_FLATTEN`` is renamed before parsing: sqlglot's node for it accepts one argument,
 # so the documented two-argument Snowflake form fails to parse outright.
@@ -252,6 +264,28 @@ def _table_name_parts(table: exp.Table) -> list[str]:
     return parts
 
 
+def _make_drop_table(table: exp.Table) -> exp.Drop:
+    """Build a ``DROP TABLE IF EXISTS <table>`` for ``table``.
+
+    sqlglot models a ``DROP`` target as a ``tables`` list (``this`` before 30.18, which
+    the project no longer supports).
+    """
+    return exp.Drop(tables=[table.copy()], kind="TABLE", exists=True)
+
+
+def drop_target_table(statement: exp.Drop) -> exp.Table | None:
+    """Return the table a ``DROP`` targets.
+
+    Returns ``None`` when there is no single table target (e.g. a multi-target drop,
+    which the emulator does not emulate).
+    """
+    tables = statement.args.get("tables")
+    if tables:
+        target = tables[0]
+        return target if isinstance(target, exp.Table) else None
+    return None
+
+
 def _make_sequence_create(
     seq_parts: list[str],
     start: exp.Expression,
@@ -314,7 +348,7 @@ def _rewrite_autoincrement_create(
     # ``CREATE OR REPLACE SEQUENCE`` cannot replace a sequence that an existing
     # table depends on, so drop the old table first when the CREATE is a replace.
     if replace:
-        pre_statements.append(exp.Drop(this=table.copy(), kind="TABLE", exists=True))
+        pre_statements.append(_make_drop_table(table))
 
     columns: list[exp.Expression] = []
     for col in statement.this.expressions:

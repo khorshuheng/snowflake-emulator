@@ -8,6 +8,7 @@ from sqlglot import exp
 
 from snowflake_emulator.stages import (
     StageError,
+    _decode_options,
     copy_stage_source,
     has_stage_file_table,
     is_stage_file_table,
@@ -199,6 +200,15 @@ def test_parse_stage_file_options_pattern_only():
     assert parse_stage_file_options("(PATTERN => 'part.*')") == {"PATTERN": "part.*"}
 
 
+def test_parse_stage_file_options_pattern_keeps_backslash():
+    r"""A regex escape such as ``\.`` must survive option parsing.
+
+    sqlglot >= 30.21 decodes it to ``.``, which silently broadens the pattern (``.*.csv``
+    also matches ``-csv``); the emulator pins the tokenizer so the backslash is kept.
+    """
+    assert parse_stage_file_options(r"(PATTERN => '.*\.csv')") == {"PATTERN": r".*\.csv"}
+
+
 def test_parse_stage_file_options_empty_clause():
     assert parse_stage_file_options("()") == {}
 
@@ -211,7 +221,7 @@ def test_preprocess_stage_file_clauses_encodes_options():
     parsed = sqlglot.parse_one(rewritten, read="snowflake")
     marker = parsed.find(exp.Table).args["format"]
     assert marker.name.startswith("sfemu:staged-file-options:")
-    assert '"SKIP_HEADER": "1"' in marker.name
+    assert _decode_options(marker.name) == {"TYPE": "CSV", "SKIP_HEADER": "1"}
 
 
 def test_preprocess_stage_file_clauses_leaves_other_sql_alone():

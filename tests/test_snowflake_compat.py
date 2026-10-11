@@ -400,3 +400,28 @@ def test_internal_error_returns_snowflake_shaped_422(client):
     assert resp.status_code == 422
     assert resp.json()["detail"]["sqlState"] == "42000"
     assert "Invalid identifier" in resp.json()["detail"]["message"]
+
+
+def test_backslash_escapes_stay_literal_in_string_literals(client):
+    """sqlglot >= 30.21 decodes backslash escapes inside Snowflake string literals.
+
+    An unknown escape lost its backslash (``\\d`` -> ``d``) and a numeric escape was
+    decoded (``\\x41`` -> ``A``), silently breaking regex calls and stored paths. The
+    emulator pins the Snowflake tokenizer back to the pre-30.21 behaviour.
+    """
+    resp = _post(client, r"SELECT REGEXP_REPLACE('a1b', '\d', 'x') AS v")
+    assert resp.status_code == 200
+    assert resp.json()["data"] == [["axb"]]
+
+    resp = _post(client, r"SELECT '1' RLIKE '\d' AS v")
+    assert resp.json()["data"] == [[True]]
+
+    # Numeric escapes are not decoded either.
+    resp = _post(client, r"SELECT '\x41' AS v")
+    assert resp.json()["data"] == [[r"\x41"]]
+
+    # A backslash in stored text survives a round trip.
+    assert _post(client, "CREATE TABLE esc_t (s VARCHAR)").status_code == 200
+    assert _post(client, r"INSERT INTO esc_t VALUES ('C:\Users\me')").status_code == 200
+    resp = _post(client, "SELECT s FROM esc_t")
+    assert resp.json()["data"] == [["C:\\Users\\me"]]

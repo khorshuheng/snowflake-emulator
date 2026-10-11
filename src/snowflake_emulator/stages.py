@@ -18,6 +18,7 @@ connector copies files into/out of it directly.
 
 from __future__ import annotations
 
+import base64
 import datetime
 import glob
 import gzip
@@ -38,6 +39,7 @@ from sqlglot import exp
 from snowflake_emulator.file_formats import resolve_file_format
 from snowflake_emulator.sessions import SessionContext
 from snowflake_emulator.settings import settings
+from snowflake_emulator.translator import drop_target_table
 
 # -- Command detection (mirrors snowflake.connector._sql_util.get_file_transfer_type) --
 
@@ -484,11 +486,17 @@ def create_stage(manager: StageManager, session: SessionContext, statement: exp.
     manager.stage_dir(session, stage)  # ensure the directory exists
 
 
-def drop_stage(manager: StageManager, session: SessionContext, statement: exp.Drop) -> None:
-    """Remove the named stage's directory tree."""
-    stage = parse_stage_ref("@" + statement.this.name)
+def drop_stage(
+    manager: StageManager, session: SessionContext, statement: exp.Drop
+) -> str | None:
+    """Remove the named stage's directory tree, returning the stage name."""
+    target = drop_target_table(statement)
+    if target is None:
+        return None
+    stage = parse_stage_ref("@" + target.name)
     base = manager.stage_base_dir(session, stage)
     shutil.rmtree(base, ignore_errors=True)
+    return target.name
 
 
 def show_stages(manager: StageManager, session: SessionContext) -> list[tuple[str, str, str, str]]:
@@ -704,6 +712,19 @@ def _unquote_literal(value: str) -> str:
     return text
 
 
+def _option_value_text(value_node: exp.Expression) -> str:
+    """Return a scalar staged-file option's text, without re-escaping it.
+
+    ``.sql()`` re-serializes a string literal with escapes (and sqlglot escapes a literal
+    backslash as ``\\``), so round-tripping a value through ``.sql()`` mangles regex and
+    path values. ``Literal.name`` is the decoded value already, so prefer it for literals
+    and fall back to the serialized form for non-literal operands.
+    """
+    if isinstance(value_node, exp.Literal):
+        return value_node.name
+    return _unquote_literal(value_node.sql(dialect="snowflake"))
+
+
 def _copy_param(copy_node: exp.Copy, name: str) -> str | None:
     """Return a scalar COPY INTO parameter's value, e.g. ``PATTERN = '...'``."""
     for param in copy_node.args.get("params") or []:
@@ -727,7 +748,7 @@ def _extract_file_format(copy_node: exp.Copy) -> dict[str, Any]:
             value_node = prop.args.get("value")
             if value_node is None:
                 continue
-            fmt[key] = _unquote_literal(value_node.sql(dialect="snowflake"))
+            fmt[key] = _option_value_text(value_node)
     return fmt
 
 
@@ -858,7 +879,15 @@ class StageFileSource:
 
 
 def _encode_options(options: dict[str, Any]) -> str:
-    return _OPTIONS_MARKER + json.dumps(options, sort_keys=True)
+    """Encode staged-file options into a marker usable inside a SQL string literal.
+
+    The JSON is base64-encoded rather than embedded directly: sqlglot 30.21+ treats a
+    backslash as a string escape in the Snowflake dialect, so the ``\"`` JSON escapes
+    would be eaten on the way back through the parser. Base64's alphabet has no quotes
+    or backslashes, so the marker survives any such escape handling.
+    """
+    payload = json.dumps(options, sort_keys=True).encode("utf-8")
+    return _OPTIONS_MARKER + base64.urlsafe_b64encode(payload).decode("ascii")
 
 
 def _decode_options(value: str | None) -> dict[str, Any] | None:
@@ -866,8 +895,9 @@ def _decode_options(value: str | None) -> dict[str, Any] | None:
     if not value or not value.startswith(_OPTIONS_MARKER):
         return None
     try:
-        decoded = json.loads(value[len(_OPTIONS_MARKER) :])
-    except json.JSONDecodeError:
+        payload = base64.urlsafe_b64decode(value[len(_OPTIONS_MARKER) :].encode("ascii"))
+        decoded = json.loads(payload)
+    except (ValueError, json.JSONDecodeError):
         return None
     return decoded if isinstance(decoded, dict) else None
 
@@ -969,11 +999,11 @@ def parse_stage_file_options(clause: str) -> dict[str, Any]:
                 )
             elif param.expression is not None:
                 # `(FILE_FORMAT => 'name')` names a created file format.
-                options["FORMAT_NAME"] = param.expression.sql(dialect="snowflake").strip("'\"")
+                options["FORMAT_NAME"] = _option_value_text(param.expression)
             else:
                 raise StageError(f"FILE_FORMAT needs options or a format name: {clause}")
         elif name == "PATTERN" and param.expression is not None:
-            options["PATTERN"] = param.expression.sql(dialect="snowflake").strip("'\"")
+            options["PATTERN"] = _option_value_text(param.expression)
     return options
 
 
