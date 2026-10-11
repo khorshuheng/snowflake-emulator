@@ -194,21 +194,21 @@ def test_array_slice_over_variant_arrays(client):
     )
 
     for statement, expected in (
-        ("SELECT ARRAY_SLICE(j:names, 0, 4) FROM slices", [[['"a"', '"b"', '"c"', '"d"', '"e"']]]),
-        ("SELECT ARRAY_SLICE(j:names, 1, 3) FROM slices", [[['"b"', '"c"', '"d"']]]),
-        ("SELECT ARRAY_SLICE(j:names, -3, -1) FROM slices", [[['"c"', '"d"', '"e"']]]),
-        ("SELECT ARRAY_SLICE(j:names, 0, 0) FROM slices", [[['"a"']]]),
-        ("SELECT ARRAY_SLICE(j:names, -1, -1) FROM slices", [[['"e"']]]),
+        ("SELECT ARRAY_SLICE(j:names, 0, 4) FROM slices", [[['a', 'b', 'c', 'd', 'e']]]),
+        ("SELECT ARRAY_SLICE(j:names, 1, 3) FROM slices", [[['b', 'c', 'd']]]),
+        ("SELECT ARRAY_SLICE(j:names, -3, -1) FROM slices", [[['c', 'd', 'e']]]),
+        ("SELECT ARRAY_SLICE(j:names, 0, 0) FROM slices", [[['a']]]),
+        ("SELECT ARRAY_SLICE(j:names, -1, -1) FROM slices", [[['e']]]),
         # Out-of-range bounds clamp, and an empty slice is an empty array, not an error.
-        ("SELECT ARRAY_SLICE(j:names, 0, 99) FROM slices", [[['"a"', '"b"', '"c"', '"d"', '"e"']]]),
-        ("SELECT ARRAY_SLICE(j:names, -100, 100) FROM slices", [[['"a"', '"b"', '"c"', '"d"', '"e"']]]),
+        ("SELECT ARRAY_SLICE(j:names, 0, 99) FROM slices", [[['a', 'b', 'c', 'd', 'e']]]),
+        ("SELECT ARRAY_SLICE(j:names, -100, 100) FROM slices", [[['a', 'b', 'c', 'd', 'e']]]),
         ("SELECT ARRAY_SLICE(j:names, 10, 20) FROM slices", [[[]]]),
         ("SELECT ARRAY_SLICE(j:names, 3, 1) FROM slices", [[[]]]),
         ("SELECT ARRAY_SLICE(j:missing, 0, 1) FROM slices", [[None]]),
         # A nested call, and a bound that is itself a VARIANT value.
         ("SELECT ARRAY_CONTAINS('c', ARRAY_SLICE(j:names, 1, 3)) FROM slices", [[True]]),
         ("SELECT ARRAY_SIZE(ARRAY_SLICE(j:names, 1, 3)) FROM slices", [[3]]),
-        ("SELECT ARRAY_SLICE(j:names, j:idx, 3) FROM slices", [[['"b"', '"c"', '"d"']]]),
+        ("SELECT ARRAY_SLICE(j:names, j:idx, 3) FROM slices", [[['b', 'c', 'd']]]),
     ):
         resp = post(statement)
         assert resp.status_code == 200, (statement, resp.json())
@@ -244,13 +244,13 @@ def test_slice_alias_matches_array_slice(client, tmp_path):
     _stage(client, headers, json_path, "@~/staged")
 
     for statement, expected in (
-        ("SELECT SLICE(j:n, 0, 1) FROM alias_t", [[['"a"', '"b"']]]),
-        ("SELECT SLICE(j:n, -2, -1) FROM alias_t", [[['"c"', '"d"']]]),
-        ("SELECT slice(j:n, 1, 2) FROM alias_t", [[['"b"', '"c"']]]),
+        ("SELECT SLICE(j:n, 0, 1) FROM alias_t", [[['a', 'b']]]),
+        ("SELECT SLICE(j:n, -2, -1) FROM alias_t", [[['c', 'd']]]),
+        ("SELECT slice(j:n, 1, 2) FROM alias_t", [[['b', 'c']]]),
         ("SELECT SLICE(ARRAY_CONSTRUCT('a','b','c'), 0, 1)", [[["a", "b"]]]),
         ("SELECT ARRAY_SIZE(SLICE(j:n, 0, 1)) FROM alias_t", [[2]]),
         ("SELECT ARRAY_CONTAINS('a', SLICE(j:n, 0, 1)) FROM alias_t", [[True]]),
-        ("SELECT SLICE(SLICE(j:n, 0, 2), 1, 1) FROM alias_t", [[['"b"']]]),
+        ("SELECT SLICE(SLICE(j:n, 0, 2), 1, 1) FROM alias_t", [[['b']]]),
     ):
         resp = post(statement)
         assert resp.status_code == 200, (statement, resp.json())
@@ -262,7 +262,7 @@ def test_slice_alias_matches_array_slice(client, tmp_path):
         headers=headers,
     )
     assert staged.status_code == 200, staged.json()
-    assert staged.json()["data"] == [[['"b"', '"c"']]]
+    assert staged.json()["data"] == [[['b', 'c']]]
 
 
 def test_array_slice_requires_both_bounds(client):
@@ -313,37 +313,37 @@ def test_other_array_functions_over_variant_arrays(client):
 
     for statement, expected in (
         # Order is unspecified where DuckDB uses a hash set, so sort before comparing.
-        ("SELECT ARRAY_SORT(ARRAY_UNIQUE(j:n)) FROM arr_t", [[['"a"', '"b"']]]),
-        ("SELECT ARRAY_REMOVE_AT(j:n, 0) FROM arr_t", [[['"b"', '"a"']]]),
+        ("SELECT ARRAY_SORT(ARRAY_UNIQUE(j:n)) FROM arr_t", [[['a', 'b']]]),
+        ("SELECT ARRAY_REMOVE_AT(j:n, 0) FROM arr_t", [[['b', 'a']]]),
         ("SELECT ARRAY_POSITION('b', j:n) FROM arr_t", [[1]]),
         ("SELECT ARRAY_POSITION('zz', j:n) FROM arr_t", [[0]]),
-        ("SELECT ARRAY_PREPEND('z', j:n) FROM arr_t", [[['"z"', '"a"', '"b"', '"a"']]]),
+        ("SELECT ARRAY_PREPEND('z', j:n) FROM arr_t", [[['z', 'a', 'b', 'a']]]),
         ("SELECT ARRAY_REPEAT('x', 3) FROM arr_t", [[['x', 'x', 'x']]]),
-        ("SELECT ARRAY_FLATTEN(j:deep, 1) FROM arr_t", [[['1', '2', '3']]]),
-        ("SELECT ARRAY_FLATTEN(j:deep, 2) FROM arr_t", [[['1', '2', '3']]]),
+        ("SELECT ARRAY_FLATTEN(j:deep, 1) FROM arr_t", [[[1, 2, 3]]]),
+        ("SELECT ARRAY_FLATTEN(j:deep, 2) FROM arr_t", [[[1, 2, 3]]]),
         # A depth past the nesting leaves the array as it is rather than raising.
-        ("SELECT ARRAY_FLATTEN(j:flat, 2) FROM arr_t", [[['1', '2', '3']]]),
-        ("SELECT ARRAY_APPEND(j:n, 'z') FROM arr_t", [[['"a"', '"b"', '"a"', '"z"']]]),
-        ("SELECT ARRAY_COMPACT(j:withnull) FROM arr_t", [[['"a"']]]),
-        ("SELECT ARRAY_SORT(ARRAY_DISTINCT(j:n)) FROM arr_t", [[['"a"', '"b"']]]),
+        ("SELECT ARRAY_FLATTEN(j:flat, 2) FROM arr_t", [[[1, 2, 3]]]),
+        ("SELECT ARRAY_APPEND(j:n, 'z') FROM arr_t", [[['a', 'b', 'a', 'z']]]),
+        ("SELECT ARRAY_COMPACT(j:withnull) FROM arr_t", [[['a']]]),
+        ("SELECT ARRAY_SORT(ARRAY_DISTINCT(j:n)) FROM arr_t", [[['a', 'b']]]),
         ("SELECT ARRAY_EXCEPT(j:n, j:n) FROM arr_t", [[[]]]),
         ("SELECT ARRAYS_OVERLAP(j:n, j:n) FROM arr_t", [[True]]),
-        ("SELECT ARRAY_SORT(j:n) FROM arr_t", [[['"a"', '"a"', '"b"']]]),
-        ("SELECT ARRAY_MAX(j:nums) FROM arr_t", [["3"]]),
-        ("SELECT ARRAY_MIN(j:nums) FROM arr_t", [["1"]]),
+        ("SELECT ARRAY_SORT(j:n) FROM arr_t", [[['a', 'a', 'b']]]),
+        ("SELECT ARRAY_MAX(j:nums) FROM arr_t", [[3]]),
+        ("SELECT ARRAY_MIN(j:nums) FROM arr_t", [[1]]),
         # JSON string elements are unquoted, unlike sqlglot's own CAST(x AS TEXT) rendering.
         ("SELECT ARRAY_TO_STRING(j:n, ',') FROM arr_t", [["a,b,a"]]),
-        ("SELECT ARRAY_REMOVE(j:n, 'a') FROM arr_t", [[['"b"']]]),
-        ("SELECT ARRAY_INSERT(j:n, 0, 'z') FROM arr_t", [[['"z"', '"a"', '"b"', '"a"']]]),
-        ("SELECT ARRAY_AGG(j:n) FROM arr_t", [[[['"a"', '"b"', '"a"']]]]),
+        ("SELECT ARRAY_REMOVE(j:n, 'a') FROM arr_t", [[['b']]]),
+        ("SELECT ARRAY_INSERT(j:n, 0, 'z') FROM arr_t", [[['z', 'a', 'b', 'a']]]),
+        ("SELECT ARRAY_AGG(j:n) FROM arr_t", [[[['a', 'b', 'a']]]]),
         ("SELECT ARRAY_SIZE(ARRAY_CAT(j:n, j:n)) FROM arr_t", [[6]]),
         # A lambda compares against a VARIANT element, so the literal is encoded.
-        ("SELECT FILTER(j:n, x -> x = TO_JSON('a')) FROM arr_t", [[['"a"', '"a"']]]),
+        ("SELECT FILTER(j:n, x -> x = TO_JSON('a')) FROM arr_t", [[['a', 'a']]]),
         ("SELECT ARRAY_SIZE(TRANSFORM(j:n, x -> TO_VARCHAR(x))) FROM arr_t", [[3]]),
         (
             "SELECT REDUCE(j:nums, 0, (acc, x) -> CAST(acc AS INT) + CAST(x AS INT)) "
             "FROM arr_t",
-            [["6"]],
+            [[6]],
         ),
         # Native lists keep their own rendering, including the two that were wrong before.
         ("SELECT ARRAY_SORT(ARRAY_UNIQUE(ARRAY_CONSTRUCT('a','a','b')))", [[["a", "b"]]]),
@@ -357,7 +357,7 @@ def test_other_array_functions_over_variant_arrays(client):
     # sqlglot models ARRAY_INTERSECTION as a multiset operation, so compare as a set here.
     intersected = post("SELECT ARRAY_INTERSECTION(j:n, j:n) FROM arr_t")
     assert intersected.status_code == 200, intersected.json()
-    assert set(intersected.json()["data"][0][0]) == {'"a"', '"b"'}
+    assert set(intersected.json()["data"][0][0]) == {'a', 'b'}
 
 
 def test_array_flatten_requires_a_literal_depth(client):
@@ -386,7 +386,7 @@ def test_flatten_over_a_variant_column(client):
     ):
         resp = post(statement)
         assert resp.status_code == 200, (statement, resp.json())
-        assert {row[0] for row in resp.json()["data"]} == {'"a"', '"b"'}
+        assert {row[0] for row in resp.json()["data"]} == {'a', 'b'}
 
 
 def test_semi_structured_text_cast_returns_the_value(client):
@@ -477,7 +477,7 @@ def test_array_functions_over_staged_json(client, tmp_path):
         headers=headers,
     )
     assert resp.status_code == 200, resp.json()
-    assert resp.json()["data"] == [[True, 2, ['"bob"']]]
+    assert resp.json()["data"] == [[True, 2, ['bob']]]
 
 
 def test_snowflake_date_functions(client):
@@ -773,13 +773,13 @@ def test_select_from_staged_json_file(client, tmp_path):
     # A JSON record is exposed as a single `$1` value, as in Snowflake.
     selected = _select(client, headers, "SELECT * FROM @~/staged/data.json")
     assert selected["resultSetMetaData"]["rowType"][0]["name"] == "$1"
-    assert selected["data"] == [[json.dumps({"col": 1, "a": "x"})], [json.dumps({"col": 2, "a": "y"})]]
+    assert selected["data"] == [[{"col": 1, "a": "x"}], [{"col": 2, "a": "y"}]]
 
     # `$1:path` extracts a field through the JSON path syntax.
     extracted = _select(
         client, headers, "SELECT $1:col AS c FROM @~/staged/data.json ORDER BY c"
     )
-    assert extracted["data"] == [["1"], ["2"]]
+    assert extracted["data"] == [[1], [2]]
 
 
 def test_select_from_staged_json_file_errors_on_missing_column(client, tmp_path):
@@ -910,14 +910,14 @@ def test_select_from_stage_directory_prefix_and_pattern(client, tmp_path):
     prefixed = _select(
         client, headers, "SELECT $1:col AS c FROM @~/staged/ ORDER BY c"
     )
-    assert prefixed["data"] == [["1"], ["2"]]
+    assert prefixed["data"] == [[1], [2]]
 
     patterned = _select(
         client,
         headers,
         "SELECT $1:col AS c FROM @~/staged (PATTERN => '.*part2.*')",
     )
-    assert patterned["data"] == [["2"]]
+    assert patterned["data"] == [[2]]
 
 
 def test_select_from_staged_json_strip_outer_array(client, tmp_path):
@@ -933,7 +933,7 @@ def test_select_from_staged_json_strip_outer_array(client, tmp_path):
         "SELECT $1:col AS c FROM @~/staged/array.json "
         "(FILE_FORMAT => (TYPE = JSON, STRIP_OUTER_ARRAY = TRUE)) ORDER BY c",
     )
-    assert selected["data"] == [["1"], ["2"]]
+    assert selected["data"] == [[1], [2]]
 
 
 def test_select_from_staged_file_rejects_non_newline_json(client, tmp_path):
@@ -1153,7 +1153,7 @@ def test_insert_select_from_staged_file(client, tmp_path):
     assert inserted["data"] == [[1]]
 
     stored = _select(client, headers, "SELECT j:col AS c FROM loaded")
-    assert stored["data"] == [["7"]]
+    assert stored["data"] == [[7]]
 
 
 # -- Stage path containment, extremes and option strictness -------------------
@@ -1269,7 +1269,7 @@ def test_select_from_staged_json_rejects_a_corrupt_record(client, tmp_path):
     blank.write_text('{"i": 1}\n\n{"i": 2}\n')
     _stage(client, headers, blank, "@~/staged")
     rows = _select(client, headers, "SELECT $1:i AS i FROM @~/staged/blank.json ORDER BY i")
-    assert rows["data"] == [["1"], ["2"]]
+    assert rows["data"] == [[1], [2]]
 
 
 def test_select_from_corrupt_gzip_errors(client, tmp_path):

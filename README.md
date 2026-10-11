@@ -239,9 +239,14 @@ Caveats:
   results the emulator did not produce.
 - `ESCAPE_UNENCLOSED_FIELD` (Snowflake's default is `\`) has no DuckDB equivalent and is
   rejected when set explicitly; use `ESCAPE` for enclosed fields.
-- selecting a JSON string *without* a cast (`SELECT $1:s`) returns its JSON form (`"y"`)
-  where Snowflake returns `y`; a text cast or `TO_VARCHAR` does return the text
-  (`$1:s::VARCHAR` -> `y`, `$1:o::VARCHAR` -> the object's document text);
+- a semi-structured value selected *without* a cast is inlined as a JSON value in the SQL
+  API (`$1:s` -> `y`, a number as a number, an object as an object), while the connector's
+  wire protocol keeps returning VARIANT as its JSON text (`"y"`, `42`) — which is what that
+  protocol and the Arrow path decode;
+- a **DuckDB VARIANT** cell (`TO_VARIANT(...)`, a `VARIANT` column) is reported as `text`
+  rather than `variant`, since the type mapping has no `VARIANT` entry, so those cells
+  arrive as plain strings; a `JSON` column or a `col:path` reports `variant` as Snowflake
+  does;
 - a **bare VARIANT column** cast to text (`SELECT variant_col::VARCHAR`) uses DuckDB's own
   VARIANT text form: right for a string, but an object shows as the variant's internal
   form, so use `variant_col::JSON::VARCHAR` when you need the document text.

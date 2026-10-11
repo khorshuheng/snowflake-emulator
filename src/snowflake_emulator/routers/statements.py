@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
+from typing import Any
+
 from fastapi import APIRouter, Header, HTTPException, status
 
 from snowflake_emulator.bindings import decode_bindings
 from snowflake_emulator.database import get_manager
 from snowflake_emulator.errors import error_code_pair
-from snowflake_emulator.executor import ExecutionResult, execute_sql
+from snowflake_emulator.executor import ColumnMeta, ExecutionResult, execute_sql
 from snowflake_emulator.schemas import ResultSetMetaData, RowType, StatementRequest, StatementResponse
 from snowflake_emulator.sessions import SessionContext, get_session_manager
 from snowflake_emulator.statement_store import get_statement_store
@@ -41,6 +44,49 @@ def _apply_overrides(session: SessionContext, body: StatementRequest) -> None:
         session.role = body.role
 
 
+def _json_element(element: Any) -> Any:
+    """Decode one element of a ``JSON[]`` cell, recursing into a nested list."""
+    if isinstance(element, list):
+        return [_json_element(inner) for inner in element]
+    if isinstance(element, str):
+        try:
+            return json.loads(element)
+        except json.JSONDecodeError:
+            return element
+    return element
+
+
+def _is_json_column(col: ColumnMeta) -> bool:
+    """True for a cell DuckDB typed as JSON, i.e. whose text is JSON-serialized.
+
+    Keyed on the DuckDB type rather than the Snowflake one, which both a JSON and a VARIANT
+    cell report as ``variant``: a DuckDB ``VARIANT`` cell is already a plain Python value, so
+    its text is *not* JSON-serialized and parsing it would read the string ``'42'`` as the
+    number 42.
+    """
+    return (col.duckdb_type or "").upper() == "JSON"
+
+
+def _json_cell(value: Any, col: ColumnMeta) -> Any:
+    """Inline a semi-structured cell as a JSON value, as Snowflake's rowset does.
+
+    DuckDB hands a JSON value to Python as its JSON *text*, so the rowset would otherwise
+    carry a quoted JSON string (``'"y"'`` where Snowflake embeds ``y``), a number as a
+    string, and each element of a ``JSON[]`` cell quoted. The connector's wire protocol is
+    untouched: it represents every cell as a string, which is what it decodes.
+    """
+    if value is None:
+        return None
+    if _is_json_column(col) and isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    if isinstance(value, list) and "JSON" in (col.duckdb_type or "").upper():
+        return [_json_element(element) for element in value]
+    return value
+
+
 def _to_response(result: ExecutionResult) -> StatementResponse:
     return StatementResponse(
         statementHandle=result.handle,
@@ -51,7 +97,10 @@ def _to_response(result: ExecutionResult) -> StatementResponse:
             numRows=len(result.rows),
             rowType=[RowType(name=col.name, type=col.type) for col in result.row_type],
         ),
-        data=result.rows,
+        data=[
+            [_json_cell(value, col) for value, col in zip(row, result.row_type)]
+            for row in result.rows
+        ],
     )
 
 

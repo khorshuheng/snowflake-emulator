@@ -351,7 +351,7 @@ def test_lateral_flatten_object(client):
     rows = resp.json()["data"]
     assert len(rows) == 2
     assert {r[0] for r in rows} == {"a", "b"}
-    assert {r[1] for r in rows} == {"1", "2"}
+    assert {r[1] for r in rows} == {1, 2}
 
 
 def test_table_flatten_form(client):
@@ -362,7 +362,7 @@ def test_table_flatten_form(client):
         "SELECT f.value FROM flat_arr t, TABLE(FLATTEN(input => t.arr)) f",
     )
     assert resp.status_code == 200
-    assert {r[0] for r in resp.json()["data"]} == {"10", "20"}
+    assert {r[0] for r in resp.json()["data"]} == {10, 20}
 
 
 def test_merge_qualified_update_set(client):
