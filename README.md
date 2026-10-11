@@ -128,7 +128,7 @@ session state rather than being sent to DuckDB.
 
 ## Staging files (PUT / GET / LIST / REMOVE / COPY INTO)
 
-The emulator implements Snowflake's local stage workflow for JSON and CSV files.
+The emulator implements Snowflake's local stage workflow for JSON, CSV and Parquet files.
 Stages are backed by a directory tree on disk (see `[staging]` config above), and
 the official `snowflake-connector-python` driver performs the actual file transfer
 through its built-in `local` storage client — no cloud credentials needed.
@@ -161,11 +161,62 @@ Supported stage commands:
 | `GET @stage file://... [PATTERN='...']` | Download staged files to a local directory. |
 | `LIST @stage [PATTERN='...']` | List staged files (name/size/md5/last_modified). |
 | `REMOVE @stage [PATTERN='...']` | Delete staged files. |
-| `COPY INTO t FROM @stage [FILE_FORMAT=(TYPE=CSV\|JSON, ...)]` | Load staged files into an existing table via DuckDB. |
+| `COPY INTO t FROM @stage[/path/file] [PATTERN='...'] [FILE_FORMAT=(TYPE=CSV\|JSON\|PARQUET, ...)]` | Load staged files into an existing table via DuckDB; a path prefix or one exact file both work, and `PATTERN` filters the files read. |
 | `CREATE STAGE` / `DROP STAGE` / `ALTER STAGE` / `SHOW STAGES` | Stage metadata; `@name` resolves in the session's current database/schema. |
 
 Stage references supported: `@~` (user stage, private per session), `@name`,
-`@db.schema.name`, `@%table` (table stage), `@%` (internal stage).
+`@db.schema.name`, `@%table` (table stage), `@%` (internal stage). A stage reference is a
+namespace: a sub-path that escapes its stage (`@stage/../x`, `@..`) is rejected rather
+than resolving outside the stage tree.
+
+### Querying staged files directly
+
+A stage file can also be read as a relation, without loading it into a table first. Each
+record is a row and its fields are reachable positionally:
+
+```sql
+SELECT $1:name, $1:age FROM @~/staged/people.json;          -- a JSON record as `$1`
+SELECT $1:name FROM @~/staged/ (FILE_FORMAT => (TYPE = JSON));  -- every file under a prefix
+SELECT $1, $2 FROM @~/staged/data.csv
+  (FILE_FORMAT => (TYPE = CSV, SKIP_HEADER = 1, FIELD_DELIMITER = '|'));
+SELECT $1, $2 FROM @my_stage/data.parquet;                  -- `$n` is the nth column
+SELECT $1:name FROM @~/staged/data.json (FILE_FORMAT => 'my_json_format');
+```
+
+| Format | `$1` is | Notes |
+| --- | --- | --- |
+| JSON | one record (`$1:key` extracts a field) | Newline-delimited records; `STRIP_OUTER_ARRAY = TRUE` reads each file as one JSON document and explodes its outer array. |
+| CSV | the first field (`$2`, `$3`, ... follow) | Snowflake's CSV defaults apply: `SKIP_HEADER` (not `header`), no quoting unless `FIELD_OPTIONALLY_ENCLOSED_BY`, empty fields and `NULL_IF` (`\N` by default) read as NULL, `COMPRESSION`, `EMPTY_FIELD_AS_NULL`. |
+| Parquet | the first column | Columns keep the file's own names; `$n` resolves to the nth of them. |
+
+The file format comes from the query: a `(FILE_FORMAT => ...)` clause wins (inline options
+or the name of a created format), otherwise it is inferred from the file extensions, as
+`COPY INTO` does here. A path mixing formats cannot be read as one relation, so it is
+rejected rather than guessed. `(PATTERN => '<regex>')` filters the files read, a directory
+prefix reads everything under it, and only one staged location can be queried per
+statement. `gzip`/`zstd`-compressed files are read transparently; `bzip2` is rejected.
+
+Caveats:
+
+- Staged JSON must be newline-delimited: a pretty-printed document is rejected rather
+  than read as a set of NULL rows, and a malformed record fails the query instead of
+  becoming NULL.
+- A location whose files differ in width (`a.csv` with 2 fields, `b.csv` with 3) widens
+  into the union, filling the missing fields with NULL.
+- `FILE_FORMAT` options the emulator does not translate are rejected (`TRIM_SPACE = TRUE`),
+  while a value equal to Snowflake's default (`TRIM_SPACE = FALSE`) is accepted, since that
+  default is what DuckDB already does. Silently ignoring an option would report Snowflake
+  results the emulator did not produce.
+- `ESCAPE_UNENCLOSED_FIELD` (Snowflake's default is `\`) has no DuckDB equivalent and is
+  rejected when set explicitly; use `ESCAPE` for enclosed fields.
+- `:` on a JSON string yields the JSON form (`$1:s` -> `"  padded  "`) rather than
+  Snowflake's unquoted string; this is the emulator's existing `col:path` behaviour for
+  VARIANT columns.
+- A `:` path on a non-JSON column (`$1:key` over CSV/Parquet) yields NULL rather than
+  Snowflake's compile error.
+- The stage's own `FILE_FORMAT` (`CREATE STAGE ... FILE_FORMAT = ...`) is not modelled,
+  so an explicit `(FILE_FORMAT => ...)` clause is required for anything but the inferred
+  per-extension format.
 
 ## Development
 

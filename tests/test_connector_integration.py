@@ -381,6 +381,31 @@ def test_copy_into_file_format_options(connection, tmp_path):
     assert cur.fetchall() == [(5, "q")]
 
 
+def test_select_from_staged_file(connection, tmp_path):
+    """Query staged files directly (SELECT ... FROM @stage/file), as Snowflake allows."""
+    json_path = tmp_path / "data.json"
+    _write_json(json_path, [{"a": 3, "b": "z"}, {"a": 4, "b": "w"}])
+    csv_path = tmp_path / "data.csv"
+    _write_csv(csv_path, header=("a", "b"), rows=((1, "x"), (2, "y")))
+
+    cur = connection.cursor()
+    cur.execute(f"PUT file://{json_path} @~/js")
+    cur.execute(f"PUT file://{csv_path} @~/cs")
+
+    cur.execute("SELECT $1:a AS a, $1:b AS b FROM @~/js/data.json ORDER BY a")
+    assert cur.description[0].name == "A"
+    # JSON scalars come back through the emulator's existing `col:path` handling, which
+    # renders a JSON string with its quotes (a VARIANT-column quirk, not stage-specific).
+    assert cur.fetchall() == [("3", '"z"'), ("4", '"w"')]
+
+    cur.execute(
+        "SELECT $1, $2 FROM @~/cs/data.csv (FILE_FORMAT => (TYPE = CSV, SKIP_HEADER = 1)) "
+        "ORDER BY $1"
+    )
+    assert [col.name for col in cur.description] == ["$1", "$2"]
+    assert cur.fetchall() == [(1, "x"), (2, "y")]
+
+
 def test_executemany_array_binding(emulator_port):
     """`executemany` sends an array binding; the emulator must run one INSERT per row."""
     con = _connect(emulator_port, paramstyle="qmark")

@@ -31,12 +31,15 @@ from snowflake_emulator.stages import (
     create_stage,
     drop_stage,
     get_stage_manager,
+    has_stage_file_table,
     match_stage_command,
     match_stage_ddl,
     parse_get,
     parse_list,
     parse_put,
     parse_remove,
+    preprocess_stage_file_clauses,
+    rewrite_stage_file_tables,
     show_stages,
 )
 from snowflake_emulator.translator import (
@@ -146,6 +149,10 @@ def execute_sql(
     if stage_command is not None:
         return _execute_stage_command(manager, session, raw_sql, stage_command)
 
+    # `FROM @stage/file (FILE_FORMAT => (...))` is not valid sqlglot syntax; the options
+    # are captured here (and decoded again in `rewrite_stage_file_tables`).
+    raw_sql = preprocess_stage_file_clauses(raw_sql)
+
     try:
         statements = split_statements(raw_sql)
     except TranslationError as exc:
@@ -246,6 +253,12 @@ def execute_sql(
             row_type, rows = describe_result
             continue
 
+        if has_stage_file_table(statement):
+            try:
+                statement = rewrite_stage_file_tables(statement, session, cursor)
+            except (StageError, FileFormatError) as exc:
+                raise ExecutionError(str(exc)) from exc
+
         try:
             duckdb_sql = transpile_to_duckdb(statement)
         except TranslationError as exc:
@@ -259,9 +272,11 @@ def execute_sql(
         batch_affected = 0
         try:
             if stage_copy is not None:
-                table_sql, stage_ref, file_format = stage_copy
+                table_sql, stage_ref, file_format, pattern = stage_copy
                 file_format = resolve_file_format(session, file_format)
-                duckdb_sql = build_copy_sql(session, table_sql, stage_ref, file_format)
+                duckdb_sql = build_copy_sql(
+                    session, table_sql, stage_ref, file_format, pattern
+                )
             if batch is not None:
                 # An array binding (executemany) runs the statement once per row.
                 for row in batch:

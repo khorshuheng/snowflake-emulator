@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import pytest
+import sqlglot
+from sqlglot import exp
 
 from snowflake_emulator.stages import (
     StageError,
+    copy_stage_source,
+    has_stage_file_table,
+    is_stage_file_table,
     match_stage_command,
     parse_get,
     parse_list,
     parse_put,
     parse_remove,
+    parse_stage_file_options,
     parse_stage_ref,
+    preprocess_stage_file_clauses,
 )
 
 
@@ -59,6 +66,32 @@ def test_parse_stage_ref_internal_stage():
 def test_parse_stage_ref_requires_at():
     with pytest.raises(StageError):
         parse_stage_ref("~/data")
+
+
+def test_parse_stage_ref_rejects_relative_components():
+    """`..` is not a stage name, and must not become a path into the filesystem."""
+    for ref in ("@..", "@../data.csv", "@../../etc/passwd", "@db..stage/x", "@%.."):
+        with pytest.raises(StageError):
+            parse_stage_ref(ref)
+
+
+def test_stage_manager_contained_rejects_escapes(tmp_path):
+    """The containment helper is what keeps every stage path inside its stage root."""
+    from snowflake_emulator.stages import StageManager
+
+    root = tmp_path / "stages"
+    stage = root / "named" / "DB" / "PUBLIC" / "s"
+    stage.mkdir(parents=True)
+    (root / "outside.csv").write_text("x\n")
+    manager = StageManager(str(root))
+
+    assert manager.contained(str(stage / "nested" / "f.csv"), str(stage)) == str(
+        stage / "nested" / "f.csv"
+    )
+    assert manager.contained(str(stage), str(stage)) == str(stage)
+    for escaped in (stage / ".." / "outside.csv", stage / ".." / ".." / "..", root):
+        with pytest.raises(StageError):
+            manager.contained(str(escaped), str(stage))
 
 
 def test_match_stage_command():
@@ -119,3 +152,100 @@ def test_parse_remove():
     cmd = parse_remove("REMOVE @~/staged/data.csv")
     assert cmd.stage.path == "staged/data.csv"
     assert cmd.pattern is None
+
+
+# -- Querying staged files (SELECT ... FROM @stage/file) ----------------------
+
+
+def test_parse_stage_file_options_inline_format_and_pattern():
+    options = parse_stage_file_options(
+        "(FILE_FORMAT => (TYPE = CSV, FIELD_DELIMITER = '|', SKIP_HEADER = 1), "
+        "PATTERN => '.*[.]csv')"
+    )
+    assert options == {
+        "TYPE": "CSV",
+        "FIELD_DELIMITER": "|",
+        "SKIP_HEADER": "1",
+        "PATTERN": ".*[.]csv",
+    }
+
+
+def test_parse_stage_file_options_named_format():
+    assert parse_stage_file_options("(FILE_FORMAT => 'my_fmt')") == {"FORMAT_NAME": "my_fmt"}
+
+
+def test_parse_stage_file_options_pattern_only():
+    assert parse_stage_file_options("(PATTERN => 'part.*')") == {"PATTERN": "part.*"}
+
+
+def test_parse_stage_file_options_empty_clause():
+    assert parse_stage_file_options("()") == {}
+
+
+def test_preprocess_stage_file_clauses_encodes_options():
+    sql = "SELECT $1 FROM @s/f.csv (FILE_FORMAT => (TYPE = CSV, SKIP_HEADER = 1))"
+    rewritten = preprocess_stage_file_clauses(sql)
+    assert rewritten.startswith("SELECT $1 FROM @s/f.csv (FILE_FORMAT => '")
+    # sqlglot rejects the original clause but parses the rewritten one.
+    parsed = sqlglot.parse_one(rewritten, read="snowflake")
+    marker = parsed.find(exp.Table).args["format"]
+    assert marker.name.startswith("sfemu:staged-file-options:")
+    assert '"SKIP_HEADER": "1"' in marker.name
+
+
+def test_preprocess_stage_file_clauses_leaves_other_sql_alone():
+    for sql in (
+        "SELECT $1 FROM @s/f.csv",
+        "COPY INTO t FROM @s FILE_FORMAT = (TYPE = CSV)",
+        "COPY INTO t FROM @s (PATTERN => 'x')",
+        "SELECT '@a (b' AS x FROM t",
+    ):
+        assert preprocess_stage_file_clauses(sql) == sql
+
+
+def test_preprocess_stage_file_clauses_keeps_rest_of_statement():
+    sql = "SELECT $1, x FROM t, @s/f.json (PATTERN => 'p') WHERE x > 1"
+    rewritten = preprocess_stage_file_clauses(sql)
+    assert rewritten.startswith("SELECT $1, x FROM t, @s/f.json (FILE_FORMAT => '")
+    assert rewritten.endswith(" WHERE x > 1")
+
+
+def test_is_stage_file_table_detects_from_clause_reference():
+    parsed = sqlglot.parse_one("SELECT $1 FROM @s/f.csv", read="snowflake")
+    assert has_stage_file_table(parsed)
+    assert all(is_stage_file_table(table) for table in parsed.find_all(exp.Table))
+
+
+def test_is_stage_file_table_ignores_copy_into_source():
+    """COPY INTO names its source with a stage reference, but that is not a query."""
+    parsed = sqlglot.parse_one("COPY INTO t FROM @s FILE_FORMAT = (TYPE = CSV)", read="snowflake")
+    assert not has_stage_file_table(parsed)
+
+
+def test_is_stage_file_table_ignores_plain_tables():
+    parsed = sqlglot.parse_one("SELECT * FROM t", read="snowflake")
+    assert not has_stage_file_table(parsed)
+
+
+def test_parse_stage_file_options_rejects_garbage():
+    with pytest.raises(StageError):
+        parse_stage_file_options("(FILE_FORMAT => )")
+
+
+def test_copy_stage_source_extracts_file_format_and_pattern():
+    node = sqlglot.parse_one(
+        "COPY INTO t FROM @stage FILE_FORMAT = (TYPE = CSV, SKIP_HEADER = 1) "
+        "PATTERN = '.*part.*'",
+        read="snowflake",
+    )
+    table_sql, stage_ref, file_format, pattern = copy_stage_source(node)
+    assert table_sql == "t"
+    assert stage_ref == "@stage"
+    assert file_format == {"TYPE": "CSV", "SKIP_HEADER": "1"}
+    assert pattern == ".*part.*"
+
+
+def test_copy_stage_source_without_pattern_or_stage():
+    plain = sqlglot.parse_one("COPY INTO t FROM @stage", read="snowflake")
+    assert copy_stage_source(plain)[3] is None
+    assert copy_stage_source(sqlglot.parse_one("COPY INTO t FROM 's3://b/x'", read="snowflake")) is None
