@@ -338,6 +338,7 @@ def _execute_sql(
             and str(statement.args.get("kind") or "").upper() == "TABLE"
         ):
             _record_declared_columns(manager, session, statement)
+            _record_temp_table_owner(manager, session, statement)
 
         if batch is not None:
             # Report the total affected rows across the batch, as Snowflake does for a
@@ -722,23 +723,31 @@ def _result_columns(cursor: Any) -> tuple[list[ColumnMeta], list[list[Any]]]:
     return row_type, rows
 
 
-def _show_scope(statement: exp.Show, session: SessionContext) -> tuple[str, str] | None:
+def _show_scope(statement: exp.Show, session: SessionContext) -> tuple[str, str | None] | None:
     """Extract the ``(database, schema)`` a scoped ``SHOW ... IN ...`` targets.
 
     ``SHOW SCHEMAS IN DATABASE db`` targets a database (schema ``None``);
-    ``SHOW OBJECTS IN db.schema`` targets a schema. Returns ``None`` for unscoped
-    forms (``SHOW TABLES``), which are left to DuckDB's native SHOW.
+    ``SHOW OBJECTS IN db.schema`` targets a schema. An unscoped ``SHOW TABLES``,
+    ``SHOW VIEWS``, ``SHOW OBJECTS`` or ``SHOW SCHEMAS`` is scoped to the session's own
+    database/schema, so that its ``LIKE``/``STARTS WITH``/``LIMIT`` clause is applied
+    rather than dropped (DuckDB's native SHOW, which these forms used to fall through
+    to, ignores them). Returns ``None`` for the SHOW forms handled elsewhere.
     """
     scope = statement.args.get("scope")
     kind = statement.args.get("scope_kind")
-    if not isinstance(scope, exp.Table):
+    if isinstance(scope, exp.Table):
+        if kind == "DATABASE":
+            return scope.name, None
+        if kind == "SCHEMA":
+            db = scope.args.get("db")
+            database = db.name if isinstance(db, exp.Identifier) else session.database
+            return database, scope.name
         return None
-    if kind == "DATABASE":
-        return scope.name, None
-    if kind == "SCHEMA":
-        db = scope.args.get("db")
-        database = db.name if isinstance(db, exp.Identifier) else session.database
-        return database, scope.name
+    obj = str(statement.args.get("this") or "").upper()
+    if obj == "SCHEMAS":
+        return session.database, None
+    if obj in ("TABLES", "VIEWS", "OBJECTS"):
+        return session.database, session.schema
     return None
 
 
@@ -766,6 +775,48 @@ def _name_prefix_filter(column: str, prefix: str | None) -> str:
         return ""
     escaped = _escape_like(prefix).replace("'", "''")
     return f" AND {column} LIKE '{escaped}%' ESCAPE '\\'"
+
+
+def _name_like_filter(column: str, pattern: str | None) -> str:
+    """Return a WHERE fragment matching ``column`` against a ``SHOW ... LIKE`` pattern.
+
+    Unlike ``STARTS WITH`` the pattern keeps its ``%``/``_`` wildcards. Matching is
+    case-insensitive because object names are upper-cased unless they were quoted.
+    """
+    if not pattern:
+        return ""
+    escaped = pattern.replace("\\", "\\\\").replace("'", "''")
+    return f" AND {column} ILIKE '{escaped}' ESCAPE '\\'"
+
+
+def _temp_inclusive_scope(
+    alias: str, database: str, schema: str | None, name_column: str = "table_name"
+) -> str:
+    """Return a WHERE fragment matching an object in scope, or a session's temp table.
+
+    DuckDB reports a temporary table in the connection-local ``temp`` catalog, so an
+    object is in scope when it lives in the catalog/schema asked for *or* when it is a
+    temporary table of the calling connection and the caller asked about that
+    connection's current database (and schema, when one was named). The ``temp`` catalog
+    is per connection, so a session never sees another session's temporary tables.
+
+    A temporary table shadows a permanent one of the same name (DuckDB resolves names to
+    the temp catalog first), so the catalog-side row is dropped while a shadowing
+    temporary table exists -- otherwise the same column would be reported twice.
+    `name_column` is the name column of `alias` (``view_name`` for ``duckdb_views()``).
+    """
+    schema_match = f" AND lower({alias}.schema_name) = lower('{schema}')" if schema else ""
+    temp_schema_match = f" AND lower(current_schema()) = lower('{schema}')" if schema else ""
+    shadowed = (
+        " AND NOT EXISTS (SELECT 1 FROM duckdb_tables() sh"
+        " WHERE lower(sh.database_name) = 'temp'"
+        f" AND lower(sh.table_name) = lower({alias}.{name_column}))"
+    )
+    return (
+        f"((lower({alias}.database_name) = lower('{database}'){schema_match}{shadowed})"
+        f" OR (lower({alias}.database_name) = 'temp'"
+        f" AND lower(current_database()) = lower('{database}'){temp_schema_match}))"
+    )
 
 
 def _execute_snowflake_show(
@@ -806,6 +857,8 @@ def _execute_snowflake_show(
     limit = _show_limit(statement)
     prefix = statement.args.get("starts_with")
     prefix = prefix.this if isinstance(prefix, exp.Literal) else None
+    like = statement.args.get("like")
+    like = like.this if isinstance(like, exp.Literal) else None
 
     if obj == "SCHEMAS":
         sql = f"""
@@ -823,6 +876,7 @@ def _execute_snowflake_show(
             WHERE lower(database_name) = lower('{database}')
               AND lower(schema_name) != 'main'
               {_name_prefix_filter('schema_name', prefix)}
+              {_name_like_filter('schema_name', like)}
             ORDER BY schema_name
         """
     else:
@@ -831,33 +885,35 @@ def _execute_snowflake_show(
             selects.append(f"""
                 SELECT
                     NULL::TIMESTAMP AS created_on,
-                    table_name AS name,
+                    t.table_name AS name,
                     'TABLE' AS kind,
-                    database_name AS database_name,
-                    schema_name AS schema_name,
-                    comment AS comment,
+                    CASE WHEN lower(t.database_name) = 'temp'
+                         THEN current_database() ELSE t.database_name END AS database_name,
+                    CASE WHEN lower(t.database_name) = 'temp'
+                         THEN current_schema() ELSE t.schema_name END AS schema_name,
+                    t.comment AS comment,
                     'N' AS is_dynamic,
                     'N' AS is_iceberg
-                FROM duckdb_tables()
-                WHERE lower(database_name) = lower('{database}')
-                  AND lower(schema_name) = lower('{schema}')
-                  {_name_prefix_filter('table_name', prefix)}
+                FROM duckdb_tables() t
+                WHERE {_temp_inclusive_scope('t', database, schema)}
+                  {_name_prefix_filter('t.table_name', prefix)}
+                  {_name_like_filter('t.table_name', like)}
             """)
         if obj in ("VIEWS", "OBJECTS"):
             selects.append(f"""
                 SELECT
                     NULL::TIMESTAMP AS created_on,
-                    view_name AS name,
+                    v.view_name AS name,
                     'VIEW' AS kind,
-                    database_name AS database_name,
-                    schema_name AS schema_name,
-                    comment AS comment,
+                    v.database_name AS database_name,
+                    v.schema_name AS schema_name,
+                    v.comment AS comment,
                     'N' AS is_dynamic,
                     'N' AS is_iceberg
-                FROM duckdb_views()
-                WHERE lower(database_name) = lower('{database}')
-                  AND lower(schema_name) = lower('{schema}')
-                  {_name_prefix_filter('view_name', prefix)}
+                FROM duckdb_views() v
+                WHERE {_temp_inclusive_scope('v', database, schema, 'view_name')}
+                  {_name_prefix_filter('v.view_name', prefix)}
+                  {_name_like_filter('v.view_name', like)}
             """)
         if not selects:
             return None
@@ -905,12 +961,24 @@ def _execute_show_columns(
     elif scope_kind is not None:
         return None
 
-    # Bound as parameters so an identifier containing a quote cannot break the SQL.
-    params: list[Any] = [database]
-    where = ["lower(c.database_name) = lower(?)"]
+    # Bound as parameters so an identifier containing a quote cannot break the SQL. The
+    # second branch of each test includes the session's own temporary tables, which
+    # DuckDB reports in the connection-local ``temp`` catalog.
+    params: list[Any] = [database, database]
+    where = [
+        "((lower(c.database_name) = lower(?)"
+        " AND NOT EXISTS (SELECT 1 FROM duckdb_tables() sh"
+        " WHERE lower(sh.database_name) = 'temp'"
+        " AND lower(sh.table_name) = lower(c.table_name)))"
+        " OR (lower(c.database_name) = 'temp'"
+        " AND lower(current_database()) = lower(?)))"
+    ]
     if schema is not None:
-        where.append("lower(c.schema_name) = lower(?)")
-        params.append(schema)
+        where.append(
+            "((lower(c.schema_name) = lower(?))"
+            " OR (lower(c.database_name) = 'temp' AND lower(current_schema()) = lower(?)))"
+        )
+        params.extend([schema, schema])
     if table_name is not None:
         where.append("lower(c.table_name) = lower(?)")
         params.append(table_name)
@@ -918,7 +986,8 @@ def _execute_show_columns(
         f"""
         SELECT
             c.table_name AS "table_name",
-            c.schema_name AS "schema_name",
+            CASE WHEN lower(c.database_name) = 'temp'
+                 THEN current_schema() ELSE c.schema_name END AS "schema_name",
             c.column_name AS "column_name",
             c.data_type AS "data_type",
             e.declared_type AS "declared_type",
@@ -927,7 +996,8 @@ def _execute_show_columns(
             'COLUMN' AS "kind",
             NULL::VARCHAR AS "expression",
             c.comment AS "comment",
-            c.database_name AS "database_name",
+            CASE WHEN lower(c.database_name) = 'temp'
+                 THEN current_database() ELSE c.database_name END AS "database_name",
             NULL::VARCHAR AS "autoincrement",
             NULL::VARCHAR AS "schema_evolution_record"
         FROM duckdb_columns() c
@@ -936,6 +1006,7 @@ def _execute_show_columns(
          AND lower(e.table_schema) = lower(c.schema_name)
          AND lower(e.table_name) = lower(c.table_name)
          AND lower(e.column_name) = lower(c.column_name)
+         AND lower(c.database_name) <> 'temp'
         WHERE {' AND '.join(where)}
         ORDER BY c.table_name, c.column_index
         """,
@@ -1423,8 +1494,8 @@ def _execute_snowflake_describe(
          AND lower(e.table_schema) = lower(c.schema_name)
          AND lower(e.table_name) = lower(c.table_name)
          AND lower(e.column_name) = lower(c.column_name)
-        WHERE lower(c.database_name) = lower('{database}')
-          AND lower(c.schema_name) = lower('{schema}')
+         AND lower(c.database_name) <> 'temp'
+        WHERE {_temp_inclusive_scope('c', database, schema)}
           AND lower(c.table_name) = lower('{table_name}')
         ORDER BY c.column_index
         """
@@ -1552,6 +1623,36 @@ def _execute_file_format_ddl(
     return None
 
 
+def _created_table_target(
+    session: SessionContext, statement: exp.Create
+) -> tuple[str, str, str] | None:
+    """Return the ``(database, schema, table)`` a CREATE TABLE targets, else None."""
+    schema = statement.this
+    if not (isinstance(schema, exp.Schema) and isinstance(schema.this, exp.Table)):
+        return None
+    table = schema.this
+    catalog = table.args.get("catalog")
+    db = table.args.get("db")
+    database = catalog.name if isinstance(catalog, exp.Identifier) else session.database
+    table_schema = db.name if isinstance(db, exp.Identifier) else session.schema
+    return database, table_schema, table.name
+
+
+def _is_temporary_table_create(statement: exp.Create) -> bool:
+    """Return True for a ``CREATE TEMPORARY|VOLATILE TABLE``.
+
+    ``VOLATILE`` is checked as written: it reaches here before the translator rewrites it
+    into the ``TEMPORARY`` property.
+    """
+    properties = statement.args.get("properties")
+    if properties is None:
+        return False
+    return any(
+        isinstance(prop, (exp.TemporaryProperty, exp.VolatileProperty))
+        for prop in properties.expressions
+    )
+
+
 def _record_declared_columns(
     manager: DuckDBManager, session: SessionContext, statement: exp.Create
 ) -> None:
@@ -1559,23 +1660,42 @@ def _record_declared_columns(
 
     DuckDB drops ``VARCHAR`` lengths, so the type as written is kept in the
     per-catalog side table so ``DESCRIBE`` / ``INFORMATION_SCHEMA.COLUMNS`` can report it.
+
+    Temporary tables are skipped: that side table is keyed by (catalog, schema, table),
+    which two sessions' same-named temporary tables would share, and a temporary table
+    shadowing a permanent one would overwrite -- and so silently lose -- the permanent
+    table's declared types. A temporary table therefore reports DuckDB's own type.
     """
-    schema = statement.this
-    if not (isinstance(schema, exp.Schema) and isinstance(schema.this, exp.Table)):
+    target = _created_table_target(session, statement)
+    if target is None or _is_temporary_table_create(statement):
         return
-    table = schema.this
-    catalog = table.args.get("catalog")
-    db = table.args.get("db")
-    database = catalog.name if isinstance(catalog, exp.Identifier) else session.database
-    table_schema = db.name if isinstance(db, exp.Identifier) else session.schema
+    database, table_schema, table_name = target
     columns: list[tuple[str, str | None, str | None]] = []
-    for column in schema.expressions:
+    for column in statement.this.expressions:
         if isinstance(column, exp.ColumnDef):
             kind = column.args.get("kind")
             declared = kind.sql(dialect="snowflake") if kind is not None else None
             columns.append((column.this.name, declared, None))
     if columns:
-        manager.record_columns(database, table_schema, table.name, columns)
+        manager.record_columns(database, table_schema, table_name, columns)
+
+
+def _record_temp_table_owner(
+    manager: DuckDBManager, session: SessionContext, statement: exp.Create
+) -> None:
+    """Remember which database a session's temporary table was created in.
+
+    ``CREATE OR REPLACE DATABASE`` uses this to drop the temporary tables it owned, the
+    way Snowflake drops them with the schema they belong to (DuckDB keeps them in a
+    separate connection-local catalog that a database replacement does not touch).
+    """
+    if not _is_temporary_table_create(statement):
+        return
+    target = _created_table_target(session, statement)
+    if target is None:
+        return
+    database, _, table_name = target
+    manager.record_temp_table(session.token, table_name, database)
 
 
 def _execute_stage_command(

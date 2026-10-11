@@ -56,6 +56,12 @@ max_cached_statements = 500
 # succeed without being executed, e.g. session parameters the emulator does not model.
 noop_regexes = []
 
+[sessions]
+# Maximum number of live bearer-token sessions. Above this the least recently used
+# session is evicted, releasing its connection and any temporary tables it held, as a
+# real Snowflake session does when it expires. 0 or less keeps every session.
+max_sessions = 1000
+
 [staging]
 # Root directory under which staged files (PUT/GET/COPY INTO @stage) are stored.
 # Leave empty to use an auto-created temporary directory.
@@ -97,6 +103,12 @@ class StatementSettings(BaseModel):
     noop_regexes: list[str] = []
 
 
+class SessionSettings(BaseModel):
+    # Live bearer-token sessions kept before the least recently used one is evicted;
+    # 0 or less keeps every session (unbounded).
+    max_sessions: int = 1000
+
+
 class StagingSettings(BaseModel):
     # Root directory for staged files; empty means an auto-created temp directory.
     stage_root: str = ""
@@ -116,6 +128,7 @@ class Settings(BaseSettings):
     snowflake: SnowflakeDefaults = SnowflakeDefaults()
     persistence: PersistenceSettings = PersistenceSettings()
     statements: StatementSettings = StatementSettings()
+    sessions: SessionSettings = SessionSettings()
     staging: StagingSettings = StagingSettings()
 
     @classmethod
@@ -159,6 +172,10 @@ class Settings(BaseSettings):
     @property
     def max_cached_statements(self) -> int:
         return self.statements.max_cached_statements
+
+    @property
+    def max_sessions(self) -> int:
+        return self.sessions.max_sessions
 
     @property
     def isolation(self) -> str:

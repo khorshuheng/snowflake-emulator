@@ -63,6 +63,11 @@ database_path = ":memory:"
 # Maximum number of cached statement results kept in memory.
 max_cached_statements = 500
 
+[sessions]
+# Maximum number of live bearer-token sessions. Above this the least recently used
+# session is evicted, releasing its connection and any temporary tables it held.
+max_sessions = 1000
+
 [staging]
 # Root directory under which staged files (PUT/GET/COPY INTO @stage) are stored.
 # Leave empty to use an auto-created temporary directory.

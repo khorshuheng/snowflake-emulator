@@ -68,6 +68,11 @@ class DuckDBManager:
         # be used concurrently, and a Snowflake session executes one statement at a
         # time anyway. Sessions do not block each other.
         self._session_locks: dict[str, threading.RLock] = {}
+        # {session key: {temporary table name: database it was created in}}, so
+        # ``CREATE OR REPLACE DATABASE`` can drop the temporary tables that belonged to
+        # the replaced database, as Snowflake does. An entry that has gone stale (the
+        # user dropped or renamed the table) is harmless: the drop is ``IF EXISTS``.
+        self._session_temp_tables: dict[str, dict[str, str]] = {}
         # Native (Python) functions registered for type-overloaded user functions, keyed
         # by the dispatcher's name. They are per-process, cannot be re-registered under
         # the same name, and cannot be unregistered, so the mapping is mutable and the
@@ -157,8 +162,29 @@ class DuckDBManager:
         (schemachange only uses them for an existence check + log line). ``tables``
         unions base tables (``duckdb_tables()``) with views (``duckdb_views()``) so
         ``TABLE_TYPE`` is ``BASE TABLE`` or ``VIEW`` as on Snowflake.
+
+        The calling session's temporary tables are included too. DuckDB keeps them in a
+        connection-local ``temp`` catalog, so ``duckdb_tables()``/``duckdb_columns()``
+        report them to that connection only -- which is exactly the visibility a
+        Snowflake temporary table has. They are reported under the session's current
+        database and schema (``current_database()``/``current_schema()`` are evaluated
+        per connection inside the view), because that is where the user created them.
         """
         schema = INFORMATION_SCHEMA_SCHEMA
+        # A scoped object of the catalog this view lives in, or the calling connection's
+        # temporary tables when it is currently working in that catalog. A temporary
+        # table shadows a permanent one of the same name, so the catalog-side row is
+        # dropped while a shadowing temporary table exists.
+        def in_scope(alias: str) -> str:
+            return (
+                f"({alias}.database_name = '{database}'"
+                f" AND NOT EXISTS (SELECT 1 FROM duckdb_tables() sh"
+                f" WHERE lower(sh.database_name) = 'temp'"
+                f" AND lower(sh.table_name) = lower({alias}.table_name)))"
+                f" OR (lower({alias}.database_name) = 'temp'"
+                f" AND lower(current_database()) = lower('{database}'))"
+            )
+
         self._connection.execute(f"CREATE SCHEMA IF NOT EXISTS {db_ident}.{schema}")
         self._connection.execute(
             f"""
@@ -177,17 +203,19 @@ class DuckDBManager:
             f"""
             CREATE OR REPLACE VIEW {db_ident}.{schema}.tables AS
             SELECT
-                database_name AS TABLE_CATALOG,
-                schema_name AS TABLE_SCHEMA,
-                table_name AS TABLE_NAME,
+                CASE WHEN lower(t.database_name) = 'temp'
+                     THEN current_database() ELSE t.database_name END AS TABLE_CATALOG,
+                CASE WHEN lower(t.database_name) = 'temp'
+                     THEN current_schema() ELSE t.schema_name END AS TABLE_SCHEMA,
+                t.table_name AS TABLE_NAME,
                 'BASE TABLE'::VARCHAR AS TABLE_TYPE,
                 NULL::TIMESTAMP AS CREATED,
                 NULL::TIMESTAMP AS LAST_ALTERED,
-                comment AS COMMENT,
+                t.comment AS COMMENT,
                 NULL::BIGINT AS ROW_COUNT,
-                estimated_size AS BYTES
-            FROM duckdb_tables()
-            WHERE database_name = '{database}'
+                t.estimated_size AS BYTES
+            FROM duckdb_tables() t
+            WHERE {in_scope('t')}
             UNION ALL
             SELECT
                 database_name AS TABLE_CATALOG,
@@ -231,8 +259,10 @@ class DuckDBManager:
             f"""
             CREATE OR REPLACE VIEW {db_ident}.{schema}.columns AS
             SELECT
-                c.database_name AS TABLE_CATALOG,
-                c.schema_name AS TABLE_SCHEMA,
+                CASE WHEN lower(c.database_name) = 'temp'
+                     THEN current_database() ELSE c.database_name END AS TABLE_CATALOG,
+                CASE WHEN lower(c.database_name) = 'temp'
+                     THEN current_schema() ELSE c.schema_name END AS TABLE_SCHEMA,
                 c.table_name AS TABLE_NAME,
                 c.column_name AS COLUMN_NAME,
                 c.column_index + 1 AS ORDINAL_POSITION,
@@ -256,7 +286,11 @@ class DuckDBManager:
              AND lower(e.table_schema) = lower(c.schema_name)
              AND lower(e.table_name) = lower(c.table_name)
              AND lower(e.column_name) = lower(c.column_name)
-            WHERE c.database_name = '{database}'
+             -- Temporary tables have no row of their own in the side table (their types
+             -- are per session, so a shared row could not tell two sessions apart):
+             -- joining one would apply some permanent table's declared type to it.
+             AND lower(c.database_name) <> 'temp'
+            WHERE {in_scope('c')}
             """
         )
 
@@ -579,12 +613,54 @@ class DuckDBManager:
             yield
 
     def release_session(self, session_token: str | None) -> None:
-        """Drop a closed session's connection, discarding its temporary tables."""
+        """Drop a closed session's connection, discarding its temporary tables.
+
+        The session's statement lock is held across the pop-and-close so a logout cannot
+        pull the connection out from under a statement that is still running on it.
+        """
+        key = _session_key(session_token)
+        with self.session_lock(key):
+            with self._lock:
+                cursor = self._session_cursors.pop(key, None)
+                self._session_locks.pop(key, None)
+                self._session_temp_tables.pop(key, None)
+            _close_quietly(cursor)
+
+    def record_temp_table(
+        self, session_token: str | None, table: str, database: str
+    ) -> None:
+        """Remember that a session's temporary table belongs to `database`."""
         key = _session_key(session_token)
         with self._lock:
-            cursor = self._session_cursors.pop(key, None)
-            self._session_locks.pop(key, None)
-        _close_quietly(cursor)
+            self._session_temp_tables.setdefault(key, {})[table.lower()] = database.lower()
+
+    def _drop_replaced_temp_tables(self, database: str) -> None:
+        """Drop the temporary tables a replaced database owned, in every session.
+
+        Best effort: a temporary table that has already been dropped, or whose session
+        is mid-statement, must not make ``CREATE OR REPLACE DATABASE`` fail.
+        """
+        target = database.lower()
+        with self._lock:
+            victims = [
+                (key, table)
+                for key, tables in self._session_temp_tables.items()
+                for table, owner in tables.items()
+                if owner == target
+            ]
+            for key, table in victims:
+                self._session_temp_tables.get(key, {}).pop(table, None)
+        for key, table in victims:
+            escaped = table.replace('"', '""')
+            with self.session_lock(key):
+                with self._lock:
+                    cursor = self._session_cursors.get(key)
+                if cursor is None:
+                    continue
+                try:
+                    cursor.execute(f'DROP TABLE IF EXISTS temp."{escaped}"')
+                except Exception:  # noqa: BLE001 - best-effort cleanup, see docstring
+                    continue
 
     def has_database(self, database: str) -> bool:
         """Return True if a Snowflake database is already attached as a catalog.
@@ -600,6 +676,10 @@ class DuckDBManager:
     def replace_database(self, database: str) -> None:
         """Recreate a Snowflake database (``CREATE OR REPLACE DATABASE``)."""
         db_ident = _quote_ident(database)
+        # Temporary tables live in DuckDB's connection-local ``temp`` catalog rather than
+        # in the catalog being replaced, so they have to be dropped explicitly for the
+        # replacement to cascade the way it does on Snowflake.
+        self._drop_replaced_temp_tables(database)
         # Hold the lock across DETACH, file removal and re-ATTACH so a concurrent
         # reference cannot observe (or re-attach) the database mid-replacement.
         with self._lock:

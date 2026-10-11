@@ -120,6 +120,19 @@ def test_variables_are_session_scoped(client):
     assert other.json()["data"] == []
 
 
+def test_create_or_replace_database_drops_its_temporary_tables(client):
+    """Replacing a database drops the temp tables that belonged to it, as Snowflake does."""
+    headers = _auth(client)
+    _post(client, "CREATE TEMPORARY TABLE kept_table (a INT)", headers)
+    assert _post(client, "CREATE DATABASE tmp_db", headers).status_code == 200
+    assert _post(client, "USE DATABASE tmp_db", headers).status_code == 200
+    _post(client, "CREATE TEMPORARY TABLE dropped_with_db (a INT)", headers)
+    assert _post(client, "CREATE OR REPLACE DATABASE tmp_db", headers).status_code == 200
+    assert _post(client, "SELECT * FROM dropped_with_db", headers).status_code == 422
+    # A temp table created in another database is untouched.
+    assert _post(client, "SELECT a FROM kept_table", headers).status_code == 200
+
+
 def test_set_expression_variable_expands_expression_not_string(client):
     headers = _auth(client)
     _post(client, "SET x = 1 + 1", headers)

@@ -17,6 +17,7 @@ def restore_settings():
         "port": settings.server.port,
         "database_path": settings.persistence.database_path,
         "stage_root": settings.staging.stage_root,
+        "max_sessions": settings.sessions.max_sessions,
     }
     yield
     settings.persistence.isolation = saved["isolation"]
@@ -25,6 +26,7 @@ def restore_settings():
     settings.server.port = saved["port"]
     settings.persistence.database_path = saved["database_path"]
     settings.staging.stage_root = saved["stage_root"]
+    settings.sessions.max_sessions = saved["max_sessions"]
 
 
 def _auth(client):
@@ -77,6 +79,65 @@ def test_temporary_table_survives_in_isolated_mode(client, restore_settings):
     assert _post(client, "CREATE TEMPORARY TABLE iso_tmp (a INT)", headers).status_code == 200
     assert _post(client, "INSERT INTO iso_tmp VALUES (3)", headers).status_code == 200
     assert _post(client, "SELECT a FROM iso_tmp", headers).json()["data"] == [[3]]
+
+
+def test_tokenless_requests_share_one_session(client):
+    """A request without a token must not retain a session (and connection) of its own."""
+    import snowflake_emulator.sessions as sessions_module
+
+    for _ in range(5):
+        assert _post(client, "SELECT 1").status_code == 200
+    manager = sessions_module.get_session_manager()
+    assert manager._sessions == {}
+    assert len(manager._sessions) == 0
+    # ...and a tokenless client still gets session state: its temp table survives.
+    assert _post(client, "CREATE TEMPORARY TABLE anon_keep (a INT)").status_code == 200
+    assert _post(client, "INSERT INTO anon_keep VALUES (1)").status_code == 200
+    assert _post(client, "SELECT a FROM anon_keep").json()["data"] == [[1]]
+
+
+def test_sessions_are_capped_and_eviction_releases_the_connection(client, restore_settings):
+    import snowflake_emulator.database as database_module
+    import snowflake_emulator.sessions as sessions_module
+
+    settings.sessions.max_sessions = 2
+    sessions_module._manager = None
+    oldest = client.post("/session/token").json()["token"]
+    hdr = {"Authorization": f"Bearer {oldest}"}
+    _post(client, "CREATE TEMPORARY TABLE capped (a INT)", hdr)
+    assert _post(client, "SELECT * FROM capped", hdr).status_code == 200
+    middle = client.post("/session/token").json()["token"]
+    newest = client.post("/session/token").json()["token"]  # evicts `oldest`
+    assert set(sessions_module.get_session_manager()._sessions) == {middle, newest}
+    assert oldest not in database_module.get_manager(None)._session_cursors
+    # The evicted token's next statement starts a fresh session, without its temp table.
+    assert _post(client, "SELECT * FROM capped", hdr).status_code == 422
+
+
+def test_session_close_waits_for_an_in_flight_statement(client):
+    """A logout must not pull the connection out from under a running statement."""
+    import threading
+    import time
+
+    from snowflake_emulator.database import get_manager
+    from snowflake_emulator.sessions import get_session_manager
+
+    token = client.post("/session/token").json()["token"]
+    manager = get_manager(None)
+    _post(client, "SELECT 1", {"Authorization": f"Bearer {token}"})
+    closed = threading.Event()
+
+    def closer():
+        get_session_manager().close(token)
+        closed.set()
+
+    thread = threading.Thread(target=closer)
+    with manager.session_scope(token):  # stand in for a statement holding the session
+        thread.start()
+        time.sleep(0.2)
+        assert not closed.is_set()
+    thread.join(timeout=5)
+    assert closed.is_set()
 
 
 def test_cli_parser_applies_overrides(restore_settings):

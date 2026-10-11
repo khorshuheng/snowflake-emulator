@@ -7,6 +7,11 @@ def _post(client, statement, headers=None):
     return client.post("/api/v2/statements", json={"statement": statement}, headers=headers)
 
 
+def _auth(client):
+    token = client.post("/session/token").json()["token"]
+    return {"Authorization": f"Bearer {token}"}
+
+
 def test_show_columns_in_table_has_snowflake_shape(client):
     _post(client, "CREATE TABLE sc (id INT, name VARCHAR)")
     resp = _post(client, "SHOW COLUMNS IN TABLE sc")
@@ -126,3 +131,99 @@ def test_create_or_replace_refreshes_declared_length(client):
     _post(client, "CREATE OR REPLACE TABLE rl (name VARCHAR(300))")
     describe = {row[0]: row[1] for row in _post(client, "DESCRIBE TABLE rl").json()["data"]}
     assert describe["NAME"] == "VARCHAR(300)"
+
+
+def test_temporary_table_metadata_is_visible_to_its_session(client):
+    """DESCRIBE, SHOW COLUMNS and INFORMATION_SCHEMA cover the session's temp tables."""
+    headers = _auth(client)
+    _post(client, "CREATE TEMPORARY TABLE tt_meta (a INT, name VARCHAR(7))", headers)
+    describe = {row[0]: row[1] for row in _post(client, "DESCRIBE TABLE tt_meta", headers).json()["data"]}
+    assert describe == {"A": "NUMBER(38,0)", "NAME": "VARCHAR"}
+    show = {row[2]: row[3] for row in _post(client, "SHOW COLUMNS IN TABLE tt_meta", headers).json()["data"]}
+    assert show == describe
+    columns = _post(
+        client,
+        "SELECT TABLE_CATALOG, TABLE_SCHEMA, COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+        "WHERE TABLE_NAME = 'TT_META' ORDER BY ORDINAL_POSITION",
+        headers,
+    ).json()["data"]
+    assert columns == [["EMULATOR_DB", "PUBLIC", "A"], ["EMULATOR_DB", "PUBLIC", "NAME"]]
+    tables = _post(
+        client,
+        "SELECT TABLE_CATALOG, TABLE_SCHEMA FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'TT_META'",
+        headers,
+    ).json()["data"]
+    assert tables == [["EMULATOR_DB", "PUBLIC"]]
+
+
+def test_temporary_table_metadata_is_hidden_from_other_sessions(client):
+    owner = _auth(client)
+    other = _auth(client)
+    _post(client, "CREATE TEMPORARY TABLE tt_secret (a INT)", owner)
+    assert _post(client, "DESCRIBE TABLE tt_secret", owner).status_code == 200
+    assert _post(client, "DESCRIBE TABLE tt_secret", other).json()["data"] == []
+    assert _post(client, "SHOW COLUMNS IN TABLE tt_secret", other).json()["data"] == []
+    assert (
+        _post(
+            client,
+            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'TT_SECRET'",
+            other,
+        ).json()["data"]
+        == []
+    )
+
+
+def test_temporary_table_shadows_a_permanent_one(client):
+    """A temp table wins name resolution, so its metadata replaces the permanent one's."""
+    headers = _auth(client)
+    _post(client, "CREATE TABLE sh_tbl (b VARCHAR(7))", headers)
+    _post(client, "CREATE TEMPORARY TABLE sh_tbl (b NUMBER(5,2))", headers)
+    describe = _post(client, "DESCRIBE TABLE sh_tbl", headers).json()["data"]
+    assert [row[0] for row in describe] == ["B"]
+    assert describe[0][1] == "NUMBER(5,2)"
+    assert [row[1] for row in _post(client, "SHOW TABLES", headers).json()["data"]].count("SH_TBL") == 1
+    # The permanent table keeps its own declared type, which another session still sees.
+    permanent = {row[0]: row[1] for row in _post(client, "DESCRIBE TABLE sh_tbl", _auth(client)).json()["data"]}
+    assert permanent == {"B": "VARCHAR(7)"}
+
+
+def test_show_tables_like_and_starts_with_filter(client):
+    _post(client, "CREATE TABLE alpha_one (a INT)")
+    _post(client, "CREATE TABLE beta_two (a INT)")
+    names = lambda resp: [row[1] for row in resp.json()["data"]]
+    assert names(_post(client, "SHOW TABLES LIKE 'alpha%'")) == ["ALPHA_ONE"]
+    assert names(_post(client, "SHOW TABLES LIKE 'ALPHA_ONE'")) == ["ALPHA_ONE"]
+    assert names(_post(client, "SHOW TABLES LIKE 'zzz%'")) == []
+    assert names(_post(client, "SHOW TABLES STARTS WITH 'BET'")) == ["BETA_TWO"]
+    assert names(_post(client, "SHOW TABLES LIMIT 1")) == ["ALPHA_ONE"]
+
+
+def test_show_tables_in_database_spans_schemas(client):
+    _post(client, "CREATE SCHEMA span_s")
+    _post(client, "CREATE TABLE span_s.spanned (a INT)")
+    rows = _post(client, "SHOW TABLES IN DATABASE EMULATOR_DB").json()["data"]
+    assert "SPANNED" in {row[1] for row in rows}
+
+
+def test_show_views_and_objects_respect_scope_and_shadowing(client):
+    headers = _auth(client)
+    _post(client, "CREATE SCHEMA v_schema", headers)
+    _post(client, "CREATE VIEW v_schema.v1 AS SELECT 1 AS c", headers)
+    _post(client, "CREATE TABLE v_schema.t1 (a INT)", headers)
+    objects = lambda: [
+        (row[1], row[2])
+        for row in _post(client, "SHOW OBJECTS IN SCHEMA EMULATOR_DB.V_SCHEMA", headers).json()["data"]
+    ]
+    assert sorted(objects()) == [("T1", "TABLE"), ("V1", "VIEW")]
+    assert "V1" in {
+        row[1] for row in _post(client, "SHOW VIEWS IN DATABASE EMULATOR_DB", headers).json()["data"]
+    }
+    _post(client, "USE SCHEMA v_schema", headers)
+    assert [row[1] for row in _post(client, "SHOW VIEWS LIKE 'V%'", headers).json()["data"]] == ["V1"]
+    assert _post(client, "SHOW VIEWS LIKE 'zzz%'", headers).json()["data"] == []
+    # A temporary table of the same name shadows the view: the object is still listed,
+    # once, as the session's temporary table.
+    _post(client, "CREATE TEMPORARY TABLE v1 (x INT)", headers)
+    assert objects() == [("T1", "TABLE"), ("V1", "TABLE")]
+    assert [row[1] for row in _post(client, "SHOW TABLES", headers).json()["data"]] == ["T1", "V1"]
+    assert _post(client, "SHOW VIEWS LIKE 'V%'", headers).json()["data"] == []
