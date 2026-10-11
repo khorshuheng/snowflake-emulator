@@ -296,6 +296,108 @@ def test_array_slice_over_native_lists(client):
         assert resp.json()["data"] == expected, statement
 
 
+def test_other_array_functions_over_variant_arrays(client):
+    """The rest of Snowflake's array functions over a VARIANT array, and their native controls."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    assert post("CREATE TABLE arr_t (j VARIANT)").status_code == 200
+    assert (
+        post(
+            "INSERT INTO arr_t SELECT PARSE_JSON('{\"n\": [\"a\",\"b\",\"a\"], "
+            "\"nums\": [3,1,2], \"deep\": [[1,2],[3]], \"withnull\": [\"a\",null], "
+            "\"flat\": [1,2,3]}')"
+        ).status_code
+        == 200
+    )
+
+    for statement, expected in (
+        # Order is unspecified where DuckDB uses a hash set, so sort before comparing.
+        ("SELECT ARRAY_SORT(ARRAY_UNIQUE(j:n)) FROM arr_t", [[['"a"', '"b"']]]),
+        ("SELECT ARRAY_REMOVE_AT(j:n, 0) FROM arr_t", [[['"b"', '"a"']]]),
+        ("SELECT ARRAY_POSITION('b', j:n) FROM arr_t", [[1]]),
+        ("SELECT ARRAY_POSITION('zz', j:n) FROM arr_t", [[0]]),
+        ("SELECT ARRAY_PREPEND('z', j:n) FROM arr_t", [[['"z"', '"a"', '"b"', '"a"']]]),
+        ("SELECT ARRAY_REPEAT('x', 3) FROM arr_t", [[['x', 'x', 'x']]]),
+        ("SELECT ARRAY_FLATTEN(j:deep, 1) FROM arr_t", [[['1', '2', '3']]]),
+        ("SELECT ARRAY_FLATTEN(j:deep, 2) FROM arr_t", [[['1', '2', '3']]]),
+        # A depth past the nesting leaves the array as it is rather than raising.
+        ("SELECT ARRAY_FLATTEN(j:flat, 2) FROM arr_t", [[['1', '2', '3']]]),
+        ("SELECT ARRAY_APPEND(j:n, 'z') FROM arr_t", [[['"a"', '"b"', '"a"', '"z"']]]),
+        ("SELECT ARRAY_COMPACT(j:withnull) FROM arr_t", [[['"a"']]]),
+        ("SELECT ARRAY_SORT(ARRAY_DISTINCT(j:n)) FROM arr_t", [[['"a"', '"b"']]]),
+        ("SELECT ARRAY_EXCEPT(j:n, j:n) FROM arr_t", [[[]]]),
+        ("SELECT ARRAYS_OVERLAP(j:n, j:n) FROM arr_t", [[True]]),
+        ("SELECT ARRAY_SORT(j:n) FROM arr_t", [[['"a"', '"a"', '"b"']]]),
+        ("SELECT ARRAY_MAX(j:nums) FROM arr_t", [["3"]]),
+        ("SELECT ARRAY_MIN(j:nums) FROM arr_t", [["1"]]),
+        # JSON string elements are unquoted, unlike sqlglot's own CAST(x AS TEXT) rendering.
+        ("SELECT ARRAY_TO_STRING(j:n, ',') FROM arr_t", [["a,b,a"]]),
+        ("SELECT ARRAY_REMOVE(j:n, 'a') FROM arr_t", [[['"b"']]]),
+        ("SELECT ARRAY_INSERT(j:n, 0, 'z') FROM arr_t", [[['"z"', '"a"', '"b"', '"a"']]]),
+        ("SELECT ARRAY_AGG(j:n) FROM arr_t", [[[['"a"', '"b"', '"a"']]]]),
+        ("SELECT ARRAY_SIZE(ARRAY_CAT(j:n, j:n)) FROM arr_t", [[6]]),
+        # A lambda compares against a VARIANT element, so the literal is encoded.
+        ("SELECT FILTER(j:n, x -> x = TO_JSON('a')) FROM arr_t", [[['"a"', '"a"']]]),
+        ("SELECT ARRAY_SIZE(TRANSFORM(j:n, x -> TO_VARCHAR(x))) FROM arr_t", [[3]]),
+        (
+            "SELECT REDUCE(j:nums, 0, (acc, x) -> CAST(acc AS INT) + CAST(x AS INT)) "
+            "FROM arr_t",
+            [["6"]],
+        ),
+        # Native lists keep their own rendering, including the two that were wrong before.
+        ("SELECT ARRAY_SORT(ARRAY_UNIQUE(ARRAY_CONSTRUCT('a','a','b')))", [[["a", "b"]]]),
+        ("SELECT ARRAY_PREPEND('z', ARRAY_CONSTRUCT('a','b'))", [[["z", "a", "b"]]]),
+        ("SELECT ARRAY_REPEAT('x', 2)", [[["x", "x"]]]),
+    ):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        assert resp.json()["data"] == expected, statement
+
+    # sqlglot models ARRAY_INTERSECTION as a multiset operation, so compare as a set here.
+    intersected = post("SELECT ARRAY_INTERSECTION(j:n, j:n) FROM arr_t")
+    assert intersected.status_code == 200, intersected.json()
+    assert set(intersected.json()["data"][0][0]) == {'"a"', '"b"'}
+
+
+def test_array_flatten_requires_a_literal_depth(client):
+    resp = client.post(
+        "/api/v2/statements",
+        json={"statement": "SELECT ARRAY_FLATTEN(ARRAY_CONSTRUCT(1), j) FROM arr_t"},
+    )
+    assert resp.status_code == 422
+    assert "ARRAY_FLATTEN" in resp.json()["detail"]["message"]
+
+
+def test_flatten_over_a_variant_column(client):
+    """`json_each` needs JSON: a VARIANT column (and `col:path`) is cast, as `col:path` is."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    assert post("CREATE TABLE flat_v (j VARIANT)").status_code == 200
+    assert (
+        post("INSERT INTO flat_v SELECT PARSE_JSON('{\"n\": [\"a\",\"b\"]}')").status_code
+        == 200
+    )
+
+    for statement in (
+        "SELECT f.value AS v FROM flat_v t, LATERAL FLATTEN(input => t.j:n) AS f",
+        "SELECT f.value AS v FROM flat_v t, TABLE(FLATTEN(input => t.j:n)) AS f",
+    ):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        assert {row[0] for row in resp.json()["data"]} == {'"a"', '"b"'}
+
+
+def test_uninterpreted_function_is_left_to_duckdb(client):
+    """A function sqlglot does not know must pass through, not crash the array rewrite."""
+    resp = client.post(
+        "/api/v2/statements", json={"statement": "SELECT NOT_A_REAL_FUNCTION(1) AS x"}
+    )
+    assert resp.status_code == 422
+    assert "NOT_A_REAL_FUNCTION" in resp.json()["detail"]["message"]
+
+
 def test_array_functions_over_a_bare_variant_column_still_error(client):
     """A bare VARIANT column has no static array type, so this stays a loud error."""
     def post(statement):

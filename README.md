@@ -126,24 +126,35 @@ including `QUALIFY`, `ILIKE`, `DATEADD`/`DATEDIFF`, semi-structured functions li
 WAREHOUSE/ROLE` statements are intercepted and applied to the emulator's in-memory
 session state rather than being sent to DuckDB.
 
-Semi-structured arrays work with `ARRAY_CONTAINS`, `ARRAY_SIZE` and `ARRAY_SLICE` (plus
-Snowflake's `SLICE` alias): an operand that the emulator stores as JSON (`col:names`,
-`$1:names`, `PARSE_JSON('[...]')`, `x::VARIANT`) is translated onto DuckDB's list
-functions, and a bound search value occupies one parameter. `WHERE ARRAY_CONTAINS('admin', payload:tags)` therefore filters VARIANT rows
-and staged records alike. `ARRAY_SLICE` keeps Snowflake's indexing (0-based, both bounds
-inclusive, a negative bound counting from the end, out-of-range bounds clamping and an
-empty array when the start is past the end) and now does so for native lists as well, where
-it previously came back one element short. Not translated, and left as a loud error rather
-than a guess:
+Snowflake's array functions work over both a native array and one the emulator stores as
+JSON (`col:names`, `$1:names`, `PARSE_JSON('[...]')`, `x::VARIANT`): `ARRAY_CONTAINS`,
+`ARRAY_SIZE`, `ARRAY_SLICE`/`SLICE`, `ARRAY_APPEND`, `ARRAY_CAT`, `ARRAY_COMPACT`,
+`ARRAY_DISTINCT`, `ARRAY_EXCEPT`, `ARRAY_INSERT`, `ARRAY_INTERSECTION`, `ARRAY_MAX`,
+`ARRAY_MIN`, `ARRAY_POSITION`, `ARRAY_PREPEND`, `ARRAY_REMOVE`, `ARRAY_REMOVE_AT`,
+`ARRAY_REPEAT`, `ARRAY_SORT`, `ARRAY_TO_STRING`, `ARRAY_UNIQUE`, `ARRAYS_OVERLAP`,
+`ARRAY_AGG`, `ARRAY_FLATTEN(arr, depth)` and the `FILTER`/`TRANSFORM`/`REDUCE` lambdas — a
+JSON array is cast to DuckDB's list form, and a searched value is encoded as a VARIANT so
+both sides compare the way Snowflake compares them. `WHERE ARRAY_CONTAINS('admin',
+payload:tags)` therefore filters VARIANT rows and staged records alike, and `LATERAL
+FLATTEN(input => ...)` / `TABLE(FLATTEN(...))` read a VARIANT column, a `col:path` or JSON.
 
-- a **bare VARIANT column** (`ARRAY_CONTAINS('a', variant_col)`) — whether it holds an
-  array is only known at run time, and casting a non-array VARIANT to a list compares
-  silently unequal values;
-- the rest of the family — `ARRAY_POSITION` (needs `0`, not NULL, when the value is
-  absent), `ARRAY_TO_STRING` (would keep each element's JSON quotes), `ARRAY_SORT`,
-  `ARRAY_UNIQUE`, `ARRAY_COMPACT`, `ARRAY_AGG`;
+Not translated, and left as a loud error rather than a guess:
+
+- a **bare VARIANT column** as the array (`ARRAY_CONTAINS('a', variant_col)`) — whether it
+  holds an array is only known at run time, and casting a non-array VARIANT to a list
+  compares silently unequal values;
+- a **mixed pair** where one operand is a JSON array and the other a native list
+  (`ARRAY_EXCEPT(j:n, ARRAY_CONSTRUCT('a'))`): DuckDB has no common list type for them, and
+  casting a `VARCHAR[]` to `JSON[]` silently loses its values;
 - an `ARRAY_SLICE` index given as a `?` bind — the 0-based adjustment has to name the index
-  twice, so it would consume two values; a literal, a column or a JSON value all work.
+  twice, so it would consume two values; a literal, a column or a JSON value all work;
+- a lambda *body* that compares or extracts without encoding (`FILTER(j:n, x -> x = 'a')`):
+  the element is a VARIANT, so compare against `TO_JSON('a')` or cast with `TO_VARCHAR(x)`;
+- `ARRAY_FLATTEN`, which needs a constant depth between 1 and 10.
+
+Two behaviours inherited from sqlglot rather than Snowflake, so treat them as unverified:
+`ARRAY_INTERSECTION` keeps duplicate elements (its multiset model), and `ARRAY_POSITION`
+returns 0 for a NULL value as well as for an absent one.
 
 ## Staging files (PUT / GET / LIST / REMOVE / COPY INTO)
 
