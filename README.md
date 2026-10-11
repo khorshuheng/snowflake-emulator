@@ -150,30 +150,29 @@ including `QUALIFY`, `ILIKE`, `DATEADD`/`DATEDIFF`, semi-structured functions li
 WAREHOUSE/ROLE` statements are intercepted and applied to the emulator's in-memory
 session state rather than being sent to DuckDB.
 
-Snowflake's array functions work over both a native array and one the emulator stores as
-JSON (`col:names`, `$1:names`, `PARSE_JSON('[...]')`): `ARRAY_CONTAINS`,
-`ARRAY_SIZE`, `ARRAY_SLICE`/`SLICE`, `ARRAY_APPEND`, `ARRAY_CAT`, `ARRAY_COMPACT`,
-`ARRAY_DISTINCT`, `ARRAY_EXCEPT`, `ARRAY_INSERT`, `ARRAY_INTERSECTION`, `ARRAY_MAX`,
-`ARRAY_MIN`, `ARRAY_POSITION`, `ARRAY_PREPEND`, `ARRAY_REMOVE`, `ARRAY_REMOVE_AT`,
-`ARRAY_REPEAT`, `ARRAY_SORT`, `ARRAY_TO_STRING`, `ARRAY_UNIQUE`, `ARRAYS_OVERLAP`,
-`ARRAY_AGG`, `ARRAY_FLATTEN(arr, depth)` and the `FILTER`/`TRANSFORM`/`REDUCE` lambdas — a
-JSON array is cast to DuckDB's list form, and a searched value is encoded as a VARIANT so
-both sides compare the way Snowflake compares them. A **VARIANT-typed array** (`v::VARIANT`,
-`TO_VARIANT('["a"]')`, a bare VARIANT column) is not one of those forms, and stays a loud
-error rather than a guess — see the list below. `WHERE ARRAY_CONTAINS('admin',
-payload:tags)` therefore filters VARIANT rows and staged records alike, and `LATERAL
-FLATTEN(input => ...)` / `TABLE(FLATTEN(...))` read a VARIANT column, a `col:path` or JSON.
+Snowflake's array functions work over a native array, one the emulator stores as JSON
+(`col:names`, `$1:names`, `PARSE_JSON('[...]')`), and a VARIANT-typed array (`v::VARIANT`,
+`TO_VARIANT(ARRAY_CONSTRUCT(...))`, `col:path::VARIANT`, or a bare VARIANT/ARRAY column):
+`ARRAY_CONTAINS`, `ARRAY_SIZE`, `ARRAY_SLICE`/`SLICE`, `ARRAY_APPEND`, `ARRAY_CAT`,
+`ARRAY_COMPACT`, `ARRAY_DISTINCT`, `ARRAY_EXCEPT`, `ARRAY_INSERT`, `ARRAY_INTERSECTION`,
+`ARRAY_POSITION`, `ARRAY_PREPEND`, `ARRAY_REMOVE`, `ARRAY_REMOVE_AT`, `ARRAY_REPEAT`,
+`ARRAY_TO_STRING`, `ARRAY_UNIQUE`, `ARRAYS_OVERLAP`, `ARRAY_AGG`,
+`ARRAY_FLATTEN(arr, depth)` and the `FILTER`/`TRANSFORM`/`REDUCE` lambdas — a JSON array
+is cast to DuckDB's `JSON[]`, a VARIANT array to `VARIANT[]`, and a searched value is
+encoded as a VARIANT so both sides compare the way Snowflake compares them (the string
+`'1'` is not the number `1`).
+`WHERE ARRAY_CONTAINS('admin', payload:tags)` therefore filters VARIANT rows and staged
+records alike, and `LATERAL FLATTEN(input => ...)` / `TABLE(FLATTEN(...))` read a VARIANT
+column, a `col:path` or JSON.
 
 Not translated, and left as a loud error rather than a guess:
 
-- a **VARIANT-typed array** (`ARRAY_CONTAINS('a', v::VARIANT)`, `TO_VARIANT('["a"]')`, a
-  `'["a"]'::VARIANT` literal, `col:path::VARIANT`, or a bare VARIANT column): only an operand
-  the emulator recognises as JSON (`col:path`, `$1:path`, `PARSE_JSON('[...]')`) is cast to
-  DuckDB's list form. A VARIANT is not JSON to DuckDB, and its own `VARIANT` -> `JSON[]` cast
-  is no substitute — built from text, it returns unquoted element text (`ada` where the
-  element is `"ada"`), so a present value would search as absent; whether a bare column holds
-  an array is known only at run time in any case. Write the array as `PARSE_JSON('[...]')` or
-  reach it through a `col:path`;
+- **ordering a VARIANT array** (`ARRAY_SORT`, `ARRAY_MAX`, `ARRAY_MIN` over `v`,
+  `v::VARIANT`, or `PARSE_JSON('[...]')::VARIANT`): DuckDB's `list_sort`/`list_max`/
+  `list_min` do not order `VARIANT[]` the way their own `<` operator does — for strings it
+  goes by length, so `['aa','ab','b']` comes back `['b','aa','ab']` where Snowflake sorts it
+  lexicographically. Reach the array through a JSON path (`col:path`, which stays `JSON[]`
+  and sorts correctly) or write it as an `ARRAY_CONSTRUCT` list;
 - a **mixed pair** where one operand is a JSON array and the other a native list
   (`ARRAY_EXCEPT(j:n, ARRAY_CONSTRUCT('a'))`): DuckDB has no common list type for them, and
   casting a `VARCHAR[]` to `JSON[]` silently loses its values;

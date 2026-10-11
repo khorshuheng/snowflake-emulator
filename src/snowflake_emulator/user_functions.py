@@ -48,10 +48,10 @@ The trade-offs, all deliberate:
 * a function becomes reachable through a dispatcher once it is overloaded and stays that
   way for the life of the process, because a registered native function cannot be
   unregistered;
-* a *single* overload keeps using a plain macro, and so inherits the emulator's existing
-  limitation that a bare ``ARRAY`` column is not recognised as a JSON array (the same
-  reason ``ARRAY_SIZE(arr_col)`` fails); the dispatcher's ``VARCHAR[]`` normalization is
-  what makes an overloaded ARRAY parameter work against such a column.
+* a *single* overload keeps using a plain macro; an overloaded call goes through the
+  dispatcher, which is told each argument's SQL type and normalizes an ARRAY argument to
+  ``VARCHAR[]`` so the body sees an ``ARRAY`` column and an ``ARRAY_CONSTRUCT`` literal the
+  same way.
 """
 
 from __future__ import annotations

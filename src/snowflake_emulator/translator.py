@@ -506,15 +506,68 @@ def _is_json_array_value(node: exp.Expression) -> bool:
     return isinstance(node, exp.ArraySlice) and _is_json_array_value(node.this)
 
 
-def _json_list(node: exp.Expression | None) -> exp.Expression | None:
-    """Present a Snowflake array to DuckDB as a LIST: a JSON value becomes ``JSON[]``.
+def _is_variant_list(node: exp.Expression) -> bool:
+    """True for a ``CAST(... AS VARIANT[])``, the list form these rewrites produce."""
+    return (
+        isinstance(node, exp.Cast)
+        and isinstance(node.to, exp.DataType)
+        and node.to.this == exp.DataType.Type.ARRAY
+        and any(
+            isinstance(inner, exp.DataType) and inner.this == exp.DataType.Type.VARIANT
+            for inner in node.to.expressions
+        )
+    )
 
-    Anything else (a native DuckDB list, or a bare column whose type is only known at run
-    time) is returned unchanged.
+
+def _is_variant_array_value(node: exp.Expression) -> bool:
+    """True for expressions the emulator evaluates to DuckDB's VARIANT[] type.
+
+    Covers a VARIANT value, a ``CAST(... AS VARIANT[])``, and an ``ARRAY_SLICE`` over
+    either -- which this module turns into a VARIANT[] call, so an enclosing call must
+    treat it as an array too.
     """
+    if _is_variant_value(node) or _is_variant_list(node):
+        return True
+    return isinstance(node, exp.ArraySlice) and _is_variant_array_value(node.this)
+
+
+def _json_list(node: exp.Expression | None) -> exp.Expression | None:
+    """Present a JSON array to DuckDB as ``JSON[]``; anything else is unchanged."""
     if node is None or _is_json_list(node) or not _is_json_value(node):
         return node
     return exp.cast(node, exp.DataType.build("JSON[]"), dialect=WRITE_DIALECT)
+
+
+def _array_list(node: exp.Expression | None) -> exp.Expression | None:
+    """Present a Snowflake array to DuckDB as a LIST.
+
+    A JSON array becomes ``JSON[]`` and a VARIANT array becomes ``VARIANT[]``: both are
+    real DuckDB lists, so they bind the list functions, and their elements compare as
+    VARIANT values the way Snowflake compares them. An operand whose type is only known at
+    run time -- a bare column -- is cast through VARIANT to ``VARIANT[]``: Snowflake keeps
+    an ARRAY as DuckDB JSON and a VARIANT as VARIANT, and a native list reaches it too. An
+    operand already in one of those list forms, a native DuckDB list, or a call whose
+    result is already a list, is left alone.
+    """
+    if node is None or _is_json_list(node) or _is_variant_list(node):
+        return node
+    if _is_json_value(node):
+        return _json_list(node)
+    if isinstance(node, exp.Array):
+        return node
+    variant = exp.DataType.build("VARIANT", dialect=WRITE_DIALECT)
+    if _is_variant_value(node):
+        return exp.cast(node, exp.DataType.build("VARIANT[]"), dialect=WRITE_DIALECT)
+    if isinstance(node, (exp.Column, exp.Placeholder, exp.Parameter)):
+        # ``CAST(json AS VARIANT[])`` raises, so go through VARIANT first; a VARIANT or a
+        # native list is unaffected by the extra cast.
+        return exp.cast(
+            exp.cast(node, variant, dialect=WRITE_DIALECT),
+            exp.DataType.build("VARIANT[]"),
+            dialect=WRITE_DIALECT,
+        )
+    # Any other expression is a call this module already rewrote to a list result.
+    return node
 
 
 def _json_element(node: exp.Expression | None) -> exp.Expression | None:
@@ -522,6 +575,73 @@ def _json_element(node: exp.Expression | None) -> exp.Expression | None:
     if node is None or _is_json_value(node) or _is_variant_value(node):
         return node
     return exp.func("to_json", node)
+
+
+def _variant_element(node: exp.Expression | None) -> exp.Expression | None:
+    """Encode a searched value as a VARIANT so it compares against ``VARIANT[]`` elements.
+
+    Going through ``TO_JSON`` keeps the VARIANT's representation in step with an array built
+    from ``PARSE_JSON``: a JSON number becomes a ``UINT64`` VARIANT where ``CAST(2 AS
+    VARIANT)`` is an ``INT32``, and DuckDB's ``array_contains`` does not treat those as equal.
+    """
+    variant = exp.DataType.build("VARIANT", dialect=WRITE_DIALECT)
+    if node is None or _is_variant_value(node):
+        return node
+    if _is_json_value(node):
+        return exp.cast(node, variant, dialect=WRITE_DIALECT)
+    return exp.cast(exp.func("to_json", node), variant, dialect=WRITE_DIALECT)
+
+
+def _encoded_element(
+    value: exp.Expression | None, array: exp.Expression | None
+) -> exp.Expression | None:
+    """Encode a searched value the way ``array``'s element type needs it."""
+    if _is_json_array_value(array):
+        return _json_element(value)
+    if _is_variant_array_value(array):
+        return _variant_element(value)
+    return value
+
+
+def _has_variant_list(node: exp.Expression) -> bool:
+    """True when `node` holds a ``VARIANT[]`` cast -- the array functions' mark for one."""
+    return _is_variant_list(node) or any(
+        _is_variant_list(cast) for cast in node.find_all(exp.Cast)
+    )
+
+
+def _rewrite_ordering_function(node: exp.Expression) -> exp.Expression:
+    """``ARRAY_SORT``/``ARRAY_MAX``/``ARRAY_MIN`` over a JSON or native list only.
+
+    DuckDB's ``list_sort``/``list_max``/``list_min`` do not order ``VARIANT[]`` the way its
+    own ``<`` operator does -- for strings it goes by length, so DuckDB returns
+    ``['apple','other','datafile']`` where Snowflake returns ``['apple','datafile','other']``
+    -- and DuckDB raises or crashes outright for a bare VARIANT. A JSON array (``col:path``,
+    ``PARSE_JSON('[...]')``) sorts correctly, and a native list keeps DuckDB's own order, so
+    only a VARIANT or run-time-typed operand is rejected.
+    """
+    array = _rewrite_json_array_functions(node.this)
+    if _is_json_array_value(array):
+        node.set("this", _json_list(array))
+        return node
+    if (
+        isinstance(array, (exp.Column, exp.Placeholder, exp.Parameter))
+        or _is_variant_array_value(array)
+        or _has_variant_list(array)
+    ):
+        name = type(node).__name__
+        name = {
+            exp.ArrayMax: "ARRAY_MAX",
+            exp.ArrayMin: "ARRAY_MIN",
+            exp.SortArray: "ARRAY_SORT",
+        }.get(type(node), name)
+        raise TranslationError(
+            f"{name} over a VARIANT-typed array is not supported by the emulator: DuckDB "
+            "orders VARIANT values differently from Snowflake. Reach the array through a "
+            "JSON path (col:path) or use an ARRAY_CONSTRUCT list."
+        )
+    node.set("this", array)
+    return node
 
 
 def _sql(node: exp.Expression | None, default: str = "NULL") -> str:
@@ -584,9 +704,7 @@ def _rewrite_array_slice(node: exp.Expression) -> exp.Expression:
     if start is None or end is None:
         # Snowflake requires both bounds; without one, DuckDB would return NULL instead.
         raise TranslationError("ARRAY_SLICE requires both a start and an end index.")
-    operand = _rewrite_json_array_functions(node.this)
-    if _is_json_array_value(operand) and not _is_json_list(operand):
-        operand = exp.cast(operand, exp.DataType.build("JSON[]"), dialect=WRITE_DIALECT)
+    operand = _array_list(_rewrite_json_array_functions(node.this))
     return exp.func(
         "array_slice",
         operand,
@@ -603,11 +721,11 @@ def _rewrite_array_contains(node: exp.Expression) -> exp.Expression:
     form below is equivalent (checked against that CASE for a found/absent value, a NULL
     value, and an array holding NULL) while naming the value once.
     """
-    array = _json_list(_rewrite_json_array_functions(node.this))
+    array = _array_list(_rewrite_json_array_functions(node.this))
     value = _rewrite_json_array_functions(node.args.get("expression"))
-    if _is_json_array_value(array):
-        # Only a JSON element needs encoding: against a native list the value keeps its type.
-        value = _json_element(value)
+    # A VARIANT/JSON element is encoded so both sides compare as VARIANT values; against a
+    # native list the value keeps its type.
+    value = _encoded_element(value, array)
     array_sql = _sql(array)
     return sqlglot.parse_one(
         f"COALESCE(ARRAY_CONTAINS({array_sql}, {_sql(value)}), "
@@ -618,30 +736,28 @@ def _rewrite_array_contains(node: exp.Expression) -> exp.Expression:
 
 def _rewrite_array_size(node: exp.Expression) -> exp.Expression:
     """``ARRAY_SIZE(col:path)``: DuckDB needs a LIST, not the JSON the array is stored as."""
-    node.set("this", _json_list(_rewrite_json_array_functions(node.this)))
+    node.set("this", _array_list(_rewrite_json_array_functions(node.this)))
     return node
 
 
 def _rewrite_array_position(node: exp.Expression) -> exp.Expression:
     """``ARRAY_POSITION`` is 0-based, and 0 rather than NULL when the value is absent."""
-    array = _rewrite_json_array_functions(node.this)
-    value = _rewrite_json_array_functions(node.args.get("expression"))
-    if _is_json_array_value(array):
-        value = _json_element(value)
+    array = _array_list(_rewrite_json_array_functions(node.this))
+    value = _encoded_element(
+        _rewrite_json_array_functions(node.args.get("expression")), array
+    )
     return sqlglot.parse_one(
-        f"COALESCE(ARRAY_POSITION({_sql(_json_list(array))}, {_sql(value)}) - 1, 0)",
+        f"COALESCE(ARRAY_POSITION({_sql(array)}, {_sql(value)}) - 1, 0)",
         read=WRITE_DIALECT,
     )
 
 
 def _rewrite_array_prepend(node: exp.Expression) -> exp.Expression:
     """sqlglot's ``LIST_PREPEND`` does not bind in DuckDB; build it from ``LIST_CONCAT``."""
-    array = _rewrite_json_array_functions(node.args.get("expression"))
-    value = _rewrite_json_array_functions(node.this)
-    if _is_json_array_value(array):
-        value = _json_element(value)
+    array = _array_list(_rewrite_json_array_functions(node.args.get("expression")))
+    value = _encoded_element(_rewrite_json_array_functions(node.this), array)
     return sqlglot.parse_one(
-        f"LIST_CONCAT([{_sql(value)}], {_sql(_json_list(array))})", read=WRITE_DIALECT
+        f"LIST_CONCAT([{_sql(value)}], {_sql(array)})", read=WRITE_DIALECT
     )
 
 
@@ -649,20 +765,25 @@ def _rewrite_array_unique(node: exp.Expression) -> exp.Expression:
     """DuckDB's ``array_unique`` returns a *count*; Snowflake's returns the distinct array."""
     if len(node.expressions) != 1:
         raise TranslationError("ARRAY_UNIQUE takes a single array argument.")
-    array = _json_list(_rewrite_json_array_functions(node.expressions[0]))
+    array = _array_list(_rewrite_json_array_functions(node.expressions[0]))
     return exp.func("list_distinct", array)
 
 
 def _rewrite_array_set_operation(node: exp.Expression) -> exp.Expression:
-    """``ARRAY_EXCEPT``/``ARRAYS_OVERLAP``: sqlglot's rendering does not bind a JSON[].
+    """``ARRAY_EXCEPT``/``ARRAYS_OVERLAP``: sqlglot's rendering does not bind a JSON[]/VARIANT[].
 
     A native pair keeps sqlglot's rendering (and with it the multiset semantics it models);
-    only a JSON operand is rebuilt, where DuckDB has no equivalent for the ``&&`` operator
-    or the zip-based except.
+    only a JSON or VARIANT operand is rebuilt, where DuckDB has no equivalent for the ``&&``
+    operator or the zip-based except.
     """
-    left = _json_list(_rewrite_json_array_functions(node.this))
-    right = _json_list(_rewrite_json_array_functions(node.args.get("expression")))
-    if not (_is_json_list(left) or _is_json_list(right)):
+    left = _array_list(_rewrite_json_array_functions(node.this))
+    right = _array_list(_rewrite_json_array_functions(node.args.get("expression")))
+    if not (
+        _is_json_list(left)
+        or _is_json_list(right)
+        or _is_variant_list(left)
+        or _is_variant_list(right)
+    ):
         return node
     if isinstance(node, exp.ArrayOverlaps):
         return exp.func("list_has_any", left, right)
@@ -705,9 +826,23 @@ def _rewrite_array_flatten(node: exp.Expression) -> exp.Expression:
         raise TranslationError(
             f"ARRAY_FLATTEN depth must be between 1 and {_ARRAY_FLATTEN_MAX_DEPTH}."
         )
-    array = _json_list(_rewrite_json_array_functions(array))
+    array = _array_list(_rewrite_json_array_functions(array))
     sql = _sql(array)
     for _ in range(levels):
+        if _is_variant_list(array):
+            # A VARIANT[] whose elements are VARIANT arrays: cast each back to VARIANT[] a
+            # level at a time. A level whose elements are no longer arrays is left alone,
+            # where Snowflake simply stops flattening.
+            all_arrays = (
+                f"LIST_COUNT(LIST_FILTER({sql}, _sfemu_outer -> "
+                f"variant_typeof(_sfemu_outer) LIKE 'ARRAY%')) = LIST_COUNT({sql})"
+            )
+            flattened = (
+                f"FLATTEN(LIST_TRANSFORM({sql}, "
+                f"_sfemu_inner -> CAST(_sfemu_inner AS VARIANT[])))"
+            )
+            sql = f"CASE WHEN {all_arrays} THEN {flattened} ELSE {sql} END"
+            continue
         if not _is_json_list(array):
             sql = f"FLATTEN({sql})"
             continue
@@ -727,9 +862,16 @@ def _rewrite_array_flatten(node: exp.Expression) -> exp.Expression:
 
 def _rewrite_array_to_string(node: exp.Expression) -> exp.Expression:
     """sqlglot casts each element with ``CAST(x AS TEXT)``, keeping a JSON string's quotes."""
-    array = _rewrite_json_array_functions(node.this)
+    array = _array_list(_rewrite_json_array_functions(node.this))
     known = {"this", "expression", "null_is_empty", "null_delim_is_null"}
-    if not _is_json_array_value(array) or set(node.args) - known:
+    if set(node.args) - known:
+        return node
+    if _is_variant_array_value(array):
+        # VARIANT elements are already the values themselves, so sqlglot's ``CAST(x AS
+        # TEXT)`` rendering returns their text; only the array needs a list form.
+        node.set("this", array)
+        return node
+    if not _is_json_array_value(array):
         return node
     return sqlglot.parse_one(
         f"ARRAY_TO_STRING(LIST_TRANSFORM({_sql(_json_list(array))}, "
@@ -742,22 +884,31 @@ def _rewrite_array_to_string(node: exp.Expression) -> exp.Expression:
 def _cast_array_operands(node: exp.Expression) -> exp.Expression:
     """Cast the array operand(s) of a call sqlglot otherwise renders faithfully.
 
-    A searched value is encoded with ``TO_JSON`` when the array it is compared against is
-    JSON, so the comparison happens between VARIANT values, as Snowflake does.
+    A searched value is encoded with ``TO_JSON``/``CAST(... AS VARIANT)`` when the array it
+    is compared against is JSON/VARIANT, so the comparison happens between VARIANT values,
+    as Snowflake does.
     """
-    array_is_json = _is_json_array_value(node.this)
-    if isinstance(node.this, exp.Expression):
+    if isinstance(node, exp.ArrayAgg):
+        # The argument is a value to aggregate, not an array to index into: only a JSON
+        # value is cast, so it aggregates as one element the way Snowflake does.
         node.set("this", _json_list(_rewrite_json_array_functions(node.this)))
+        return node
+    array = None
+    if isinstance(node.this, exp.Expression):
+        array = _array_list(_rewrite_json_array_functions(node.this))
+        node.set("this", array)
     if isinstance(node, _ARRAY_VALUE_FUNCTIONS):
         value = node.args.get("expression")
         if isinstance(value, exp.Expression):
-            encoded = _json_element(_rewrite_json_array_functions(value))
-            node.set("expression", encoded if array_is_json else value)
+            node.set(
+                "expression",
+                _encoded_element(_rewrite_json_array_functions(value), array),
+            )
     if node.args.get("expressions"):
         node.set(
             "expressions",
             [
-                _json_list(_rewrite_json_array_functions(e))
+                _array_list(_rewrite_json_array_functions(e))
                 if isinstance(e, exp.Expression)
                 else e
                 for e in node.args["expressions"]
@@ -770,16 +921,16 @@ def _rewrite_json_array_function(node: exp.Expression) -> exp.Expression:
     """Make a Snowflake array function work over a VARIANT/JSON array.
 
     A Snowflake array the emulator stores as DuckDB JSON (``col:path``, ``$1:path``,
-    ``PARSE_JSON('[...]')``) is rejected by DuckDB's list functions, which take a LIST. The
-    array operand is therefore cast to ``JSON[]``, a searched value is encoded with
-    ``TO_JSON`` so both sides compare as VARIANT values the way Snowflake compares them, and
-    the functions whose sqlglot mapping is wrong for *any* operand (indexing, ``SLICE``,
-    ``ARRAY_UNIQUE``, ``ARRAY_REPEAT``, ``ARRAY_FLATTEN``) are rebuilt. A VARIANT-typed
-    operand (``x::VARIANT``, ``TO_VARIANT('[...]')``, a bare VARIANT column) is left alone: it
-    is not JSON to DuckDB, and DuckDB's own ``VARIANT`` -> ``JSON[]`` cast is no substitute --
+    ``PARSE_JSON('[...]')``) is rejected by DuckDB's list functions, which take a LIST, so
+    the array operand is cast to ``JSON[]``; a VARIANT-typed array (``x::VARIANT``,
+    ``TO_VARIANT('[...]')``, a bare VARIANT column) is cast to ``VARIANT[]``, a real DuckDB
+    list whose elements keep their VARIANT comparison semantics. A searched value is encoded
+    with ``TO_JSON``/``CAST(... AS VARIANT)`` so both sides compare as VARIANT values the way
+    Snowflake compares them. DuckDB's own ``VARIANT`` -> ``JSON[]`` cast is no substitute:
     for a VARIANT built from text it returns unquoted element text (``ada`` for ``"ada"``),
-    so the search would compare unequal against ``TO_JSON(...)``. Whether a bare column holds
-    an array is known only at run time in any case.
+    so the search would compare unequal against ``TO_JSON(...)``. The functions whose sqlglot
+    mapping is wrong for *any* operand (indexing, ``SLICE``, ``ARRAY_UNIQUE``,
+    ``ARRAY_REPEAT``, ``ARRAY_FLATTEN``) are rebuilt.
 
     Called only once the operands have had their own rewrites applied (see
     ``_rewrite_json_array_functions``), because the replacement is built from their SQL.
@@ -794,6 +945,8 @@ def _rewrite_json_array_function(node: exp.Expression) -> exp.Expression:
         return _rewrite_array_to_string(node)
     if isinstance(node, (exp.ArrayExcept, exp.ArrayOverlaps)):
         return _rewrite_array_set_operation(node)
+    if isinstance(node, (exp.ArrayMax, exp.ArrayMin, exp.SortArray)):
+        return _rewrite_ordering_function(node)
     name = _array_call_name(node)
     if name == "ARRAY_UNIQUE":
         return _rewrite_array_unique(node)
@@ -983,6 +1136,26 @@ def _rewrite_snowflake_specifics(node: exp.Expression) -> exp.Expression:
             stripped = node.copy()
             stripped.set("expressions", [])
             return stripped
+
+    # ``CREATE VOLATILE TABLE`` is Snowflake's (deprecated) synonym for
+    # ``CREATE TEMPORARY TABLE``. sqlglot's DuckDB generator drops the VOLATILE marker,
+    # which would silently create a permanent table, so it is swapped for the property
+    # DuckDB understands and the table keeps its session-scoped lifetime.
+    if isinstance(node, exp.Create):
+        properties = node.args.get("properties")
+        if properties is not None and any(
+            isinstance(prop, exp.VolatileProperty) for prop in properties.expressions
+        ):
+            rewritten = node.copy()
+            rewritten_properties = rewritten.args["properties"]
+            rewritten_properties.set(
+                "expressions",
+                [
+                    exp.TemporaryProperty() if isinstance(prop, exp.VolatileProperty) else prop
+                    for prop in rewritten_properties.expressions
+                ],
+            )
+            return rewritten
 
     # ``MERGE ... UPDATE SET t.col = ...`` -> unqualified target column. DuckDB rejects
     # the target-table qualifier on the left side of a SET assignment.

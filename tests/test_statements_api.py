@@ -470,15 +470,84 @@ def test_uninterpreted_function_is_left_to_duckdb(client):
     assert "NOT_A_REAL_FUNCTION" in resp.json()["detail"]["message"]
 
 
-def test_array_functions_over_a_bare_variant_column_still_error(client):
-    """A bare VARIANT column has no static array type, so this stays a loud error."""
+def test_array_functions_over_a_bare_variant_array(client):
+    """A bare VARIANT column (and ``x::VARIANT``) is presented as ``VARIANT[]``, not left raw.
+
+    DuckDB rejects a VARIANT where its list functions want a LIST (``Binder Error: length
+    can only be used on arrays or lists``), so the operand is cast through VARIANT to
+    ``VARIANT[]`` -- a real list whose elements keep Snowflake's VARIANT comparison
+    semantics (``'1'`` and ``1`` are different values).
+    """
     def post(statement):
         return client.post("/api/v2/statements", json={"statement": statement})
 
-    assert post("CREATE TABLE bare (names VARIANT)").status_code == 200
-    assert post("INSERT INTO bare SELECT PARSE_JSON('[\"ada\"]')").status_code == 200
-    resp = post("SELECT ARRAY_CONTAINS('ada', names) FROM bare")
-    assert resp.status_code == 422
+    assert post("CREATE TABLE bare (names VARIANT, nums VARIANT)").status_code == 200
+    assert (
+        post(
+            "INSERT INTO bare SELECT PARSE_JSON('[\"ada\",\"bob\"]'), "
+            "PARSE_JSON('[3,1,2]')"
+        ).status_code
+        == 200
+    )
+
+    for statement, expected in (
+        ("SELECT ARRAY_CONTAINS('ada', names) FROM bare", [[True]]),
+        ("SELECT ARRAY_CONTAINS(CAST('ada' AS VARIANT), names) FROM bare", [[True]]),
+        ("SELECT ARRAY_CONTAINS('zoe', names) FROM bare", [[False]]),
+        ("SELECT ARRAY_CONTAINS('ada', names::VARIANT) FROM bare", [[True]]),
+        ("SELECT ARRAY_CONTAINS('ada', TO_VARIANT(names)) FROM bare", [[True]]),
+        ("SELECT ARRAY_CONTAINS(2, nums) FROM bare", [[True]]),
+        # A string is not the number it spells, as in Snowflake.
+        ("SELECT ARRAY_CONTAINS('2', nums) FROM bare", [[False]]),
+        ("SELECT ARRAY_SIZE(names) FROM bare", [[2]]),
+        ("SELECT ARRAY_POSITION('bob', names) FROM bare", [[1]]),
+        ("SELECT ARRAY_POSITION('zoe', names) FROM bare", [[0]]),
+        ("SELECT ARRAY_SLICE(names, 0, 0) FROM bare", [[['ada']]]),
+        ("SELECT ARRAY_CONTAINS('ada', ARRAY_SLICE(names, 0, 0)) FROM bare", [[True]]),
+        ("SELECT ARRAY_EXCEPT(names, names) FROM bare", [[[]]]),
+        ("SELECT ARRAYS_OVERLAP(names, names) FROM bare", [[True]]),
+        ("SELECT ARRAY_TO_STRING(names, '|') FROM bare", [['ada|bob']]),
+        ("SELECT ARRAY_SIZE(ARRAY_AGG(names)) FROM bare", [[1]]),
+    ):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        assert resp.json()["data"] == expected, statement
+
+
+def test_array_ordering_over_a_variant_array_is_rejected(client):
+    """DuckDB's list_sort/list_max/list_min order VARIANT by length, not by the ``<`` operator.
+
+    ``['aa','ab','b']`` comes back ``['b','aa','ab']`` where Snowflake sorts it
+    lexicographically, so an ordering function over a VARIANT array is a loud error rather
+    than a silently wrong order. A JSON path (a ``JSON[]`` list) still sorts correctly.
+    """
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    assert post("CREATE TABLE ord (names VARIANT, j VARIANT)").status_code == 200
+    assert (
+        post(
+            "INSERT INTO ord SELECT PARSE_JSON('[\"aa\",\"ab\",\"b\"]'), "
+            "PARSE_JSON('{\"names\":[\"aa\",\"ab\",\"b\"]}')"
+        ).status_code
+        == 200
+    )
+
+    for statement in (
+        "SELECT ARRAY_SORT(names) FROM ord",
+        "SELECT ARRAY_SORT(names::VARIANT) FROM ord",
+        "SELECT ARRAY_SORT(ARRAY_UNIQUE(names)) FROM ord",
+        "SELECT ARRAY_MAX(names) FROM ord",
+        "SELECT ARRAY_MIN(names) FROM ord",
+    ):
+        resp = post(statement)
+        assert resp.status_code == 422, (statement, resp.json())
+        assert "VARIANT" in resp.json()["detail"]["message"]
+
+    # The JSON path (stored as JSON[], which DuckDB sorts lexicographically) still works.
+    sorted_json = post("SELECT ARRAY_SORT(j:names) FROM ord")
+    assert sorted_json.status_code == 200, sorted_json.json()
+    assert sorted_json.json()["data"] == [[['aa', 'ab', 'b']]]
 
 
 def test_array_functions_over_staged_json(client, tmp_path):
