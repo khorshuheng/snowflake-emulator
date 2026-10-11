@@ -196,6 +196,13 @@ def test_show_tables_like_and_starts_with_filter(client):
     assert names(_post(client, "SHOW TABLES LIKE 'zzz%'")) == []
     assert names(_post(client, "SHOW TABLES STARTS WITH 'BET'")) == ["BETA_TWO"]
     assert names(_post(client, "SHOW TABLES LIMIT 1")) == ["ALPHA_ONE"]
+    # The IN-scoped form takes LIKE before IN, as Snowflake's grammar does.
+    _post(client, "CREATE SCHEMA like_schema")
+    _post(client, "CREATE TABLE like_schema.alpha_scoped (a INT)")
+    assert names(_post(client, "SHOW TABLES LIKE 'alpha%' IN SCHEMA EMULATOR_DB.LIKE_SCHEMA")) == [
+        "ALPHA_SCOPED"
+    ]
+    assert _post(client, "SHOW TABLES LIKE 'zzz%' IN SCHEMA EMULATOR_DB.LIKE_SCHEMA").json()["data"] == []
 
 
 def test_show_tables_in_database_spans_schemas(client):

@@ -37,6 +37,22 @@ def test_unparseable_sql_reports_compilation_error(client):
     assert detail["code"] == "001003"
 
 
+def test_parse_error_has_no_ansi_escapes_and_no_stray_hint(client):
+    detail = _post(client, "SELEKT * FROM nowhere").json()["detail"]
+    assert "\x1b" not in detail["message"]
+    assert "LIKE before IN" not in detail["message"]
+
+
+def test_show_like_after_in_names_the_snowflake_clause_order(client):
+    """``SHOW ... IN ... LIKE`` is MySQL's order; Snowflake wants LIKE first, so say so."""
+    resp = _post(client, "SHOW TABLES IN SCHEMA EMULATOR_DB.PUBLIC LIKE 'a%'")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert (detail["sqlState"], detail["code"]) == ("42000", "001003")
+    assert "LIKE before IN" in detail["message"]
+    assert "SHOW TABLES LIKE '<pattern>' IN SCHEMA <database>.<schema>." in detail["message"]
+
+
 def test_conversion_failure_reports_data_error(client):
     resp = _post(client, "SELECT CAST('abc' AS INT)")
     assert resp.status_code == 422

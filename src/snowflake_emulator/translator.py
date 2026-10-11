@@ -203,6 +203,30 @@ def preprocess_array_flatten(sql: str) -> str:
     return "".join(parts)
 
 
+# sqlglot underlines the offending token with ANSI escapes, which say nothing in an HTTP
+# error body.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+# Snowflake orders a SHOW's clauses as ``SHOW <object> [LIKE '<pattern>'] [IN <scope>]
+# [STARTS WITH '<name>']``, so the MySQL order (``... IN SCHEMA s LIKE 'x'``) does not
+# parse. The hint is confined to one statement, so a multi-statement body cannot
+# trigger it on an unrelated failure.
+_SHOW_CLAUSE_ORDER_RE = re.compile(
+    r"^\s*SHOW\b[^;]*\bIN\b[^;]*\bLIKE\b", re.IGNORECASE | re.DOTALL
+)
+
+
+def _parse_error_message(sql: str, exc: Exception) -> str:
+    """Explain a parse failure, naming the Snowflake clause order where that is the cause."""
+    message = _ANSI_ESCAPE_RE.sub("", str(exc))
+    if _SHOW_CLAUSE_ORDER_RE.search(sql):
+        message += (
+            "\nSnowflake puts LIKE before IN, e.g. "
+            "SHOW TABLES LIKE '<pattern>' IN SCHEMA <database>.<schema>."
+        )
+    return message
+
+
 def split_statements(sql: str) -> list[exp.Expression]:
     """Split a (possibly multi-statement) Snowflake SQL string into parsed expressions.
 
@@ -214,7 +238,7 @@ def split_statements(sql: str) -> list[exp.Expression]:
     try:
         expressions = sqlglot.parse(preprocess_array_flatten(sql), read=READ_DIALECT)
     except Exception as exc:  # noqa: BLE001 - surfaced to the caller as a translation error
-        raise TranslationError(f"Failed to parse SQL: {exc}") from exc
+        raise TranslationError(f"Failed to parse SQL: {_parse_error_message(sql, exc)}") from exc
 
     statements = [expr for expr in expressions if expr is not None]
     if not statements:
