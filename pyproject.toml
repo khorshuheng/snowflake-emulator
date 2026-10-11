@@ -12,6 +12,7 @@ dependencies = [
     "fastapi>=0.141.1",
     "pyarrow>=20",
     "pydantic-settings>=2.15.0",
+    "pytz>=2026.3.post1",
     "sqlglot>=30.21.0",
     "uvicorn[standard]>=0.52.1",
 ]

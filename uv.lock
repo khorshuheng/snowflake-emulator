@@ -925,6 +925,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "pyarrow" },
     { name = "pydantic-settings" },
+    { name = "pytz" },
     { name = "sqlglot" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -945,6 +946,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.141.1" },
     { name = "pyarrow", specifier = ">=20" },
     { name = "pydantic-settings", specifier = ">=2.15.0" },
+    { name = "pytz", specifier = ">=2026.3.post1" },
     { name = "sqlglot", specifier = ">=30.21.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.52.1" },
 ]
