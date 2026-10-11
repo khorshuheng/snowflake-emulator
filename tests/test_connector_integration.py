@@ -381,6 +381,30 @@ def test_copy_into_file_format_options(connection, tmp_path):
     assert cur.fetchall() == [(5, "q")]
 
 
+def test_variant_cells_are_typed_and_sent_as_json_text(connection):
+    """A DuckDB VARIANT cell is typed VARIANT and reaches the connector as JSON text."""
+    cur = connection.cursor()
+    cur.execute("CREATE OR REPLACE TABLE variant_text (s VARIANT, n VARIANT, b VARIANT, o VARIANT)")
+    cur.execute(
+        """INSERT INTO variant_text SELECT TO_VARIANT('y'), TO_VARIANT(42),
+           TO_VARIANT(true), TO_VARIANT(OBJECT_CONSTRUCT('k', 1))"""
+    )
+    cur.execute("SELECT s, n, b, o FROM variant_text")
+    row = cur.fetchone()
+    assert row[0] == '"y"'  # a string variant is quoted JSON text
+    assert json.loads(row[0]) == "y"
+    assert row[1] == "42"
+    assert row[2] == "true"
+    assert json.loads(row[3]) == {"k": 1}
+    assert [col.type_code for col in cur.description] == [
+        FIELD_ID_TO_NAME_LOOKUP["VARIANT"]
+    ] * 4
+
+    cur.execute("SELECT TO_VARIANT('42') AS v")
+    assert cur.fetchall() == [('"42"',)]  # the string, not the number
+    assert cur.fetch_arrow_all().column("V").to_pylist() == ['"42"']
+
+
 def test_semi_structured_text_cast(connection):
     """`col:path::VARCHAR` is the string itself, not the JSON text with its quotes."""
     cur = connection.cursor()

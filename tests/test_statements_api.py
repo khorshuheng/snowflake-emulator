@@ -389,6 +389,27 @@ def test_flatten_over_a_variant_column(client):
         assert {row[0] for row in resp.json()["data"]} == {'a', 'b'}
 
 
+def test_variant_cells_report_as_variant(client):
+    """A DuckDB VARIANT cell is typed `variant`, and the SQL API inlines its value."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    assert post("CREATE TABLE vk (s VARIANT, n VARIANT)").status_code == 200
+    assert (
+        post("INSERT INTO vk SELECT TO_VARIANT('y'), TO_VARIANT(42)").status_code == 200
+    )
+
+    selected = post("SELECT s, n FROM vk").json()
+    assert [col["type"] for col in selected["resultSetMetaData"]["rowType"]] == [
+        "variant",
+        "variant",
+    ]
+    assert selected["data"] == [["y", 42]]
+
+    described = post("DESCRIBE TABLE vk").json()["data"]
+    assert [(row[0], row[1]) for row in described] == [("S", "VARIANT"), ("N", "VARIANT")]
+
+
 def test_semi_structured_text_cast_returns_the_value(client):
     """`col:path::VARCHAR` returns the string itself, not DuckDB's JSON serialization (`'"y"'`)."""
     def post(statement):

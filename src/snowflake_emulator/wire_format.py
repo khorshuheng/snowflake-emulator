@@ -42,10 +42,16 @@ def column_wire_metadata(col: ColumnMeta) -> dict[str, Any]:
     }
 
 
-def encode_cell(value: Any, sf_type: str, scale: int) -> str | None:
+def encode_cell(value: Any, sf_type: str, scale: int, duckdb_type: str = "") -> str | None:
     """Encode a single Python value as the wire-format string for its Snowflake type."""
     if value is None:
         return None
+
+    if sf_type == "variant" and duckdb_type.strip().upper() == "VARIANT":
+        # A DuckDB VARIANT holds a plain value, while the wire carries the JSON text the
+        # connector decodes: a string variant is quoted, a number or boolean is not. A JSON
+        # cell is already JSON text, so it falls through to the generic handling below.
+        return json.dumps(value, default=str)
 
     if sf_type == "boolean":
         return "1" if value else "0"
@@ -96,6 +102,9 @@ def encode_rows(rows: list[list[Any]], columns: list[ColumnMeta]) -> list[list[s
     encoded: list[list[str | None]] = []
     for row in rows:
         encoded.append(
-            [encode_cell(value, col.type, scale) for value, col, scale in zip(row, columns, scales)]
+            [
+                encode_cell(value, col.type, scale, col.duckdb_type)
+                for value, col, scale in zip(row, columns, scales)
+            ]
         )
     return encoded

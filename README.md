@@ -243,13 +243,15 @@ Caveats:
   API (`$1:s` -> `y`, a number as a number, an object as an object), while the connector's
   wire protocol keeps returning VARIANT as its JSON text (`"y"`, `42`) — which is what that
   protocol and the Arrow path decode;
-- a **DuckDB VARIANT** cell (`TO_VARIANT(...)`, a `VARIANT` column) is reported as `text`
-  rather than `variant`, since the type mapping has no `VARIANT` entry, so those cells
-  arrive as plain strings; a `JSON` column or a `col:path` reports `variant` as Snowflake
-  does;
 - a **bare VARIANT column** cast to text (`SELECT variant_col::VARCHAR`) uses DuckDB's own
   VARIANT text form: right for a string, but an object shows as the variant's internal
-  form, so use `variant_col::JSON::VARCHAR` when you need the document text.
+  form, so use `variant_col::JSON::VARCHAR` when you need the document text;
+- a JSON value nested inside a **STRUCT/MAP** cell keeps its text
+  (`SELECT STRUCT_PACK(a := PARSE_JSON('1'))` -> `{'A': '1'}`, `MAP {'k': PARSE_JSON('1')}`,
+  or a DuckDB-flavoured `STRUCT(a JSON)` column): only a top-level JSON cell and the elements
+  of a `JSON[]` cell are decoded. Snowflake DDL cannot declare such a column (`OBJECT`,
+  `VARIANT` and `ARRAY` are its semi-structured types), so this is reachable only through
+  DuckDB-specific SQL and is left as it is;
 - A `:` path on a non-JSON column (`$1:key` over CSV/Parquet) yields NULL rather than
   Snowflake's compile error.
 - The stage's own `FILE_FORMAT` (`CREATE STAGE ... FILE_FORMAT = ...`) is not modelled,

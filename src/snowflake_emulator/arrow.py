@@ -49,6 +49,10 @@ def _arrow_type(col: ColumnMeta) -> pa.DataType:
 def _cell(value: Any, col: ColumnMeta) -> Any:
     if value is None:
         return None
+    if col.type == "variant" and (col.duckdb_type or "").strip().upper() == "VARIANT":
+        # As in the wire encoder: a DuckDB VARIANT is a plain value that must reach the
+        # connector as JSON text, while a JSON cell already is JSON text.
+        return json.dumps(value, default=str)
     if isinstance(value, (dict, list)):
         return json.dumps(value, default=str)
     if col.type == "time" and isinstance(value, datetime.time):

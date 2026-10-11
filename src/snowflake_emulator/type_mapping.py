@@ -38,8 +38,10 @@ _TYPE_MAP: dict[str, str] = {
     "TIMESTAMP_TZ": "timestamp_tz",
     "TIMESTAMPTZ": "timestamp_tz",
     "INTERVAL": "text",
-    # Semi-structured.
+    # Semi-structured. DuckDB's own VARIANT type holds a plain value; the emulator reports
+    # both kinds as ``variant`` because that is what Snowflake calls them.
     "JSON": "variant",
+    "VARIANT": "variant",
     # Snowflake has no native UUID/enum/union types; text is the closest match.
     "UUID": "text",
     "NULL": "text",
@@ -105,6 +107,7 @@ _SQL_TYPE_MAP: dict[str, str] = {
     "TIMESTAMP_LTZ": "TIMESTAMP_LTZ",
     "INTERVAL": "VARCHAR",
     "JSON": "VARIANT",
+    "VARIANT": "VARIANT",
     "UUID": "VARCHAR",
     "ENUM": "VARCHAR",
     "BIT": "VARCHAR",
