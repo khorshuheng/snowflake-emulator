@@ -236,9 +236,9 @@ class StageManager:
                     matches.append((rel, abs_path))
         return sorted(matches)
 def create_stage(manager: StageManager, session: SessionContext, statement: exp.Create) -> None:
-    """Stage directories are created lazily; CREATE STAGE is a metadata no-op."""
+    """Create the stage directory so an empty stage is visible to SHOW STAGES."""
     stage = parse_stage_ref("@" + statement.this.name)
-    manager.stage_dir(session, stage)  # ensure the directory exists
+    os.makedirs(manager.stage_dir(session, stage), exist_ok=True)
 
 
 def drop_stage(
@@ -254,22 +254,42 @@ def drop_stage(
     return target.name
 
 
-def show_stages(manager: StageManager, session: SessionContext) -> list[tuple[str, str, str, str]]:
-    """List known named stages as (name, database_name, schema_name, url)."""
+def show_stages(
+    manager: StageManager,
+    session: SessionContext,
+    database: str | None = None,
+    schema: str | None = None,
+) -> list[tuple[str, str, str, str]]:
+    """List named stages as (name, database_name, schema_name, url).
+
+    ``database``/``schema`` narrow the listing to one namespace; neither means every
+    named stage on disk, which is what an account-level listing asks for.
+    """
     named_root = os.path.join(manager.root, "named")
     rows: list[tuple[str, str, str, str]] = []
     if os.path.isdir(named_root):
         for db in sorted(os.listdir(named_root)):
+            if database is not None and db.lower() != database.lower():
+                continue
             db_dir = os.path.join(named_root, db)
             if not os.path.isdir(db_dir):
                 continue
-            for schema in sorted(os.listdir(db_dir)):
-                schema_dir = os.path.join(db_dir, schema)
+            for schema_name in sorted(os.listdir(db_dir)):
+                if schema is not None and schema_name.lower() != schema.lower():
+                    continue
+                schema_dir = os.path.join(db_dir, schema_name)
                 if not os.path.isdir(schema_dir):
                     continue
                 for name in sorted(os.listdir(schema_dir)):
                     if os.path.isdir(os.path.join(schema_dir, name)):
-                        rows.append((name, db, schema, f"s3://sfemu/{db}.{schema}.{name}"))
+                        rows.append(
+                            (
+                                name,
+                                db,
+                                schema_name,
+                                f"s3://sfemu/{db}.{schema_name}.{name}",
+                            )
+                        )
     return rows
 def _expand_local_files(spec: str) -> list[str]:
     """Expand ``file://``/``~``/globs in a PUT source spec to concrete paths."""

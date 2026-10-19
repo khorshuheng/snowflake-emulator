@@ -16,6 +16,8 @@ from snowflake_emulator.core.errors import ExecutionError
 from snowflake_emulator.core.results import ColumnMeta
 from snowflake_emulator.database import DuckDBManager
 from snowflake_emulator.engine.errors import as_execution_error
+from snowflake_emulator.engine.handlers.common import name_matches, show_name_patterns
+from snowflake_emulator.engine.handlers.show import show_limit
 from snowflake_emulator.file_formats import get_file_format_manager
 from snowflake_emulator.sessions import SessionContext
 from snowflake_emulator.translator import (
@@ -125,6 +127,12 @@ def execute_file_format_ddl(
             [fmt.name, fmt.database, fmt.schema, fmt.options.get("TYPE", "")]
             for fmt in get_file_format_manager().list(session)
         ]
+        prefix, like = show_name_patterns(statement)
+        if prefix or like:
+            rows = [row for row in rows if name_matches(str(row[0]), prefix, like)]
+        limit = show_limit(statement)
+        if limit is not None:
+            rows = rows[:limit]
         return (
             [
                 ColumnMeta(name="name", type="text"),

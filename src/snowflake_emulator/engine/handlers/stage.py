@@ -16,6 +16,8 @@ from sqlglot import exp
 from snowflake_emulator.core.errors import ExecutionError
 from snowflake_emulator.core.results import ColumnMeta, ExecutionResult, FileTransfer
 from snowflake_emulator.database import DuckDBManager
+from snowflake_emulator.engine.handlers.common import name_matches, show_name_patterns
+from snowflake_emulator.engine.handlers.show import show_limit, show_scope
 from snowflake_emulator.sessions import SessionContext
 from snowflake_emulator.stages import (
     StageError,
@@ -184,10 +186,20 @@ def execute_stage_ddl(
                 [["Statement executed successfully."]],
             )
         if kind == "SHOW_STAGES":
+            scope = show_scope(statement, session) if isinstance(statement, exp.Show) else None
+            database, schema = scope or (session.database, session.schema)
             rows = [
-                [name, db, schema, url]
-                for name, db, schema, url in show_stages(stages, session)
+                [name, db, schema_name, url]
+                for name, db, schema_name, url in show_stages(
+                    stages, session, database, schema
+                )
             ]
+            prefix, like = show_name_patterns(statement)
+            if prefix or like:
+                rows = [row for row in rows if name_matches(str(row[0]), prefix, like)]
+            limit = show_limit(statement)
+            if limit is not None:
+                rows = rows[:limit]
             return (
                 [
                     ColumnMeta(name="name", type="text"),

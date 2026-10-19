@@ -5,6 +5,9 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from sqlglot import exp
+
+from snowflake_emulator.core.constants import INFORMATION_SCHEMA_SCHEMA
 from snowflake_emulator.core.results import ColumnMeta
 from snowflake_emulator.type_mapping import (
     duckdb_type_to_snowflake,
@@ -12,6 +15,44 @@ from snowflake_emulator.type_mapping import (
 )
 
 _DECLARED_TYPE_OVERRIDE = re.compile(r"^(VARCHAR|CHAR|STRING|TEXT|BINARY|VARBINARY)\(\d+\)$")
+
+
+def show_name_patterns(
+    statement: exp.Expression,
+) -> tuple[str | None, str | None]:
+    """Return the ``(STARTS WITH, LIKE)`` name filters of a SHOW statement."""
+    if not isinstance(statement, exp.Show):
+        return None, None
+    prefix = statement.args.get("starts_with")
+    prefix = prefix.this if isinstance(prefix, exp.Literal) else None
+    like = statement.args.get("like")
+    like = like.this if isinstance(like, exp.Literal) else None
+    return prefix, like
+
+
+def name_matches(value: str, prefix: str | None, like: str | None) -> bool:
+    """Case-insensitive match for an in-memory SHOW result row."""
+    if prefix and not value.upper().startswith(prefix.upper()):
+        return False
+    if not like:
+        return True
+    # Translate SQL LIKE (``%``/``_``, backslash escape) to a regex.
+    parts: list[str] = []
+    i = 0
+    while i < len(like):
+        char = like[i]
+        if char == "\\" and i + 1 < len(like):
+            parts.append(re.escape(like[i + 1]))
+            i += 2
+            continue
+        if char == "%":
+            parts.append(".*")
+        elif char == "_":
+            parts.append(".")
+        else:
+            parts.append(re.escape(char))
+        i += 1
+    return re.fullmatch("".join(parts), value, re.IGNORECASE) is not None
 
 
 def result_columns(cursor: Any) -> tuple[list[ColumnMeta], list[list[Any]]]:
@@ -75,13 +116,16 @@ def temp_inclusive_scope(
     """
     schema_match = f" AND lower({alias}.schema_name) = lower('{schema}')" if schema else ""
     temp_schema_match = f" AND lower(current_schema()) = lower('{schema}')" if schema else ""
+    internal = (
+        f" AND lower({alias}.schema_name) != lower('{INFORMATION_SCHEMA_SCHEMA}')"
+    )
     shadowed = (
         " AND NOT EXISTS (SELECT 1 FROM duckdb_tables() sh"
         " WHERE lower(sh.database_name) = 'temp'"
         f" AND lower(sh.table_name) = lower({alias}.{name_column}))"
     )
     return (
-        f"((lower({alias}.database_name) = lower('{database}'){schema_match}{shadowed})"
+        f"((lower({alias}.database_name) = lower('{database}'){schema_match}{internal}{shadowed})"
         f" OR (lower({alias}.database_name) = 'temp'"
         f" AND lower(current_database()) = lower('{database}'){temp_schema_match}))"
     )

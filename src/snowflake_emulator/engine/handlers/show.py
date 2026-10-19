@@ -16,8 +16,10 @@ from snowflake_emulator.core.constants import INFORMATION_SCHEMA_SCHEMA
 from snowflake_emulator.core.results import ColumnMeta
 from snowflake_emulator.database import DuckDBManager
 from snowflake_emulator.engine.handlers.common import (
+    name_matches,
     prefer_declared_type,
     result_columns,
+    show_name_patterns,
     temp_inclusive_scope,
 )
 from snowflake_emulator.sessions import SessionContext
@@ -50,7 +52,7 @@ def show_scope(
     obj = str(statement.args.get("this") or "").upper()
     if obj == "SCHEMAS":
         return session.database, None
-    if obj in ("TABLES", "VIEWS", "OBJECTS"):
+    if obj in ("TABLES", "VIEWS", "OBJECTS", "SEQUENCES", "STAGES"):
         return session.database, session.schema
     return None
 
@@ -126,10 +128,7 @@ def execute_snowflake_show(
     database, schema = scope
 
     limit = show_limit(statement)
-    prefix = statement.args.get("starts_with")
-    prefix = prefix.this if isinstance(prefix, exp.Literal) else None
-    like = statement.args.get("like")
-    like = like.this if isinstance(like, exp.Literal) else None
+    prefix, like = show_name_patterns(statement)
 
     if obj == "SCHEMAS":
         sql = f"""
@@ -146,6 +145,7 @@ def execute_snowflake_show(
             FROM duckdb_schemas()
             WHERE lower(database_name) = lower('{database}')
               AND lower(schema_name) != 'main'
+              AND lower(schema_name) != lower('{INFORMATION_SCHEMA_SCHEMA}')
               {name_prefix_filter('schema_name', prefix)}
               {name_like_filter('schema_name', like)}
             ORDER BY schema_name
@@ -250,6 +250,8 @@ def execute_show_columns(
             " OR (lower(c.database_name) = 'temp' AND lower(current_schema()) = lower(?)))"
         )
         params.extend([schema, schema])
+    where.append("(lower(c.database_name) = 'temp' OR lower(c.schema_name) <> lower(?))")
+    params.append(INFORMATION_SCHEMA_SCHEMA)
     if table_name is not None:
         where.append("lower(c.table_name) = lower(?)")
         params.append(table_name)
@@ -292,6 +294,12 @@ def execute_show_columns(
             str(row[3])
         )
         converted.append([*row[:3], sf_type, *row[5:]])
+    prefix, like = show_name_patterns(statement)
+    if prefix or like:
+        converted = [row for row in converted if name_matches(row[2], prefix, like)]
+    limit = show_limit(statement)
+    if limit is not None:
+        converted = converted[:limit]
     return row_type, converted
 
 
@@ -462,8 +470,15 @@ def execute_show_misc(
             [session.warehouse],
         )
     elif obj == "SEQUENCES":
+        scope = show_scope(statement, session) if isinstance(statement, exp.Show) else None
+        database, schema = scope or (session.database, session.schema)
+        where = ["lower(database_name) = lower(?)"]
+        params: list[Any] = [database]
+        if schema is not None:
+            where.append("lower(schema_name) = lower(?)")
+            params.append(schema)
         cursor.execute(
-            """
+            f"""
             SELECT
                 NULL::TIMESTAMP AS created_on,
                 sequence_name AS name,
@@ -473,11 +488,10 @@ def execute_show_misc(
                 increment_by AS interval,
                 comment AS comment
             FROM duckdb_sequences()
-            WHERE lower(database_name) = lower(?)
-              AND lower(schema_name) = lower(?)
+            WHERE {' AND '.join(where)}
             ORDER BY name
             """,
-            [session.database, session.schema],
+            params,
         )
     elif obj == "PARAMETERS":
         cursor.execute(
@@ -506,7 +520,27 @@ def execute_show_misc(
         cursor.execute("SELECT NULL::VARCHAR AS name, NULL::TIMESTAMP AS created_on WHERE FALSE")
     else:
         return None
-    return result_columns(cursor)
+    row_type, rows = result_columns(cursor)
+    prefix, like = show_name_patterns(statement)
+    if prefix or like:
+        name_index = {
+            "DATABASES": 1,
+            "WAREHOUSES": 0,
+            "SEQUENCES": 1,
+            "PARAMETERS": 0,
+            "PROCEDURES": 0,
+            "USERS": 0,
+        }.get(obj)
+        if name_index is not None:
+            rows = [
+                row
+                for row in rows
+                if name_matches(str(row[name_index]), prefix, like)
+            ]
+    limit = show_limit(statement) if isinstance(statement, exp.Show) else None
+    if limit is not None:
+        rows = rows[:limit]
+    return row_type, rows
 
 
 # Snowflake's ``SHOW FUNCTIONS`` column set. The metadata is derived from a typed,

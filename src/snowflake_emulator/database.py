@@ -178,6 +178,7 @@ class DuckDBManager:
         def in_scope(alias: str) -> str:
             return (
                 f"({alias}.database_name = '{database}'"
+                f" AND lower({alias}.schema_name) != lower('{INFORMATION_SCHEMA_SCHEMA}')"
                 f" AND NOT EXISTS (SELECT 1 FROM duckdb_tables() sh"
                 f" WHERE lower(sh.database_name) = 'temp'"
                 f" AND lower(sh.table_name) = lower({alias}.table_name)))"
@@ -197,6 +198,7 @@ class DuckDBManager:
                 NULL::TIMESTAMP AS LAST_ALTERED
             FROM duckdb_schemas()
             WHERE database_name = '{database}'
+              AND lower(schema_name) NOT IN ('main', lower('{INFORMATION_SCHEMA_SCHEMA}'))
             """
         )
         self._connection.execute(
@@ -229,6 +231,7 @@ class DuckDBManager:
                 NULL::BIGINT AS BYTES
             FROM duckdb_views()
             WHERE database_name = '{database}'
+              AND lower(schema_name) != lower('{INFORMATION_SCHEMA_SCHEMA}')
             """
         )
         # Snowflake-only column metadata DuckDB discards: the declared SQL type

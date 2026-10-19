@@ -234,3 +234,108 @@ def test_show_views_and_objects_respect_scope_and_shadowing(client):
     assert objects() == [("T1", "TABLE"), ("V1", "TABLE")]
     assert [row[1] for row in _post(client, "SHOW TABLES", headers).json()["data"]] == ["T1", "V1"]
     assert _post(client, "SHOW VIEWS LIKE 'V%'", headers).json()["data"] == []
+
+
+def test_internal_information_schema_objects_are_hidden(client):
+    _post(client, "CREATE TABLE visible_t (a INT)")
+
+    schemas = _post(client, "SHOW SCHEMAS").json()["data"]
+    assert "SF_INFORMATION_SCHEMA" not in {row[1] for row in schemas}
+
+    tables = _post(client, "SHOW TABLES IN DATABASE EMULATOR_DB").json()["data"]
+    assert "VISIBLE_T" in {row[1] for row in tables}
+    assert not any(row[1].startswith("_sf_") for row in tables)
+
+    objects = _post(client, "SHOW OBJECTS IN DATABASE EMULATOR_DB").json()["data"]
+    assert "VISIBLE_T" in {row[1] for row in objects}
+    assert not any(row[4] == "SF_INFORMATION_SCHEMA" for row in objects)
+
+    views = _post(client, "SHOW VIEWS IN DATABASE EMULATOR_DB").json()["data"]
+    assert not any(row[4] == "SF_INFORMATION_SCHEMA" for row in views)
+
+    columns = _post(client, "SHOW COLUMNS IN DATABASE EMULATOR_DB").json()["data"]
+    assert any(row[0] == "VISIBLE_T" for row in columns)
+    assert not any(row[1] == "SF_INFORMATION_SCHEMA" for row in columns)
+
+    info_tables = _post(
+        client, "SELECT TABLE_SCHEMA, TABLE_NAME FROM EMULATOR_DB.INFORMATION_SCHEMA.TABLES"
+    ).json()["data"]
+    assert ["PUBLIC", "VISIBLE_T"] in info_tables
+    assert not any(row[0] == "SF_INFORMATION_SCHEMA" for row in info_tables)
+    assert not any(str(row[1]).startswith("_sf_") for row in info_tables)
+
+    info_columns = _post(
+        client,
+        "SELECT TABLE_SCHEMA, TABLE_NAME FROM EMULATOR_DB.INFORMATION_SCHEMA.COLUMNS",
+    ).json()["data"]
+    assert not any(row[0] == "SF_INFORMATION_SCHEMA" for row in info_columns)
+
+    info_schemas = _post(
+        client, "SELECT SCHEMA_NAME FROM EMULATOR_DB.INFORMATION_SCHEMA.SCHEMATA"
+    ).json()["data"]
+    names = {row[0] for row in info_schemas}
+    assert "SF_INFORMATION_SCHEMA" not in names
+    assert "main" not in names
+
+
+def test_show_databases_like_filters(client):
+    _post(client, "CREATE DATABASE FILTER_DB")
+    rows = _post(client, "SHOW DATABASES LIKE 'FILTER%'").json()["data"]
+    assert [row[1] for row in rows] == ["FILTER_DB"]
+    assert _post(client, "SHOW DATABASES LIKE 'NO_SUCH%'").json()["data"] == []
+
+
+def test_show_file_formats_like_starts_with_and_limit(client):
+    _post(client, "CREATE FILE FORMAT FF_CSV TYPE = CSV")
+    _post(client, "CREATE FILE FORMAT FF_JSON TYPE = JSON")
+
+    rows = _post(client, "SHOW FILE FORMATS LIKE 'FF_C%'").json()["data"]
+    assert [row[0] for row in rows] == ["FF_CSV"]
+    rows = _post(client, "SHOW FILE FORMATS STARTS WITH 'FF_J'").json()["data"]
+    assert [row[0] for row in rows] == ["FF_JSON"]
+    assert len(_post(client, "SHOW FILE FORMATS LIMIT 1").json()["data"]) == 1
+
+
+def test_show_sequences_scope_like_and_limit(client):
+    _post(client, "CREATE SCHEMA SEQ_SCOPE")
+    _post(client, "CREATE SEQUENCE SEQ_SCOPE.SCOPED_SEQ")
+    _post(client, "CREATE SEQUENCE PUBLIC.FILTER_SEQ")
+
+    rows = _post(client, "SHOW SEQUENCES IN SCHEMA SEQ_SCOPE").json()["data"]
+    assert [row[1] for row in rows] == ["SCOPED_SEQ"]
+
+    rows = _post(client, "SHOW SEQUENCES LIKE 'FILTER%'").json()["data"]
+    assert [row[1] for row in rows] == ["FILTER_SEQ"]
+
+    assert len(_post(client, "SHOW SEQUENCES LIMIT 1").json()["data"]) == 1
+
+
+def test_show_columns_like_filter(client):
+    _post(client, "CREATE TABLE COL_FILTER (MATCH_ME INT, OTHER VARCHAR)")
+    rows = _post(client, "SHOW COLUMNS LIKE 'MATCH%' IN TABLE COL_FILTER").json()["data"]
+    assert [row[2] for row in rows] == ["MATCH_ME"]
+
+
+def test_show_stages_scope_like_and_empty_stage(client):
+    headers = _auth(client)
+    _post(client, "CREATE SCHEMA STAGE_SCOPE", headers)
+    _post(client, "USE SCHEMA STAGE_SCOPE", headers)
+    _post(client, "CREATE STAGE SCOPED_STAGE", headers)
+    _post(client, "USE SCHEMA PUBLIC", headers)
+    _post(client, "CREATE STAGE PUBLIC_STAGE", headers)
+
+    # An empty stage is visible and an unscoped SHOW lists only the current schema.
+    rows = _post(client, "SHOW STAGES", headers).json()["data"]
+    assert [row[0] for row in rows] == ["PUBLIC_STAGE"]
+
+    rows = _post(
+        client, "SHOW STAGES LIKE 'SCOPED%' IN SCHEMA EMULATOR_DB.STAGE_SCOPE", headers
+    ).json()["data"]
+    assert [row[0] for row in rows] == ["SCOPED_STAGE"]
+
+    rows = _post(client, "SHOW STAGES IN SCHEMA EMULATOR_DB.STAGE_SCOPE", headers).json()["data"]
+    assert [row[0] for row in rows] == ["SCOPED_STAGE"]
+
+    rows = _post(client, "SHOW STAGES IN DATABASE EMULATOR_DB", headers).json()["data"]
+    assert {row[0] for row in rows} >= {"PUBLIC_STAGE", "SCOPED_STAGE"}
+    assert len(_post(client, "SHOW STAGES LIMIT 1", headers).json()["data"]) == 1
