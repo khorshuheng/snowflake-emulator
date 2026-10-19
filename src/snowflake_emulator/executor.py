@@ -11,10 +11,21 @@ from typing import Any
 from sqlglot import exp
 
 from snowflake_emulator.core.ast import drop_target_table
-from snowflake_emulator.core.constants import INFORMATION_SCHEMA_SCHEMA
 from snowflake_emulator.core.errors import ExecutionError, classify_exception
 from snowflake_emulator.core.results import ColumnMeta, ExecutionResult, FileTransfer
 from snowflake_emulator.database import DuckDBManager
+from snowflake_emulator.engine.handlers.common import convert_describe_types
+from snowflake_emulator.engine.handlers.describe import (
+    describe_sql,  # re-exported for the wire-protocol router
+    execute_function_describe,
+    execute_snowflake_describe,
+)
+from snowflake_emulator.engine.handlers.show import (
+    execute_show_columns,
+    execute_show_keys,
+    execute_show_misc,
+    execute_snowflake_show,
+)
 from snowflake_emulator.file_formats import (
     FileFormatError,
     get_file_format_manager,
@@ -56,16 +67,12 @@ from snowflake_emulator.translator import (
     translate_create_function,
     transpile_to_duckdb,
 )
-from snowflake_emulator.type_mapping import (
-    duckdb_type_to_snowflake,
-    duckdb_type_to_snowflake_sql_type,
-)
+from snowflake_emulator.type_mapping import duckdb_type_to_snowflake
 from snowflake_emulator.user_functions import (
     SessionUserFunctionResolver,
     UserFunctionError,
     execute_create_function,
     execute_drop_function,
-    query_user_functions,
 )
 
 
@@ -212,32 +219,32 @@ def _execute_sql(
             row_type, rows = function_ddl
             continue
 
-        show_result = _execute_snowflake_show(manager, cursor, session, statement)
+        show_result = execute_snowflake_show(manager, cursor, session, statement)
         if show_result is not None:
             row_type, rows = show_result
             continue
 
-        show_columns = _execute_show_columns(cursor, session, statement)
+        show_columns = execute_show_columns(cursor, session, statement)
         if show_columns is not None:
             row_type, rows = show_columns
             continue
 
-        show_keys = _execute_show_keys(cursor, session, statement)
+        show_keys = execute_show_keys(cursor, session, statement)
         if show_keys is not None:
             row_type, rows = show_keys
             continue
 
-        show_misc = _execute_show_misc(manager, cursor, session, statement)
+        show_misc = execute_show_misc(manager, cursor, session, statement)
         if show_misc is not None:
             row_type, rows = show_misc
             continue
 
-        describe_result = _execute_function_describe(manager, session, statement)
+        describe_result = execute_function_describe(manager, session, statement)
         if describe_result is not None:
             row_type, rows = describe_result
             continue
 
-        describe_result = _execute_snowflake_describe(cursor, session, statement)
+        describe_result = execute_snowflake_describe(cursor, session, statement)
         if describe_result is not None:
             row_type, rows = describe_result
             continue
@@ -313,7 +320,7 @@ def _execute_sql(
                 ]
                 rows = [list(row) for row in cursor.fetchall()]
                 if isinstance(statement, exp.Describe):
-                    rows = _convert_describe_types(rows)
+                    rows = convert_describe_types(rows)
         else:
             row_type = [ColumnMeta(name="status", type="text")]
             affected = cursor.fetchone()
@@ -328,136 +335,6 @@ def _execute_sql(
         message=message,
         statement_type_id=statement_type_id(last_statement),
         number_of_binds=number_of_binds(last_statement),
-    )
-
-
-# Columns Snowflake reports when asked to describe a statement that produces no result
-# set, without running it. Only the names and types matter.
-_DESCRIBE_STATUS = [("status", "VARCHAR")]
-_DESCRIBE_COPY = [
-    ("file", "VARCHAR"),
-    ("status", "VARCHAR"),
-    ("rows_parsed", "BIGINT"),
-    ("rows_loaded", "BIGINT"),
-    ("error_limit", "BIGINT"),
-    ("errors_seen", "BIGINT"),
-    ("first_error", "VARCHAR"),
-    ("first_error_line", "BIGINT"),
-    ("first_error_character", "BIGINT"),
-    ("first_error_column_name", "VARCHAR"),
-]
-_DESCRIBE_SYNTHETIC: dict[type[exp.Expression], list[tuple[str, str]]] = {
-    exp.Create: _DESCRIBE_STATUS,
-    exp.Drop: _DESCRIBE_STATUS,
-    exp.Alter: _DESCRIBE_STATUS,
-    exp.TruncateTable: _DESCRIBE_STATUS,
-    # Session/transaction control must not run during a describe; they are
-    # read-only to observe and would otherwise mutate the session.
-    exp.Use: _DESCRIBE_STATUS,
-    exp.Transaction: _DESCRIBE_STATUS,
-    exp.Commit: _DESCRIBE_STATUS,
-    exp.Rollback: _DESCRIBE_STATUS,
-    exp.Insert: [("number of rows inserted", "BIGINT")],
-    exp.Update: [
-        ("number of rows updated", "BIGINT"),
-        ("number of multi-joined rows updated", "BIGINT"),
-    ],
-    exp.Delete: [("number of rows deleted", "BIGINT")],
-    # MERGE reports one count per operation; both are listed (a MERGE that omits a
-    # WHEN clause would report fewer, but describing must never execute the write).
-    exp.Merge: [
-        ("number of rows inserted", "BIGINT"),
-        ("number of rows updated", "BIGINT"),
-    ],
-    exp.Copy: _DESCRIBE_COPY,
-}
-
-
-def _describe_result(
-    statement: exp.Expression, columns: list[tuple[str, str]]
-) -> ExecutionResult:
-    """Build a metadata-only result for a statement described without executing."""
-    return ExecutionResult(
-        handle=str(uuid.uuid4()),
-        created_on=int(time.time() * 1000),
-        row_type=[
-            ColumnMeta(
-                name=name,
-                type=duckdb_type_to_snowflake(duckdb_type),
-                duckdb_type=duckdb_type,
-            )
-            for name, duckdb_type in columns
-        ],
-        rows=[],
-        message="Describe statement executed successfully.",
-        statement_type_id=statement_type_id(statement),
-        number_of_binds=number_of_binds(statement),
-    )
-
-
-def describe_sql(
-    manager: DuckDBManager,
-    session: SessionContext,
-    raw_sql: str,
-) -> ExecutionResult | None:
-    """Describe a statement's result columns without executing it."""
-    with manager.session_scope(session.token):
-        return _describe_sql(manager, session, raw_sql)
-
-
-def _describe_sql(
-    manager: DuckDBManager,
-    session: SessionContext,
-    raw_sql: str,
-) -> ExecutionResult | None:
-    """Describe a statement's result columns without executing it.
-
-    Snowflake answers a ``describeOnly`` request with result metadata and no rows, so
-    a client can prepare a statement without running it. DML/DDL get Snowflake's
-    synthetic result shape; a SELECT is described directly with DuckDB ``DESCRIBE``
-    (placeholders replaced with NULL so it stays valid without bindings). Anything
-    else returns ``None`` and the caller falls back to executing it.
-    """
-    manager.ensure_namespace(session.database, session.schema)
-    try:
-        statement = split_statements(raw_sql)[-1]
-    except TranslationError:
-        return None
-    if type(statement) in _DESCRIBE_SYNTHETIC:
-        return _describe_result(statement, _DESCRIBE_SYNTHETIC[type(statement)])
-    if not isinstance(statement, (exp.Select, exp.Union, exp.Subquery)):
-        return None
-    binds = number_of_binds(statement)
-    statement = statement.transform(
-        lambda node: exp.Null()
-        if isinstance(node, (exp.Placeholder, exp.Parameter))
-        else node
-    )
-    cursor = manager.cursor(session.token)
-    cursor.execute(f'USE "{session.database}"."{session.schema}"')
-    try:
-        duckdb_sql = transpile_to_duckdb(statement)
-        cursor.execute(f"DESCRIBE {duckdb_sql}")
-    except Exception:  # noqa: BLE001 - only described by running; fall back
-        return None
-    if not cursor.description:
-        return None
-    described = cursor.fetchall()
-    return ExecutionResult(
-        handle=str(uuid.uuid4()),
-        created_on=int(time.time() * 1000),
-        row_type=[
-            ColumnMeta(
-                name=row[0],
-                type=duckdb_type_to_snowflake(str(row[1])),
-                duckdb_type=str(row[1]),
-            )
-            for row in described
-        ],
-        rows=[],
-        message="Describe statement executed successfully.",
-        statement_type_id=statement_type_id(statement),
-        number_of_binds=binds,
     )
 
 
@@ -639,665 +516,6 @@ def _substitute_variables(statement: exp.Expression, session: SessionContext) ->
     return statement.transform(replace)
 
 
-def _convert_describe_types(rows: list[list[Any]]) -> list[list[Any]]:
-    """Convert DuckDB type names in a ``DESCRIBE`` result to Snowflake type names.
-
-    DuckDB's ``DESCRIBE`` returns a ``column_type`` column (index 1) whose values are
-    DuckDB-specific type names. Snowflake's ``DESCRIBE TABLE`` reports Snowflake SQL
-    types in that column, so we rewrite each value in place.
-    """
-    converted: list[list[Any]] = []
-    for row in rows:
-        if len(row) >= 2 and isinstance(row[1], str):
-            row = list(row)
-            row[1] = duckdb_type_to_snowflake_sql_type(row[1])
-        converted.append(row)
-    return converted
-
-
-def _result_columns(cursor: Any) -> tuple[list[ColumnMeta], list[list[Any]]]:
-    """Build ``(row_type, rows)`` from a cursor that just executed a query."""
-    description = cursor.description
-    row_type = [
-        ColumnMeta(
-            name=col[0],
-            type=duckdb_type_to_snowflake(str(col[1])),
-            duckdb_type=str(col[1]),
-        )
-        for col in description
-    ]
-    rows = [list(row) for row in cursor.fetchall()]
-    return row_type, rows
-
-
-def _show_scope(statement: exp.Show, session: SessionContext) -> tuple[str, str | None] | None:
-    """Extract the ``(database, schema)`` a scoped ``SHOW ... IN ...`` targets.
-
-    ``SHOW SCHEMAS IN DATABASE db`` targets a database (schema ``None``);
-    ``SHOW OBJECTS IN db.schema`` targets a schema. An unscoped ``SHOW TABLES``,
-    ``SHOW VIEWS``, ``SHOW OBJECTS`` or ``SHOW SCHEMAS`` is scoped to the session's own
-    database/schema, so that its ``LIKE``/``STARTS WITH``/``LIMIT`` clause is applied
-    rather than dropped (DuckDB's native SHOW, which these forms used to fall through
-    to, ignores them). Returns ``None`` for the SHOW forms handled elsewhere.
-    """
-    scope = statement.args.get("scope")
-    kind = statement.args.get("scope_kind")
-    if isinstance(scope, exp.Table):
-        if kind == "DATABASE":
-            return scope.name, None
-        if kind == "SCHEMA":
-            db = scope.args.get("db")
-            database = db.name if isinstance(db, exp.Identifier) else session.database
-            return database, scope.name
-        return None
-    obj = str(statement.args.get("this") or "").upper()
-    if obj == "SCHEMAS":
-        return session.database, None
-    if obj in ("TABLES", "VIEWS", "OBJECTS"):
-        return session.database, session.schema
-    return None
-
-
-def _show_limit(statement: exp.Show) -> int | None:
-    """Extract the ``LIMIT n`` from a SHOW statement, if any."""
-    limit = statement.args.get("limit")
-    if isinstance(limit, exp.Limit):
-        expr = limit.args.get("expression")
-        if isinstance(expr, exp.Literal):
-            try:
-                return int(expr.this)
-            except (TypeError, ValueError):
-                return None
-    return None
-
-
-def _escape_like(text: str) -> str:
-    """Escape LIKE wildcards so a ``STARTS WITH`` match is a plain prefix."""
-    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-
-def _name_prefix_filter(column: str, prefix: str | None) -> str:
-    """Return a WHERE fragment restricting ``column`` to a ``STARTS WITH`` prefix."""
-    if not prefix:
-        return ""
-    escaped = _escape_like(prefix).replace("'", "''")
-    return f" AND {column} LIKE '{escaped}%' ESCAPE '\\'"
-
-
-def _name_like_filter(column: str, pattern: str | None) -> str:
-    """Return a WHERE fragment matching ``column`` against a ``SHOW ... LIKE`` pattern.
-
-    Unlike ``STARTS WITH`` the pattern keeps its ``%``/``_`` wildcards. Matching is
-    case-insensitive because object names are upper-cased unless they were quoted.
-    """
-    if not pattern:
-        return ""
-    escaped = pattern.replace("\\", "\\\\").replace("'", "''")
-    return f" AND {column} ILIKE '{escaped}' ESCAPE '\\'"
-
-
-def _temp_inclusive_scope(
-    alias: str, database: str, schema: str | None, name_column: str = "table_name"
-) -> str:
-    """Return a WHERE fragment matching an object in scope, or a session's temp table.
-
-    DuckDB reports a temporary table in the connection-local ``temp`` catalog, so an
-    object is in scope when it lives in the catalog/schema asked for *or* when it is a
-    temporary table of the calling connection and the caller asked about that
-    connection's current database (and schema, when one was named). The ``temp`` catalog
-    is per connection, so a session never sees another session's temporary tables.
-
-    A temporary table shadows a permanent one of the same name (DuckDB resolves names to
-    the temp catalog first), so the catalog-side row is dropped while a shadowing
-    temporary table exists -- otherwise the same column would be reported twice.
-    `name_column` is the name column of `alias` (``view_name`` for ``duckdb_views()``).
-    """
-    schema_match = f" AND lower({alias}.schema_name) = lower('{schema}')" if schema else ""
-    temp_schema_match = f" AND lower(current_schema()) = lower('{schema}')" if schema else ""
-    shadowed = (
-        " AND NOT EXISTS (SELECT 1 FROM duckdb_tables() sh"
-        " WHERE lower(sh.database_name) = 'temp'"
-        f" AND lower(sh.table_name) = lower({alias}.{name_column}))"
-    )
-    return (
-        f"((lower({alias}.database_name) = lower('{database}'){schema_match}{shadowed})"
-        f" OR (lower({alias}.database_name) = 'temp'"
-        f" AND lower(current_database()) = lower('{database}'){temp_schema_match}))"
-    )
-
-
-def _execute_snowflake_show(
-    manager: DuckDBManager,
-    cursor: Any,
-    session: SessionContext,
-    statement: exp.Expression,
-) -> tuple[list[ColumnMeta], list[list[Any]]] | None:
-    """Execute Snowflake ``SHOW ... IN ...`` statements with Snowflake-shaped output.
-
-    DuckDB's native SHOW returns its own column names (``schema_name``, ...), but
-    Snowflake tools such as dbt expect ``name``/``kind``/``database_name``/...
-    These are generated from DuckDB's catalog introspection functions instead.
-    Returns ``None`` for SHOW forms this handler doesn't own.
-    """
-    if isinstance(statement, exp.Command):
-        text = str(statement.args.get("expression") or "")
-        upper = text.upper()
-        if any(
-            kind in upper
-            for kind in ("USER FUNCTIONS", "ALL FUNCTIONS", "EXTERNAL FUNCTIONS")
-        ):
-            # sqlglot cannot parse ``SHOW USER FUNCTIONS IN ...``, so this form arrives as
-            # a raw command and its scope/LIKE clause is parsed from the text.
-            database, schema = _function_show_scope(text, session)
-            return _user_function_show(
-                manager, cursor, database, schema, _show_like_pattern(text)
-            )
-        return None
-    if not isinstance(statement, exp.Show):
-        return None
-    obj = str(statement.args.get("this") or "").upper()
-    scope = _show_scope(statement, session)
-    if scope is None:
-        return None
-    database, schema = scope
-
-    limit = _show_limit(statement)
-    prefix = statement.args.get("starts_with")
-    prefix = prefix.this if isinstance(prefix, exp.Literal) else None
-    like = statement.args.get("like")
-    like = like.this if isinstance(like, exp.Literal) else None
-
-    if obj == "SCHEMAS":
-        sql = f"""
-            SELECT
-                NULL::TIMESTAMP AS created_on,
-                schema_name AS name,
-                'SCHEMA' AS kind,
-                database_name AS database_name,
-                schema_name AS schema_name,
-                comment AS comment,
-                NULL::VARCHAR AS options,
-                NULL::VARCHAR AS owner,
-                NULL::BIGINT AS retention_time
-            FROM duckdb_schemas()
-            WHERE lower(database_name) = lower('{database}')
-              AND lower(schema_name) != 'main'
-              {_name_prefix_filter('schema_name', prefix)}
-              {_name_like_filter('schema_name', like)}
-            ORDER BY schema_name
-        """
-    else:
-        selects: list[str] = []
-        if obj in ("TABLES", "OBJECTS"):
-            selects.append(f"""
-                SELECT
-                    NULL::TIMESTAMP AS created_on,
-                    t.table_name AS name,
-                    'TABLE' AS kind,
-                    CASE WHEN lower(t.database_name) = 'temp'
-                         THEN current_database() ELSE t.database_name END AS database_name,
-                    CASE WHEN lower(t.database_name) = 'temp'
-                         THEN current_schema() ELSE t.schema_name END AS schema_name,
-                    t.comment AS comment,
-                    'N' AS is_dynamic,
-                    'N' AS is_iceberg
-                FROM duckdb_tables() t
-                WHERE {_temp_inclusive_scope('t', database, schema)}
-                  {_name_prefix_filter('t.table_name', prefix)}
-                  {_name_like_filter('t.table_name', like)}
-            """)
-        if obj in ("VIEWS", "OBJECTS"):
-            selects.append(f"""
-                SELECT
-                    NULL::TIMESTAMP AS created_on,
-                    v.view_name AS name,
-                    'VIEW' AS kind,
-                    v.database_name AS database_name,
-                    v.schema_name AS schema_name,
-                    v.comment AS comment,
-                    'N' AS is_dynamic,
-                    'N' AS is_iceberg
-                FROM duckdb_views() v
-                WHERE {_temp_inclusive_scope('v', database, schema, 'view_name')}
-                  {_name_prefix_filter('v.view_name', prefix)}
-                  {_name_like_filter('v.view_name', like)}
-            """)
-        if not selects:
-            return None
-        sql = " UNION ALL ".join(selects) + " ORDER BY name"
-
-    if limit is not None:
-        sql += f" LIMIT {limit}"
-    cursor.execute(sql)
-    return _result_columns(cursor)
-
-
-def _execute_show_columns(
-    cursor: Any,
-    session: SessionContext,
-    statement: exp.Expression,
-) -> tuple[list[ColumnMeta], list[list[Any]]] | None:
-    """Handle ``SHOW COLUMNS`` with Snowflake's column names (used by dbt).
-
-    Scopes onto the current schema by default, or a named table/schema/database when
-    the statement carries ``IN``. Returns ``None`` for SHOW forms this handler does
-    not own.
-    """
-    if not (
-        isinstance(statement, exp.Show)
-        and str(statement.args.get("this") or "").upper() == "COLUMNS"
-    ):
-        return None
-    scope_kind = statement.args.get("scope_kind")
-    scope = statement.args.get("scope")
-    database = session.database
-    schema = session.schema
-    table_name = None
-    if scope_kind == "DATABASE" and isinstance(scope, exp.Table):
-        database, schema = scope.name, None
-    elif scope_kind == "SCHEMA" and isinstance(scope, exp.Table):
-        db = scope.args.get("db")
-        database = db.name if isinstance(db, exp.Identifier) else session.database
-        schema = scope.name
-    elif scope_kind in ("TABLE", "VIEW") and isinstance(scope, exp.Table):
-        catalog = scope.args.get("catalog")
-        db = scope.args.get("db")
-        database = catalog.name if isinstance(catalog, exp.Identifier) else session.database
-        schema = db.name if isinstance(db, exp.Identifier) else session.schema
-        table_name = scope.name
-    elif scope_kind is not None:
-        return None
-
-    # Bound as parameters so an identifier containing a quote cannot break the SQL. The
-    # second branch of each test includes the session's own temporary tables, which
-    # DuckDB reports in the connection-local ``temp`` catalog.
-    params: list[Any] = [database, database]
-    where = [
-        "((lower(c.database_name) = lower(?)"
-        " AND NOT EXISTS (SELECT 1 FROM duckdb_tables() sh"
-        " WHERE lower(sh.database_name) = 'temp'"
-        " AND lower(sh.table_name) = lower(c.table_name)))"
-        " OR (lower(c.database_name) = 'temp'"
-        " AND lower(current_database()) = lower(?)))"
-    ]
-    if schema is not None:
-        where.append(
-            "((lower(c.schema_name) = lower(?))"
-            " OR (lower(c.database_name) = 'temp' AND lower(current_schema()) = lower(?)))"
-        )
-        params.extend([schema, schema])
-    if table_name is not None:
-        where.append("lower(c.table_name) = lower(?)")
-        params.append(table_name)
-    cursor.execute(
-        f"""
-        SELECT
-            c.table_name AS "table_name",
-            CASE WHEN lower(c.database_name) = 'temp'
-                 THEN current_schema() ELSE c.schema_name END AS "schema_name",
-            c.column_name AS "column_name",
-            c.data_type AS "data_type",
-            e.declared_type AS "declared_type",
-            CASE WHEN c.is_nullable THEN 'Y' ELSE 'N' END AS "null?",
-            c.column_default AS "default",
-            'COLUMN' AS "kind",
-            NULL::VARCHAR AS "expression",
-            c.comment AS "comment",
-            CASE WHEN lower(c.database_name) = 'temp'
-                 THEN current_database() ELSE c.database_name END AS "database_name",
-            NULL::VARCHAR AS "autoincrement",
-            NULL::VARCHAR AS "schema_evolution_record"
-        FROM duckdb_columns() c
-        LEFT JOIN "{database}".{INFORMATION_SCHEMA_SCHEMA}._sf_columns_ext e
-          ON lower(e.table_catalog) = lower(c.database_name)
-         AND lower(e.table_schema) = lower(c.schema_name)
-         AND lower(e.table_name) = lower(c.table_name)
-         AND lower(e.column_name) = lower(c.column_name)
-         AND lower(c.database_name) <> 'temp'
-        WHERE {' AND '.join(where)}
-        ORDER BY c.table_name, c.column_index
-        """,
-        params,
-    )
-    row_type, rows = _result_columns(cursor)
-    # Drop the helper "declared_type" column (index 4) and prefer the declared type.
-    row_type = [*row_type[:4], *row_type[5:]]
-    converted: list[list[Any]] = []
-    for row in rows:
-        sf_type = _prefer_declared_type(row[4], row[3]) or duckdb_type_to_snowflake_sql_type(
-            str(row[3])
-        )
-        converted.append([*row[:3], sf_type, *row[5:]])
-    return row_type, converted
-
-
-def _show_key_kind(statement: exp.Expression) -> str | None:
-    """Classify a SHOW <PRIMARY|UNIQUE|FOREIGN|IMPORTED> KEYS statement."""
-    kinds = {
-        "PRIMARY KEYS": "PRIMARY",
-        "UNIQUE KEYS": "UNIQUE",
-        "IMPORTED KEYS": "FOREIGN",
-    }
-    if isinstance(statement, exp.Show):
-        return kinds.get(str(statement.args.get("this") or "").upper())
-    # sqlglot cannot parse SHOW FOREIGN KEYS, so it arrives as a Command.
-    if isinstance(statement, exp.Command) and str(statement.args.get("this") or "").upper() == "SHOW":
-        if "FOREIGN KEYS" in str(statement.args.get("expression") or "").upper():
-            return "FOREIGN"
-    return None
-
-
-def _show_key_scope(
-    statement: exp.Expression, session: SessionContext
-) -> tuple[str, str | None, str | None]:
-    """Return the ``(database, schema, table)`` a scoped SHOW KEYS statement targets."""
-    scope_kind = statement.args.get("scope_kind")
-    scope = statement.args.get("scope")
-    database: str = session.database
-    schema: str | None = session.schema
-    table_name: str | None = None
-    if scope_kind == "DATABASE" and isinstance(scope, exp.Table):
-        database, schema = scope.name, None
-    elif scope_kind == "SCHEMA" and isinstance(scope, exp.Table):
-        db = scope.args.get("db")
-        database = db.name if isinstance(db, exp.Identifier) else session.database
-        schema = scope.name
-    elif scope_kind == "TABLE" and isinstance(scope, exp.Table):
-        catalog = scope.args.get("catalog")
-        db = scope.args.get("db")
-        database = catalog.name if isinstance(catalog, exp.Identifier) else session.database
-        schema = db.name if isinstance(db, exp.Identifier) else session.schema
-        table_name = scope.name
-    elif isinstance(statement, exp.Command):
-        # SHOW FOREIGN KEYS is not parseable by sqlglot, so read the ``IN TABLE x``
-        # target from the raw text.
-        match = re.search(r"\bIN\s+(?:TABLE\s+)?([\w.\"]+)", str(statement.args.get("expression") or ""), re.IGNORECASE)
-        if match:
-            parts = [part.strip('"') for part in match.group(1).split(".")]
-            table_name = parts[-1]
-            if len(parts) >= 2:
-                schema = parts[-2]
-            if len(parts) >= 3:
-                database = parts[-3]
-    return database, schema, table_name
-
-
-def _execute_show_keys(
-    cursor: Any,
-    session: SessionContext,
-    statement: exp.Expression,
-) -> tuple[list[ColumnMeta], list[list[Any]]] | None:
-    """Handle SHOW PRIMARY/UNIQUE/FOREIGN/IMPORTED KEYS via ``duckdb_constraints()``."""
-    kind = _show_key_kind(statement)
-    if kind is None:
-        return None
-    database, schema, table_name = _show_key_scope(statement, session)
-
-    where = ["lower(database_name) = lower(?)"]
-    params: list[Any] = [database]
-    if schema is not None:
-        where.append("lower(schema_name) = lower(?)")
-        params.append(schema)
-    if table_name is not None:
-        where.append(f'lower(table_name) = lower(?)')
-        params.append(table_name)
-
-    if kind in ("PRIMARY", "UNIQUE"):
-        params.insert(0, "PRIMARY KEY" if kind == "PRIMARY" else "UNIQUE")
-        cursor.execute(
-            f"""
-            SELECT
-                NULL::TIMESTAMP AS created_on,
-                database_name AS database_name,
-                schema_name AS schema_name,
-                table_name AS table_name,
-                u.column_name AS column_name,
-                u.key_sequence AS key_sequence,
-                constraint_name AS constraint_name,
-                NULL::VARCHAR AS rely,
-                NULL::VARCHAR AS comment
-            FROM duckdb_constraints(), UNNEST(constraint_column_names) WITH ORDINALITY AS u(column_name, key_sequence)
-            WHERE constraint_type = ? AND {' AND '.join(where)}
-            ORDER BY table_name, constraint_name, key_sequence
-            """,
-            params,
-        )
-    else:
-        cursor.execute(
-            f"""
-            SELECT
-                NULL::TIMESTAMP AS created_on,
-                database_name AS pk_database_name,
-                schema_name AS pk_schema_name,
-                referenced_table AS pk_table_name,
-                referenced_column_names[u.key_sequence] AS pk_column_name,
-                database_name AS fk_database_name,
-                schema_name AS fk_schema_name,
-                table_name AS fk_table_name,
-                u.column_name AS fk_column_name,
-                u.key_sequence AS key_sequence,
-                NULL::VARCHAR AS update_rule,
-                NULL::VARCHAR AS delete_rule,
-                constraint_name AS fk_name,
-                NULL::VARCHAR AS pk_name,
-                NULL::VARCHAR AS deferrability,
-                NULL::VARCHAR AS rely,
-                NULL::VARCHAR AS comment
-            FROM duckdb_constraints(), UNNEST(constraint_column_names) WITH ORDINALITY AS u(column_name, key_sequence)
-            WHERE constraint_type = 'FOREIGN KEY' AND {' AND '.join(where)}
-            ORDER BY table_name, constraint_name, key_sequence
-            """,
-            params,
-        )
-    return _result_columns(cursor)
-
-
-def _execute_show_misc(
-    manager: DuckDBManager,
-    cursor: Any,
-    session: SessionContext,
-    statement: exp.Expression,
-) -> tuple[list[ColumnMeta], list[list[Any]]] | None:
-    """Handle the simpler SHOW variants (databases, warehouses, sequences, ...)."""
-    obj: str | None = None
-    if isinstance(statement, exp.Show):
-        obj = str(statement.args.get("this") or "").upper()
-    elif isinstance(statement, exp.Command) and str(statement.args.get("this") or "").upper() == "SHOW":
-        # sqlglot cannot parse SHOW PARAMETERS.
-        if str(statement.args.get("expression") or "").upper().strip().startswith("PARAMETERS"):
-            obj = "PARAMETERS"
-
-    if obj == "DATABASES":
-        cursor.execute(
-            """
-            SELECT
-                NULL::TIMESTAMP AS created_on,
-                database_name AS name,
-                'N' AS is_default,
-                CASE WHEN lower(database_name) = lower(?) THEN 'Y' ELSE 'N' END AS is_current,
-                NULL::VARCHAR AS origin,
-                NULL::VARCHAR AS owner,
-                comment AS comment,
-                NULL::VARCHAR AS options,
-                NULL::BIGINT AS retention_time
-            FROM duckdb_databases()
-            WHERE lower(database_name) NOT IN ('system', 'temp', 'memory')
-            ORDER BY name
-            """,
-            [session.database],
-        )
-    elif obj == "WAREHOUSES":
-        cursor.execute(
-            "SELECT ? AS name, 'STARTED' AS state, 'STANDARD' AS type, 'X-SMALL' AS size, "
-            "'N' AS running, 'N' AS queued, NULL::TIMESTAMP AS created_on, NULL::VARCHAR AS owner, "
-            "NULL::VARCHAR AS comment",
-            [session.warehouse],
-        )
-    elif obj == "SEQUENCES":
-        cursor.execute(
-            """
-            SELECT
-                NULL::TIMESTAMP AS created_on,
-                sequence_name AS name,
-                database_name AS database_name,
-                schema_name AS schema_name,
-                last_value AS next_value,
-                increment_by AS interval,
-                comment AS comment
-            FROM duckdb_sequences()
-            WHERE lower(database_name) = lower(?)
-              AND lower(schema_name) = lower(?)
-            ORDER BY name
-            """,
-            [session.database, session.schema],
-        )
-    elif obj == "PARAMETERS":
-        cursor.execute(
-            """
-            SELECT name, value, "default", level FROM (VALUES
-                ('AUTOCOMMIT', 'true', 'true', 'SESSION'),
-                ('TIMEZONE', 'UTC', 'UTC', 'SESSION'),
-                ('CLIENT_PREFETCH_THREADS', '4', '4', 'SESSION')
-            ) AS t(name, value, "default", level)
-            """
-        )
-    elif obj == "PROCEDURES":
-        cursor.execute(
-            "SELECT NULL::VARCHAR AS name, NULL::VARCHAR AS schema_name, NULL::VARCHAR AS catalog_name WHERE FALSE"
-        )
-    elif obj == "FUNCTIONS":
-        scope = _show_scope(statement, session) if isinstance(statement, exp.Show) else None
-        database, schema = scope or (session.database, session.schema)
-        like = None
-        if isinstance(statement, exp.Show):
-            pattern = statement.args.get("like")
-            if isinstance(pattern, exp.Literal) and pattern.is_string:
-                like = str(pattern.this)
-        return _user_function_show(manager, cursor, database, schema, like)
-    elif obj == "USERS":
-        cursor.execute("SELECT NULL::VARCHAR AS name, NULL::TIMESTAMP AS created_on WHERE FALSE")
-    else:
-        return None
-    return _result_columns(cursor)
-
-
-_DECLARED_TYPE_OVERRIDE = re.compile(r"^(VARCHAR|CHAR|STRING|TEXT|BINARY|VARBINARY)\(\d+\)$")
-
-
-def _prefer_declared_type(
-    declared: Any, duckdb_type: Any
-) -> str | None:
-    """Return the declared Snowflake type only where DuckDB loses information.
-
-    DuckDB keeps numeric precision/scale, so ``INT`` must still report as
-    ``NUMBER(38,0)``; only character/binary lengths are dropped, so ``VARCHAR(255)``
-    is the one case worth restoring from the side table.
-    """
-    if not isinstance(declared, str):
-        return None
-    return declared if _DECLARED_TYPE_OVERRIDE.match(declared.upper()) else None
-
-
-# Snowflake's ``SHOW FUNCTIONS`` column set. The metadata is derived from a typed,
-# empty query so the declared Snowflake types (and the DuckDB types the wire encoders
-# use) match the rest of the SHOW surface; the rows are built from recorded functions.
-_USER_FUNCTION_SHOW_SQL = """
-    SELECT
-        NULL::TIMESTAMP AS created_on,
-        NULL::VARCHAR AS name,
-        NULL::VARCHAR AS schema_name,
-        NULL::VARCHAR AS catalog_name,
-        NULL::VARCHAR AS is_builtin,
-        NULL::VARCHAR AS is_secure,
-        NULL::VARCHAR AS arguments,
-        NULL::VARCHAR AS result_type,
-        NULL::VARCHAR AS description
-    WHERE FALSE
-"""
-
-# ``DESCRIBE FUNCTION`` adds the signature bounds a caller needs to tell overloads
-# apart. Snowflake reports both as the number of declared arguments.
-_USER_FUNCTION_DESCRIBE_SQL = """
-    SELECT
-        NULL::TIMESTAMP AS created_on,
-        NULL::VARCHAR AS name,
-        NULL::VARCHAR AS schema_name,
-        NULL::VARCHAR AS catalog_name,
-        NULL::VARCHAR AS is_builtin,
-        NULL::VARCHAR AS is_aggregate,
-        NULL::VARCHAR AS is_ansi,
-        NULL::INTEGER AS min_num_arguments,
-        NULL::INTEGER AS max_num_arguments,
-        NULL::VARCHAR AS arguments,
-        NULL::VARCHAR AS description,
-        NULL::VARCHAR AS language,
-        NULL::VARCHAR AS body
-    WHERE FALSE
-"""
-
-# ``SHOW USER FUNCTIONS IN <scope>`` is a raw command (sqlglot cannot parse it), so its
-# optional ``LIKE``/``IN`` clauses are matched out of the statement text.
-_FUNCTION_SHOW_LIKE_RE = re.compile(r"LIKE\s+'((?:[^']|'')*)'", re.IGNORECASE)
-_FUNCTION_SHOW_SCOPE_RE = re.compile(
-    r"\bIN\s+(?:DATABASE\s+|SCHEMA\s+)?([A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)?)",
-    re.IGNORECASE,
-)
-_FUNCTION_SHOW_DATABASE_RE = re.compile(r"\bIN\s+DATABASE\b", re.IGNORECASE)
-
-
-def _show_like_pattern(text: str) -> str | None:
-    """Extract the ``LIKE '<pattern>'`` filter from a raw SHOW statement."""
-    match = _FUNCTION_SHOW_LIKE_RE.search(text)
-    return match.group(1).replace("''", "'") if match else None
-
-
-def _function_show_scope(
-    text: str, session: SessionContext
-) -> tuple[str, str | None]:
-    """Extract the ``(database, schema)`` a raw ``SHOW ... FUNCTIONS IN ...`` targets.
-
-    ``None`` for the schema means every schema in the database
-    (``SHOW FUNCTIONS IN DATABASE db``); an unscoped statement uses the session's current
-    database and schema.
-    """
-    match = _FUNCTION_SHOW_SCOPE_RE.search(text)
-    if match is None:
-        return session.database, session.schema
-    parts = match.group(1).split(".")
-    if _FUNCTION_SHOW_DATABASE_RE.search(text):
-        return parts[0], None
-    if len(parts) == 2:
-        return parts[0], parts[1]
-    return session.database, parts[0]
-
-
-def _user_function_show(
-    manager: DuckDBManager,
-    cursor: Any,
-    database: str,
-    schema: str | None,
-    like: str | None = None,
-) -> tuple[list[ColumnMeta], list[list[Any]]]:
-    """Build Snowflake-shaped ``SHOW FUNCTIONS`` output from the recorded functions."""
-    cursor.execute(_USER_FUNCTION_SHOW_SQL)
-    row_type = _result_columns(cursor)[0]
-    rows = [
-        [
-            fn.created_on,
-            fn.name,
-            fn.schema,
-            fn.database,
-            "N",  # is_builtin: only user functions are recorded
-            "N",  # is_secure: SECURE is accepted but not enforced
-            fn.show_signature,
-            fn.return_type,
-            None,  # description
-        ]
-        for fn in query_user_functions(manager, database, schema, like=like)
-    ]
-    return row_type, rows
-
-
 def _execute_function_ddl(
     manager: DuckDBManager,
     cursor: Any,
@@ -1340,124 +558,6 @@ def _execute_function_ddl(
             raise _as_execution_error(exc) from exc
         return status, [[message]]
     return None
-
-
-def _execute_function_describe(
-    manager: DuckDBManager,
-    session: SessionContext,
-    statement: exp.Expression,
-) -> tuple[list[ColumnMeta], list[list[Any]]] | None:
-    """Execute ``DESCRIBE FUNCTION`` from the recorded user functions.
-
-    An omitted argument list lists every overload, matching Snowflake's behaviour for a
-    function whose name is unambiguous. Returns ``None`` for other DESCRIBE forms.
-    """
-    if not (
-        isinstance(statement, exp.Describe)
-        and str(statement.args.get("kind") or "").upper() == "FUNCTION"
-    ):
-        return None
-    this = statement.args.get("this")
-    types: list[exp.Expression] = []
-    if isinstance(this, exp.Schema):
-        types = list(this.expressions)
-        this = this.this
-    if not isinstance(this, exp.Table):
-        return None
-
-    functions = query_user_functions(
-        manager,
-        session.database,
-        session.schema,
-        name=this.name,
-        signature=normalize_function_signature(types) if types else None,
-    )
-    if not functions:
-        raise ExecutionError(f"Function {this.name.upper()} does not exist.")
-
-    cursor = manager.cursor(session.token)
-    cursor.execute(_USER_FUNCTION_DESCRIBE_SQL)
-    row_type = _result_columns(cursor)[0]
-    rows = [
-        [
-            fn.created_on,
-            fn.name,
-            fn.schema,
-            fn.database,
-            "N",  # is_builtin
-            "N",  # is_aggregate: aggregate UDFs are not emulated
-            "N",  # is_ansi
-            fn.arity,
-            fn.arity,
-            fn.describe_signature,
-            None,  # description
-            fn.language,
-            fn.body,
-        ]
-        for fn in functions
-    ]
-    return row_type, rows
-
-
-def _execute_snowflake_describe(
-    cursor: Any,
-    session: SessionContext,
-    statement: exp.Expression,
-) -> tuple[list[ColumnMeta], list[list[Any]]] | None:
-    """Execute ``DESCRIBE TABLE`` with Snowflake's output shape.
-
-    dbt's ``get_columns_in_relation`` reads the ``name``/``type`` columns of the
-    DESCRIBE result; DuckDB's own DESCRIBE returns ``column_name``/``column_type``.
-    """
-    if not (isinstance(statement, exp.Describe) and statement.args.get("kind") == "TABLE"):
-        return None
-    table = statement.args.get("this")
-    if not isinstance(table, exp.Table):
-        return None
-    db_ident = table.args.get("catalog")
-    schema_ident = table.args.get("db")
-    database = db_ident.name if isinstance(db_ident, exp.Identifier) else session.database
-    schema = schema_ident.name if isinstance(schema_ident, exp.Identifier) else session.schema
-    table_name = table.name
-
-    cursor.execute(
-        f"""
-        SELECT
-            c.column_name AS "name",
-            c.data_type AS "type",
-            e.declared_type AS "declared_type",
-            'COLUMN' AS "kind",
-            CASE WHEN c.is_nullable THEN 'Y' ELSE 'N' END AS "null?",
-            c.column_default AS "default",
-            NULL::VARCHAR AS "primary key",
-            NULL::VARCHAR AS "unique key",
-            NULL::VARCHAR AS "check",
-            NULL::VARCHAR AS "expression",
-            c.comment AS "comment",
-            NULL::VARCHAR AS "policy name"
-        FROM duckdb_columns() c
-        LEFT JOIN "{database}".{INFORMATION_SCHEMA_SCHEMA}._sf_columns_ext e
-          ON lower(e.table_catalog) = lower(c.database_name)
-         AND lower(e.table_schema) = lower(c.schema_name)
-         AND lower(e.table_name) = lower(c.table_name)
-         AND lower(e.column_name) = lower(c.column_name)
-         AND lower(c.database_name) <> 'temp'
-        WHERE {_temp_inclusive_scope('c', database, schema)}
-          AND lower(c.table_name) = lower('{table_name}')
-        ORDER BY c.column_index
-        """
-    )
-    row_type, rows = _result_columns(cursor)
-    # Drop the helper "declared_type" column (index 2) from metadata and rows, and use
-    # the declared Snowflake type when present, else map the DuckDB type.
-    row_type = [row_type[0], row_type[1], *row_type[3:]]
-    converted: list[list[Any]] = []
-    for row in rows:
-        sf_type = _prefer_declared_type(row[2], row[1]) or duckdb_type_to_snowflake_sql_type(
-            str(row[1])
-        )
-        converted.append([row[0], sf_type, *row[3:]])
-    return row_type, converted
 
 
 def _is_ddl_status_artifact(statement: exp.Expression, description: list[Any]) -> bool:
@@ -1505,7 +605,6 @@ def _execute_create_database(
         [ColumnMeta(name="status", type="text")],
         [[f"Database {name} successfully created."]],
     )
-
 
 
 def _file_format_options(statement: exp.Expression) -> dict[str, str]:
