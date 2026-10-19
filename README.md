@@ -389,7 +389,11 @@ src/snowflake_emulator/
   executor.py            # statement execution against DuckDB
   database.py             # DuckDB connection/catalog management
   sessions.py             # in-memory session (token -> db/schema/warehouse/role)
-  stages.py               # local stage tree: PUT/GET/LIST/REMOVE/COPY INTO @stage
+  stages/                # local stage tree: PUT/GET/LIST/REMOVE/COPY INTO @stage
+    __init__.py          # staged-file query path and the stage-manager singleton
+    refs.py              # stage references, command parsing and StageError
+    manager.py           # on-disk stage tree and stage DDL
+    copy.py              # COPY INTO source resolution and DuckDB load SQL
   statement_store.py      # cache of executed statement results, by handle
   type_mapping.py          # DuckDB type -> Snowflake rowType mapping
   wire_format.py            # DuckDB value -> connector wire-format string encoding

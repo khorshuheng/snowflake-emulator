@@ -56,6 +56,7 @@ from snowflake_emulator.stages import (
     StageError,
     build_copy_sql,
     copy_stage_source,
+    get_stage_manager,
     has_stage_file_table,
     match_stage_command,
     match_stage_ddl,
@@ -241,7 +242,9 @@ def _execute_sql(
 
         if has_stage_file_table(statement):
             try:
-                statement = rewrite_stage_file_tables(statement, session, cursor)
+                statement = rewrite_stage_file_tables(
+                    statement, session, cursor, get_stage_manager()
+                )
             except (StageError, FileFormatError) as exc:
                 raise ExecutionError(str(exc)) from exc
 
@@ -261,7 +264,13 @@ def _execute_sql(
                 table_sql, stage_ref, file_format, pattern, projection = stage_copy
                 file_format = resolve_file_format(session, file_format)
                 duckdb_sql = build_copy_sql(
-                    session, table_sql, stage_ref, file_format, pattern, projection
+                    session,
+                    table_sql,
+                    stage_ref,
+                    file_format,
+                    get_stage_manager(),
+                    pattern,
+                    projection,
                 )
             if batch is not None:
                 # An array binding (executemany) runs the statement once per row.
