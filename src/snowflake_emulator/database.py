@@ -297,6 +297,146 @@ class DuckDBManager:
             WHERE {in_scope('c')}
             """
         )
+        self._create_additional_information_schema_views(db_ident, schema, database)
+
+    def _create_additional_information_schema_views(
+        self, db_ident: str, schema: str, database: str
+    ) -> None:
+        """Create the common INFORMATION_SCHEMA views beyond tables/columns."""
+        internal = f"lower('{INFORMATION_SCHEMA_SCHEMA}')"
+        views = f"""
+            CREATE OR REPLACE VIEW {db_ident}.{schema}.views AS
+            SELECT
+                v.database_name AS TABLE_CATALOG,
+                v.schema_name AS TABLE_SCHEMA,
+                v.view_name AS TABLE_NAME,
+                v.sql AS VIEW_DEFINITION,
+                'NONE'::VARCHAR AS CHECK_OPTION,
+                'NO'::VARCHAR AS IS_UPDATABLE,
+                'NO'::VARCHAR AS IS_INSERTABLE_INTO,
+                'NO'::VARCHAR AS IS_TRIGGER_UPDATABLE,
+                'NO'::VARCHAR AS IS_TRIGGER_DELETABLE,
+                'NO'::VARCHAR AS IS_TRIGGER_INSERTABLE_INTO,
+                NULL::TIMESTAMP AS CREATED,
+                NULL::TIMESTAMP AS LAST_ALTERED,
+                v.comment AS COMMENT,
+                NULL::VARCHAR AS OWNER,
+                v.column_count AS COLUMN_COUNT
+            FROM duckdb_views() v
+            WHERE v.database_name = '{database}'
+              AND lower(v.schema_name) != {internal}
+              AND v.internal = false
+        """
+        sequences = f"""
+            CREATE OR REPLACE VIEW {db_ident}.{schema}.sequences AS
+            SELECT
+                s.database_name AS SEQUENCE_CATALOG,
+                s.schema_name AS SEQUENCE_SCHEMA,
+                s.sequence_name AS SEQUENCE_NAME,
+                s.start_value AS START_VALUE,
+                s.min_value AS MINIMUM_VALUE,
+                s.max_value AS MAXIMUM_VALUE,
+                s.increment_by AS INCREMENT,
+                CASE WHEN s.cycle THEN 'YES' ELSE 'NO' END AS CYCLE_OPTION,
+                'NO'::VARCHAR AS ORDERED,
+                s.last_value AS LAST_VALUE,
+                NULL::TIMESTAMP AS CREATED,
+                NULL::TIMESTAMP AS LAST_ALTERED,
+                s.comment AS COMMENT,
+                NULL::VARCHAR AS OWNER
+            FROM duckdb_sequences() s
+            WHERE s.database_name = '{database}'
+              AND lower(s.schema_name) != {internal}
+        """
+        databases = """
+            CREATE OR REPLACE VIEW {db}.{schema}.databases AS
+            SELECT
+                d.database_name AS DATABASE_NAME,
+                NULL::VARCHAR AS DATABASE_OWNER,
+                CASE WHEN lower(current_database()) = lower(d.database_name)
+                     THEN 'YES' ELSE 'NO' END AS IS_CURRENT,
+                'NO'::VARCHAR AS IS_DEFAULT,
+                'LOCAL'::VARCHAR AS ORIGIN,
+                d.type AS TYPE,
+                NULL::BIGINT AS RETENTION_TIME,
+                d.comment AS COMMENT,
+                NULL::VARCHAR AS OWNER
+            FROM duckdb_databases() d
+            WHERE lower(d.database_name) NOT IN ('system', 'temp', 'memory')
+        """.format(db=db_ident, schema=schema)
+        table_constraints = f"""
+            CREATE OR REPLACE VIEW {db_ident}.{schema}.table_constraints AS
+            SELECT
+                c.table_catalog AS CONSTRAINT_CATALOG,
+                c.table_schema AS CONSTRAINT_SCHEMA,
+                c.constraint_name AS CONSTRAINT_NAME,
+                c.table_catalog AS TABLE_CATALOG,
+                c.table_schema AS TABLE_SCHEMA,
+                c.table_name AS TABLE_NAME,
+                c.constraint_type AS CONSTRAINT_TYPE,
+                'NO'::VARCHAR AS IS_DEFERRABLE,
+                'NO'::VARCHAR AS INITIALLY_DEFERRED,
+                'NO'::VARCHAR AS ENFORCED,
+                c.comment AS COMMENT
+            FROM (
+                SELECT DISTINCT
+                    table_catalog, table_schema, table_name,
+                    constraint_name, constraint_type, comment
+                FROM {db_ident}.{schema}._sf_constraints_ext
+            ) c
+        """
+        key_column_usage = f"""
+            CREATE OR REPLACE VIEW {db_ident}.{schema}.key_column_usage AS
+            SELECT
+                table_catalog AS CONSTRAINT_CATALOG,
+                table_schema AS CONSTRAINT_SCHEMA,
+                constraint_name AS CONSTRAINT_NAME,
+                table_catalog AS TABLE_CATALOG,
+                table_schema AS TABLE_SCHEMA,
+                table_name AS TABLE_NAME,
+                column_name AS COLUMN_NAME,
+                key_sequence AS ORDINAL_POSITION,
+                CASE WHEN constraint_type = 'FOREIGN KEY'
+                     THEN NULL ELSE key_sequence END AS POSITION_IN_UNIQUE_CONSTRAINT
+            FROM {db_ident}.{schema}._sf_constraints_ext
+        """
+        constraint_column_usage = f"""
+            CREATE OR REPLACE VIEW {db_ident}.{schema}.constraint_column_usage AS
+            SELECT
+                table_catalog AS CONSTRAINT_CATALOG,
+                table_schema AS CONSTRAINT_SCHEMA,
+                constraint_name AS CONSTRAINT_NAME,
+                table_catalog AS TABLE_CATALOG,
+                table_schema AS TABLE_SCHEMA,
+                table_name AS TABLE_NAME,
+                column_name AS COLUMN_NAME
+            FROM {db_ident}.{schema}._sf_constraints_ext
+        """
+        referential_constraints = f"""
+            CREATE OR REPLACE VIEW {db_ident}.{schema}.referential_constraints AS
+            SELECT DISTINCT
+                table_catalog AS CONSTRAINT_CATALOG,
+                table_schema AS CONSTRAINT_SCHEMA,
+                constraint_name AS CONSTRAINT_NAME,
+                NULL::VARCHAR AS UNIQUE_CONSTRAINT_CATALOG,
+                NULL::VARCHAR AS UNIQUE_CONSTRAINT_SCHEMA,
+                NULL::VARCHAR AS UNIQUE_CONSTRAINT_NAME,
+                'NONE'::VARCHAR AS MATCH_OPTION,
+                'NO ACTION'::VARCHAR AS UPDATE_RULE,
+                'NO ACTION'::VARCHAR AS DELETE_RULE
+            FROM {db_ident}.{schema}._sf_constraints_ext
+            WHERE constraint_type = 'FOREIGN KEY'
+        """
+        for sql in (
+            views,
+            sequences,
+            databases,
+            table_constraints,
+            key_column_usage,
+            constraint_column_usage,
+            referential_constraints,
+        ):
+            self._connection.execute(sql)
 
     def record_columns(
         self,
@@ -742,6 +882,24 @@ class DuckDBManager:
         if database.lower() in self._attached_catalogs:
             return True
         return self._persistent and Path(self._catalog_path(database)).exists()
+
+    def drop_database(self, database: str) -> None:
+        """Drop a Snowflake database, detaching its catalog and deleting its file."""
+        db_ident = _quote_ident(database)
+        with self._lock:
+            if database.lower() in self._attached_catalogs:
+                self._connection.execute(f"DETACH {db_ident}")
+                self._attached_catalogs.discard(database.lower())
+            self._function_arity_cache = {
+                key: value
+                for key, value in self._function_arity_cache.items()
+                if key[0] != database.lower()
+            }
+            if self._persistent:
+                path = Path(self._catalog_path(database))
+                for candidate in (path, path.with_name(f"{path.name}.wal")):
+                    if candidate.exists():
+                        candidate.unlink()
 
     def replace_database(self, database: str) -> None:
         """Recreate a Snowflake database (``CREATE OR REPLACE DATABASE``)."""

@@ -22,6 +22,7 @@ from snowflake_emulator.engine.handlers.common import convert_describe_types
 from snowflake_emulator.engine.handlers.ddl import (
     execute_alter_constraints,
     execute_create_database,
+    execute_drop_database,
     execute_file_format_ddl,
     execute_function_ddl,
     is_ddl_status_artifact,
@@ -243,6 +244,11 @@ def _execute_sql(
         create_db = execute_create_database(manager, statement)
         if create_db is not None:
             row_type, rows = create_db
+            continue
+
+        drop_db = execute_drop_database(manager, statement)
+        if drop_db is not None:
+            row_type, rows = drop_db
             continue
 
         function_ddl = execute_function_ddl(manager, cursor, session, statement)

@@ -72,6 +72,32 @@ def execute_create_database(
     )
 
 
+def execute_drop_database(
+    manager: DuckDBManager, statement: exp.Expression
+) -> tuple[list[ColumnMeta], list[list[Any]]] | None:
+    """Execute ``DROP [IF EXISTS] DATABASE`` by detaching and removing its catalog."""
+    if not (
+        isinstance(statement, exp.Drop)
+        and str(statement.args.get("kind") or "").upper() == "DATABASE"
+    ):
+        return None
+    target = drop_target_table(statement)
+    if target is None or not target.name:
+        return None
+    name = _sf_name(target.this) if isinstance(target.this, exp.Identifier) else target.name
+    exists = manager.has_database(name)
+    if not exists:
+        if statement.args.get("exists"):
+            return [ColumnMeta(name="status", type="text")], [
+                [f"Database {name} does not exist."]
+            ]
+        raise ExecutionError(f"Database {name} does not exist.")
+    manager.drop_database(name)
+    return [ColumnMeta(name="status", type="text")], [
+        [f"Database {name} successfully dropped."]
+    ]
+
+
 def _file_format_options(statement: exp.Expression) -> dict[str, str]:
     """Extract the ``TYPE = CSV, SKIP_HEADER = 1, ...`` options from a CREATE node."""
     options: dict[str, str] = {}

@@ -446,7 +446,8 @@ rejected with a Snowflake-shaped error rather than failing silently).
 | `AUTOINCREMENT`/`IDENTITY`, `CREATE SEQUENCE`, `seq.NEXTVAL` | ✅ |
 | `VARIANT`/`OBJECT`/`ARRAY`, `PARSE_JSON`, `OBJECT_CONSTRUCT`, `ARRAY_CONSTRUCT` | ✅ |
 | `LATERAL FLATTEN(...)`, `TABLE(FLATTEN(...))` | ✅ |
-| `DESCRIBE TABLE`, `{db}.INFORMATION_SCHEMA.{SCHEMATA,TABLES}` | ✅ |
+| `DESCRIBE TABLE`; `{db}.INFORMATION_SCHEMA` tables/columns/views/sequences/constraints/databases | ✅ |
+| `CREATE [OR REPLACE] DATABASE`, `DROP [IF EXISTS] DATABASE` | ✅ |
 | `SHOW` schemas/tables/views/objects/columns/keys/stages/databases/sequences/… | ✅ |
 | `CREATE FUNCTION` (SQL-bodied scalar UDFs), `DESCRIBE`/`DROP FUNCTION` | ✅ |
 | UDF overloading by arity (always) and by argument type (dispatched at run time) | ✅ |

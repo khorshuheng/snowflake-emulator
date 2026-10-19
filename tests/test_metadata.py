@@ -339,3 +339,77 @@ def test_show_stages_scope_like_and_empty_stage(client):
     rows = _post(client, "SHOW STAGES IN DATABASE EMULATOR_DB", headers).json()["data"]
     assert {row[0] for row in rows} >= {"PUBLIC_STAGE", "SCOPED_STAGE"}
     assert len(_post(client, "SHOW STAGES LIMIT 1", headers).json()["data"]) == 1
+
+
+def test_information_schema_views_and_sequences(client):
+    _post(client, "CREATE VIEW info_v AS SELECT 1 AS a")
+    _post(client, "CREATE SEQUENCE info_sq")
+
+    views = _post(
+        client,
+        "SELECT TABLE_SCHEMA, TABLE_NAME, VIEW_DEFINITION "
+        "FROM EMULATOR_DB.INFORMATION_SCHEMA.VIEWS",
+    ).json()["data"]
+    assert any(
+        row[0] == "PUBLIC" and row[1] == "INFO_V" and "SELECT 1" in row[2]
+        for row in views
+    )
+    assert not any(row[0] == "SF_INFORMATION_SCHEMA" for row in views)
+
+    sequences = _post(
+        client,
+        "SELECT SEQUENCE_SCHEMA, SEQUENCE_NAME "
+        "FROM EMULATOR_DB.INFORMATION_SCHEMA.SEQUENCES",
+    ).json()["data"]
+    assert ["PUBLIC", "INFO_SQ"] in sequences
+
+    databases = _post(
+        client, "SELECT DATABASE_NAME, IS_CURRENT FROM EMULATOR_DB.INFORMATION_SCHEMA.DATABASES"
+    ).json()["data"]
+    assert ["EMULATOR_DB", "YES"] in databases
+
+
+def test_information_schema_constraint_views(client):
+    _post(client, "CREATE TABLE info_parent (id INT PRIMARY KEY)")
+    _post(
+        client,
+        "CREATE TABLE info_child ("
+        "id INT PRIMARY KEY, u INT UNIQUE, pid INT REFERENCES info_parent(id))",
+    )
+
+    constraints = _post(
+        client,
+        "SELECT TABLE_NAME, CONSTRAINT_TYPE FROM EMULATOR_DB.INFORMATION_SCHEMA.TABLE_CONSTRAINTS",
+    ).json()["data"]
+    assert ["INFO_CHILD", "PRIMARY KEY"] in constraints
+    assert ["INFO_CHILD", "UNIQUE"] in constraints
+    assert ["INFO_CHILD", "FOREIGN KEY"] in constraints
+
+    usage = _post(
+        client,
+        "SELECT TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION "
+        "FROM EMULATOR_DB.INFORMATION_SCHEMA.KEY_COLUMN_USAGE",
+    ).json()["data"]
+    assert ["INFO_CHILD", "ID", 1] in usage
+    assert ["INFO_CHILD", "PID", 1] in usage
+
+    columns = _post(
+        client,
+        "SELECT TABLE_NAME, COLUMN_NAME "
+        "FROM EMULATOR_DB.INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE",
+    ).json()["data"]
+    assert ["INFO_CHILD", "PID"] in columns
+
+    refs = _post(
+        client,
+        "SELECT CONSTRAINT_NAME FROM EMULATOR_DB.INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS",
+    ).json()["data"]
+    assert refs
+
+
+def test_drop_database_removes_it_and_if_exists_is_accepted(client):
+    assert _post(client, "CREATE DATABASE TO_DROP").status_code == 200
+    assert _post(client, "DROP DATABASE TO_DROP").status_code == 200
+    assert _post(client, "SHOW DATABASES LIKE 'TO_DROP'").json()["data"] == []
+    assert _post(client, "DROP DATABASE IF EXISTS TO_DROP").status_code == 200
+    assert _post(client, "DROP DATABASE TO_DROP").status_code == 422
