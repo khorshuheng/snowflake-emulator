@@ -20,6 +20,7 @@ from snowflake_emulator.database import DuckDBManager
 from snowflake_emulator.engine.errors import as_execution_error
 from snowflake_emulator.engine.handlers.common import convert_describe_types
 from snowflake_emulator.engine.handlers.ddl import (
+    execute_alter_constraints,
     execute_create_database,
     execute_file_format_ddl,
     execute_function_ddl,
@@ -188,6 +189,7 @@ def _execute_sql(
             continue
 
         statement = _substitute_variables(statement, session)
+        statement = _substitute_session_functions(statement, session)
 
         stmt_sql = statement.sql(dialect="snowflake")
 
@@ -219,6 +221,12 @@ def _execute_sql(
             except duckdb.TransactionException:
                 pass
             row_type, rows = [], []
+            message = "Statement executed successfully."
+            continue
+
+        alter_constraints = execute_alter_constraints(manager, session, statement)
+        if alter_constraints is not None:
+            row_type, rows = alter_constraints
             message = "Statement executed successfully."
             continue
 
@@ -395,6 +403,27 @@ def _execute_sql(
         statement_type_id=statement_type_id(last_statement),
         number_of_binds=number_of_binds(last_statement),
     )
+
+
+def _substitute_session_functions(
+    statement: exp.Expression, session: SessionContext
+) -> exp.Expression:
+    """Replace Snowflake's CURRENT_* session functions with their session values."""
+    values: dict[type[exp.Expression], str] = {
+        exp.CurrentUser: session.user,
+        exp.CurrentRole: session.role,
+        exp.CurrentWarehouse: session.warehouse,
+        exp.CurrentAccount: "EMULATOR_ACCOUNT",
+        exp.CurrentRegion: "LOCAL",
+        exp.CurrentTimezone: "UTC",
+        exp.CurrentSession: str(abs(hash(session.token)) % 10_000_000),
+    }
+
+    def replace(node: exp.Expression) -> exp.Expression:
+        value = values.get(type(node))
+        return exp.Literal.string(value) if value is not None else node
+
+    return statement.transform(replace)
 
 
 def _matches_noop(sql: str) -> bool:

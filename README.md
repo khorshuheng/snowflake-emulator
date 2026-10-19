@@ -430,6 +430,7 @@ rejected with a Snowflake-shaped error rather than failing silently).
 | Arrow result format (`fetch_arrow_all`, `fetch_pandas_all`) | ✅ |
 | Error `errno`/`sqlState` classification | ✅ |
 | `USE DATABASE/SCHEMA/WAREHOUSE/ROLE`, `ALTER SESSION` no-op | ✅ |
+| `CURRENT_USER/ROLE/WAREHOUSE/ACCOUNT/REGION/TIMEZONE` | ✅ |
 | `BEGIN`/`COMMIT`/`ROLLBACK` on the session connection | ✅ |
 | Session variables (`SET`, `SHOW VARIABLES`, `$name`) | ✅ |
 | `RESULT_SCAN(...)`, `LAST_QUERY_ID()` | ✅ (simple `SELECT *` form) |
@@ -457,7 +458,8 @@ rejected with a Snowflake-shaped error rather than failing silently).
 
 `PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY` and `CHECK` declarations are recorded and
 shown by `SHOW ... KEYS`, but not enforced, matching Snowflake; `NOT NULL` is
-enforced. `COMMIT`/`ROLLBACK` outside a transaction are accepted as no-ops.
+enforced. This covers both `CREATE TABLE` and `ALTER TABLE ... ADD CONSTRAINT`.
+`COMMIT`/`ROLLBACK` outside a transaction are accepted as no-ops.
 | Type-overloaded UDFs with differing return types | ⚠️ rejected (one declared return type per name/arity) |
 
 ### Staging and files

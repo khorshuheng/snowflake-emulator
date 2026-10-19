@@ -334,6 +334,8 @@ class DuckDBManager:
         schema: str,
         table: str,
         rows: list[tuple[str, str, str, int, str | None, str | None]],
+        *,
+        replace: bool = True,
     ) -> None:
         """Record table constraints without letting DuckDB enforce them.
 
@@ -344,15 +346,16 @@ class DuckDBManager:
         db_ident = _quote_ident(database)
         ext_ident = _quote_ident(INFORMATION_SCHEMA_SCHEMA)
         with self._lock:
-            self._connection.execute(
-                f"DELETE FROM {db_ident}.{ext_ident}._sf_constraints_ext "
-                "WHERE lower(table_catalog) = lower(?) AND lower(table_schema) = lower(?) "
-                "AND lower(table_name) = lower(?)",
-                [database, schema, table],
-            )
+            if replace:
+                self._connection.execute(
+                    f"DELETE FROM {db_ident}.{ext_ident}._sf_constraints_ext "
+                    "WHERE lower(table_catalog) = lower(?) AND lower(table_schema) = lower(?) "
+                    "AND lower(table_name) = lower(?)",
+                    [database, schema, table],
+                )
             for constraint_name, constraint_type, column_name, key_sequence, ref_table, ref_column in rows:
                 self._connection.execute(
-                    f"INSERT INTO {db_ident}.{ext_ident}._sf_constraints_ext VALUES "
+                    f"INSERT OR REPLACE INTO {db_ident}.{ext_ident}._sf_constraints_ext VALUES "
                     "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [
                         database,

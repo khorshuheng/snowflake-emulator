@@ -9,6 +9,7 @@ can back both integration styles.
 from __future__ import annotations
 
 import time
+from typing import Any
 
 from fastapi import APIRouter, Header
 
@@ -50,6 +51,8 @@ async def login(
     schemaName: str | None = None,
     warehouse: str | None = None,
     roleName: str | None = None,
+    user: str | None = None,
+    body: dict[str, Any] | None = None,
 ) -> dict:
     """Mimic Snowflake's login endpoint: always succeeds and issues a fresh token.
 
@@ -59,6 +62,15 @@ async def login(
     """
     session = get_session_manager().create()
     _apply_query_overrides(session, databaseName, schemaName, warehouse, roleName)
+    login_data = (body or {}).get("data", {})
+    login_name = (
+        user
+        or login_data.get("LOGIN_NAME")
+        or login_data.get("loginName")
+        or login_data.get("login_name")
+    )
+    if login_name:
+        session.user = str(login_name)
 
     return {
         "success": True,

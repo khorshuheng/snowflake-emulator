@@ -280,6 +280,19 @@ def _sf_name(identifier: exp.Identifier) -> str:
     return identifier.name if identifier.args.get("quoted") else identifier.name.upper()
 
 
+def _display_table_parts(
+    session: SessionContext, table: exp.Table
+) -> tuple[str, str, str]:
+    """Return Snowflake-cased ``(database, schema, table)`` parts for a table node."""
+    catalog = table.args.get("catalog")
+    db = table.args.get("db")
+    name = table.this
+    database = _sf_name(catalog) if isinstance(catalog, exp.Identifier) else session.database
+    schema = _sf_name(db) if isinstance(db, exp.Identifier) else session.schema
+    table_name = _sf_name(name) if isinstance(name, exp.Identifier) else table.name
+    return database, schema, table_name
+
+
 def _reference_info(reference: exp.Reference) -> tuple[str | None, list[str]]:
     """Return the ``(table, columns)`` a REFERENCES clause points at."""
     target = reference.this
@@ -299,10 +312,10 @@ def _reference_info(reference: exp.Reference) -> tuple[str | None, list[str]]:
     return None, []
 
 
-def _constraint_rows(
-    schema: exp.Schema, table_name: str
+def _constraint_rows_from_items(
+    items: list[exp.Expression], table_name: str
 ) -> list[tuple[str, str, str, int, str | None, str | None]]:
-    """Extract primary/unique/foreign-key rows from a CREATE TABLE schema."""
+    """Extract primary/unique/foreign-key rows from CREATE/ALTER constraint items."""
     rows: list[tuple[str, str, str, int, str | None, str | None]] = []
     unnamed = 0
 
@@ -337,7 +350,7 @@ def _constraint_rows(
                     (constraint_name, "FOREIGN KEY", column, sequence, ref_table, ref_column)
                 )
 
-    for item in schema.expressions:
+    for item in items:
         if isinstance(item, exp.ColumnDef):
             column = _sf_name(item.this) if isinstance(item.this, exp.Identifier) else item.this.name
             for constraint in item.args.get("constraints") or []:
@@ -369,6 +382,12 @@ def _constraint_rows(
     return rows
 
 
+def _constraint_rows(
+    schema: exp.Schema, table_name: str
+) -> list[tuple[str, str, str, int, str | None, str | None]]:
+    return _constraint_rows_from_items(schema.expressions, table_name)
+
+
 def record_constraints(
     manager: DuckDBManager, session: SessionContext, statement: exp.Create
 ) -> None:
@@ -380,18 +399,40 @@ def record_constraints(
     schema = statement.this
     if not isinstance(schema, exp.Schema) or not isinstance(schema.this, exp.Table):
         return
-    table = schema.this
-    catalog = table.args.get("catalog")
-    db = table.args.get("db")
-    name = table.this
-    display_database = (
-        _sf_name(catalog) if isinstance(catalog, exp.Identifier) else database
+    display_database, display_schema, display_table = _display_table_parts(
+        session, schema.this
     )
-    display_schema = _sf_name(db) if isinstance(db, exp.Identifier) else table_schema
-    display_table = _sf_name(name) if isinstance(name, exp.Identifier) else table_name
     manager.record_constraints(
         display_database,
         display_schema,
         display_table,
         _constraint_rows(schema, display_table),
+    )
+
+
+def execute_alter_constraints(
+    manager: DuckDBManager, session: SessionContext, statement: exp.Expression
+) -> tuple[list[ColumnMeta], list[list[Any]]] | None:
+    """Record ``ALTER TABLE ... ADD CONSTRAINT`` and skip DuckDB execution.
+
+    Snowflake does not enforce the added constraint. Only an ALTER whose sole actions
+    are ADD CONSTRAINT is handled here; mixed ALTERs keep their normal DuckDB path.
+    """
+    if not (isinstance(statement, exp.Alter) and statement.args.get("kind") == "TABLE"):
+        return None
+    actions = statement.args.get("actions") or []
+    if not actions or not all(isinstance(action, exp.AddConstraint) for action in actions):
+        return None
+    table = statement.this
+    if not isinstance(table, exp.Table):
+        return None
+    database, schema, table_name = _display_table_parts(session, table)
+    rows: list[tuple[str, str, str, int, str | None, str | None]] = []
+    for action in actions:
+        rows.extend(_constraint_rows_from_items(action.expressions, table_name))
+    if rows:
+        manager.record_constraints(database, schema, table_name, rows, replace=False)
+    return (
+        [ColumnMeta(name="status", type="text")],
+        [["Statement executed successfully."]],
     )

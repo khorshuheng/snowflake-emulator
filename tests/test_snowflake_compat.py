@@ -492,3 +492,43 @@ def test_commit_or_rollback_outside_transaction_is_a_noop(client):
     for statement in ("COMMIT", "ROLLBACK"):
         assert _post(client, statement).status_code == 200
     assert _post(client, "SELECT 1 AS x").json()["data"] == [[1]]
+
+
+def test_current_session_functions_return_session_values(client):
+    headers = _auth_headers(client)
+    resp = _post(
+        client,
+        "SELECT CURRENT_USER() AS u, CURRENT_ROLE() AS r, "
+        "CURRENT_WAREHOUSE() AS w, CURRENT_ACCOUNT() AS a, "
+        "CURRENT_REGION() AS region, CURRENT_TIMEZONE() AS tz",
+        headers,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["data"] == [
+        [
+            "EMULATOR_USER",
+            "ACCOUNTADMIN",
+            "EMULATOR_WH",
+            "EMULATOR_ACCOUNT",
+            "LOCAL",
+            "UTC",
+        ]
+    ]
+
+    assert _post(client, "USE ROLE analyst", headers).status_code == 200
+    assert _post(client, "USE WAREHOUSE wh2", headers).status_code == 200
+    resp = _post(client, "SELECT CURRENT_ROLE(), CURRENT_WAREHOUSE()", headers)
+    assert resp.json()["data"] == [["ANALYST", "WH2"]]
+
+
+def test_alter_table_add_constraint_is_recorded_not_enforced(client):
+    assert _post(client, "CREATE TABLE alter_c (id INT)").status_code == 200
+    assert (
+        _post(client, "ALTER TABLE alter_c ADD CONSTRAINT pk PRIMARY KEY (id)").status_code
+        == 200
+    )
+    # ALTER-added constraints are metadata only, as on Snowflake.
+    assert _post(client, "INSERT INTO alter_c VALUES (1)").status_code == 200
+    assert _post(client, "INSERT INTO alter_c VALUES (1)").status_code == 200
+    rows = _post(client, "SHOW PRIMARY KEYS IN TABLE alter_c").json()["data"]
+    assert [(row[4], row[5]) for row in rows] == [("ID", 1)]

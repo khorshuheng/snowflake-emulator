@@ -22,6 +22,7 @@ class SessionContext:
     """Mutable session-scoped state: current database/schema/warehouse/role."""
 
     token: str
+    user: str = "EMULATOR_USER"
     database: str = field(default_factory=lambda: settings.default_database)
     schema: str = field(default_factory=lambda: settings.default_schema)
     warehouse: str = field(default_factory=lambda: settings.default_warehouse)
