@@ -377,7 +377,11 @@ src/snowflake_emulator/
       describe.py       # DESCRIBE handlers and describeOnly
       ddl.py            # database/function/file-format DDL
       stage.py          # PUT/GET/LIST/REMOVE and stage DDL
-  translator.py         # sqlglot-based Snowflake -> DuckDB translation
+  translator/           # sqlglot-based Snowflake -> DuckDB translation
+    __init__.py         # public API, core transpile and non-array rewrites
+    arrays.py           # array-function rewrites over JSON/VARIANT arrays
+    constants.py        # dialect names and parser markers
+    errors.py           # TranslationError
   executor.py            # statement execution against DuckDB
   database.py             # DuckDB connection/catalog management
   sessions.py             # in-memory session (token -> db/schema/warehouse/role)
