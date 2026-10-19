@@ -135,6 +135,8 @@ def _execute_sql(
     manager.ensure_namespace(session.database, session.schema)
     cursor = manager.cursor(session.token)
     cursor.execute(f'USE "{session.database}"."{session.schema}"')
+    # Snowflake's default/session timezone is UTC; DuckDB otherwise inherits the host.
+    cursor.execute("SET TimeZone='UTC'")
 
     # Resolves user-defined function calls to the DuckDB macros backing them; loads
     # lazily so a session with no ``CREATE FUNCTION`` never touches the side table.

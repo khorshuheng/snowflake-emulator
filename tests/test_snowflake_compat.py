@@ -576,3 +576,13 @@ def test_ddl_that_cannot_be_emulated_fails_loudly(client):
         response = _post(client, statement)
         assert response.status_code == 422
         assert message in response.json()["detail"]["message"]
+
+
+def test_session_timezone_is_utc(client):
+    resp = _post(
+        client, "SELECT CURRENT_TIMEZONE() AS tz, CURRENT_TIMESTAMP() AS ts"
+    )
+    assert resp.status_code == 200
+    timezone, timestamp = resp.json()["data"][0]
+    assert timezone == "UTC"
+    assert timestamp.endswith("Z")
