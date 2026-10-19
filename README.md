@@ -429,7 +429,8 @@ rejected with a Snowflake-shaped error rather than failing silently).
 | Typed / named / array bind parameters (`executemany`) | ✅ |
 | Arrow result format (`fetch_arrow_all`, `fetch_pandas_all`) | ✅ |
 | Error `errno`/`sqlState` classification | ✅ |
-| `USE DATABASE/SCHEMA/WAREHOUSE/ROLE`, `ALTER SESSION` no-op, transactions | ✅ |
+| `USE DATABASE/SCHEMA/WAREHOUSE/ROLE`, `ALTER SESSION` no-op | ✅ |
+| `BEGIN`/`COMMIT`/`ROLLBACK` on the session connection | ✅ |
 | Session variables (`SET`, `SHOW VARIABLES`, `$name`) | ✅ |
 | `RESULT_SCAN(...)`, `LAST_QUERY_ID()` | ✅ (simple `SELECT *` form) |
 | Per-session isolation mode; configurable no-op regexes | ✅ |
@@ -453,6 +454,10 @@ rejected with a Snowflake-shaped error rather than failing silently).
 | `VARCHAR(n)` lengths in `DESCRIBE`/`SHOW COLUMNS` | ⚠️ reported as `VARCHAR` |
 | `TIMESTAMP_LTZ` precision | ⚠️ mapped to `TIMESTAMP_TZ` at microsecond precision |
 | `SHOW FUNCTIONS` built-in catalogue | ⚠️ user-defined functions only |
+
+`PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY` and `CHECK` declarations are recorded and
+shown by `SHOW ... KEYS`, but not enforced, matching Snowflake; `NOT NULL` is
+enforced. `COMMIT`/`ROLLBACK` outside a transaction are accepted as no-ops.
 | Type-overloaded UDFs with differing return types | ⚠️ rejected (one declared return type per name/arity) |
 
 ### Staging and files

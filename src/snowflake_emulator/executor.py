@@ -7,6 +7,7 @@ import time
 import uuid
 from typing import Any
 
+import duckdb
 from sqlglot import exp
 
 from snowflake_emulator.core.errors import ExecutionError
@@ -23,6 +24,7 @@ from snowflake_emulator.engine.handlers.ddl import (
     execute_file_format_ddl,
     execute_function_ddl,
     is_ddl_status_artifact,
+    record_constraints,
     record_declared_columns,
     record_temp_table_owner,
 )
@@ -196,10 +198,26 @@ def _execute_sql(
             message = "Statement executed successfully."
             continue
 
-        if is_alter_session(stmt_sql) or is_transaction_control(statement):
-            # ALTER SESSION SET/UNSET <param> and BEGIN/COMMIT/ROLLBACK have no
-            # meaning under the emulator's autocommit execution model; accept them
-            # as no-ops (schemachange sets QUERY_TAG and commits around every script).
+        if is_alter_session(stmt_sql):
+            # Session parameters are not modelled; accept ALTER SESSION SET/UNSET as a
+            # no-op (schemachange sets QUERY_TAG around every script).
+            row_type, rows = [], []
+            message = "Statement executed successfully."
+            continue
+
+        if is_transaction_control(statement):
+            # Run real transactions on the session's connection. Snowflake accepts
+            # COMMIT/ROLLBACK outside a transaction, while DuckDB raises, so those are
+            # treated as the no-op Snowflake makes them.
+            try:
+                if isinstance(statement, exp.Transaction):
+                    cursor.execute("BEGIN TRANSACTION")
+                elif isinstance(statement, exp.Commit):
+                    cursor.execute("COMMIT")
+                elif isinstance(statement, exp.Rollback):
+                    cursor.execute("ROLLBACK")
+            except duckdb.TransactionException:
+                pass
             row_type, rows = [], []
             message = "Statement executed successfully."
             continue
@@ -318,6 +336,7 @@ def _execute_sql(
             and str(statement.args.get("kind") or "").upper() == "TABLE"
         ):
             record_declared_columns(manager, session, statement)
+            record_constraints(manager, session, statement)
             record_temp_table_owner(manager, session, statement)
 
         if copy_loaded is not None:

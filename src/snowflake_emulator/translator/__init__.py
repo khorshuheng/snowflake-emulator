@@ -320,6 +320,60 @@ def _rewrite_clone(statement: exp.Expression) -> exp.Expression:
 
 
 
+def _strip_table_constraints(statement: exp.Expression) -> exp.Expression:
+    """Remove constraints DuckDB would enforce but Snowflake would not.
+
+    Snowflake records primary, unique, foreign-key and check constraints without
+    enforcing them (``NOT NULL`` is the exception). DuckDB enforces all of them, so the
+    declarations are stripped here; their metadata is recorded separately for SHOW.
+    """
+    if not (
+        isinstance(statement, exp.Create)
+        and str(statement.args.get("kind") or "").upper() == "TABLE"
+        and isinstance(statement.this, exp.Schema)
+    ):
+        return statement
+    rewritten = statement.copy()
+    schema = rewritten.this.copy()
+    expressions: list[exp.Expression] = []
+    for item in schema.expressions:
+        if isinstance(item, exp.ColumnDef):
+            constraints = item.args.get("constraints") or []
+            kept = [
+                constraint
+                for constraint in constraints
+                if not isinstance(
+                    constraint.kind,
+                    (
+                        exp.PrimaryKeyColumnConstraint,
+                        exp.UniqueColumnConstraint,
+                        exp.CheckColumnConstraint,
+                        exp.Reference,
+                    ),
+                )
+            ]
+            if len(kept) != len(constraints):
+                item = item.copy()
+                item.set("constraints", kept)
+            expressions.append(item)
+            continue
+        if isinstance(
+            item,
+            (
+                exp.Constraint,
+                exp.PrimaryKey,
+                exp.UniqueColumnConstraint,
+                exp.ForeignKey,
+                exp.CheckColumnConstraint,
+            ),
+        ):
+            continue
+        expressions.append(item)
+    schema.set("expressions", expressions)
+    rewritten.set("this", schema)
+    return rewritten
+
+
 def transpile_to_duckdb(
     statement: exp.Expression,
     user_functions: UserFunctionResolver | None = None,
@@ -349,10 +403,12 @@ def transpile_to_duckdb(
 
         if isinstance(statement, exp.Create) and statement.args.get("kind") == "TABLE":
             pre_statements, create = _rewrite_autoincrement_create(statement)
+            create = _strip_table_constraints(create)
             if pre_statements:
                 parts = [seq.sql(dialect=WRITE_DIALECT) for seq in pre_statements]
                 parts.append(create.sql(dialect=WRITE_DIALECT))
                 return ";\n".join(parts)
+            statement = create
         return statement.sql(dialect=WRITE_DIALECT)
     except TranslationError:
         raise

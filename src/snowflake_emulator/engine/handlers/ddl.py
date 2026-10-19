@@ -274,3 +274,124 @@ def is_ddl_status_artifact(statement: exp.Expression, description: list[Any]) ->
     if len(description) != 1 or description[0][0] not in ("Count", "Success"):
         return False
     return isinstance(statement, (exp.Create, exp.Drop, exp.Alter))
+
+
+def _sf_name(identifier: exp.Identifier) -> str:
+    return identifier.name if identifier.args.get("quoted") else identifier.name.upper()
+
+
+def _reference_info(reference: exp.Reference) -> tuple[str | None, list[str]]:
+    """Return the ``(table, columns)`` a REFERENCES clause points at."""
+    target = reference.this
+    if isinstance(target, exp.Schema):
+        table = (
+            _sf_name(target.this.this)
+            if isinstance(target.this, exp.Table)
+            and isinstance(target.this.this, exp.Identifier)
+            else None
+        )
+        columns = [
+            _sf_name(item) for item in target.expressions if isinstance(item, exp.Identifier)
+        ]
+        return table, columns
+    if isinstance(target, exp.Table):
+        return _sf_name(target.this) if isinstance(target.this, exp.Identifier) else None, []
+    return None, []
+
+
+def _constraint_rows(
+    schema: exp.Schema, table_name: str
+) -> list[tuple[str, str, str, int, str | None, str | None]]:
+    """Extract primary/unique/foreign-key rows from a CREATE TABLE schema."""
+    rows: list[tuple[str, str, str, int, str | None, str | None]] = []
+    unnamed = 0
+
+    def add_table_constraint(node: exp.Expression, name: str | None) -> None:
+        nonlocal unnamed
+        unnamed += 1
+        if isinstance(node, exp.PrimaryKey):
+            columns = [_sf_name(item) for item in node.expressions if isinstance(item, exp.Identifier)]
+            constraint_name = name or f"{table_name}_pkey"
+            for sequence, column in enumerate(columns, start=1):
+                rows.append((constraint_name, "PRIMARY KEY", column, sequence, None, None))
+        elif isinstance(node, exp.UniqueColumnConstraint):
+            target = node.this
+            columns = (
+                [_sf_name(item) for item in target.expressions if isinstance(item, exp.Identifier)]
+                if isinstance(target, exp.Schema)
+                else []
+            )
+            constraint_name = name or f"{table_name}_key_{unnamed}"
+            for sequence, column in enumerate(columns, start=1):
+                rows.append((constraint_name, "UNIQUE", column, sequence, None, None))
+        elif isinstance(node, exp.ForeignKey):
+            columns = [_sf_name(item) for item in node.expressions if isinstance(item, exp.Identifier)]
+            reference = node.args.get("reference")
+            ref_table, ref_columns = (
+                _reference_info(reference) if isinstance(reference, exp.Reference) else (None, [])
+            )
+            constraint_name = name or f"{table_name}_fkey_{unnamed}"
+            for sequence, column in enumerate(columns, start=1):
+                ref_column = ref_columns[sequence - 1] if sequence <= len(ref_columns) else None
+                rows.append(
+                    (constraint_name, "FOREIGN KEY", column, sequence, ref_table, ref_column)
+                )
+
+    for item in schema.expressions:
+        if isinstance(item, exp.ColumnDef):
+            column = _sf_name(item.this) if isinstance(item.this, exp.Identifier) else item.this.name
+            for constraint in item.args.get("constraints") or []:
+                kind = constraint.kind
+                if isinstance(kind, exp.PrimaryKeyColumnConstraint):
+                    rows.append(
+                        (f"{table_name}_{column}_pkey", "PRIMARY KEY", column, 1, None, None)
+                    )
+                elif isinstance(kind, exp.UniqueColumnConstraint):
+                    rows.append((f"{table_name}_{column}_key", "UNIQUE", column, 1, None, None))
+                elif isinstance(kind, exp.Reference):
+                    ref_table, ref_columns = _reference_info(kind)
+                    rows.append(
+                        (
+                            f"{table_name}_{column}_fkey",
+                            "FOREIGN KEY",
+                            column,
+                            1,
+                            ref_table,
+                            ref_columns[0] if ref_columns else None,
+                        )
+                    )
+        elif isinstance(item, exp.Constraint):
+            name = _sf_name(item.this) if isinstance(item.this, exp.Identifier) else None
+            for inner in item.expressions:
+                add_table_constraint(inner, name)
+        else:
+            add_table_constraint(item, None)
+    return rows
+
+
+def record_constraints(
+    manager: DuckDBManager, session: SessionContext, statement: exp.Create
+) -> None:
+    """Persist a CREATE TABLE's declared constraints without enforcing them."""
+    target = created_table_target(session, statement)
+    if target is None or is_temporary_table_create(statement):
+        return
+    database, table_schema, table_name = target
+    schema = statement.this
+    if not isinstance(schema, exp.Schema) or not isinstance(schema.this, exp.Table):
+        return
+    table = schema.this
+    catalog = table.args.get("catalog")
+    db = table.args.get("db")
+    name = table.this
+    display_database = (
+        _sf_name(catalog) if isinstance(catalog, exp.Identifier) else database
+    )
+    display_schema = _sf_name(db) if isinstance(db, exp.Identifier) else table_schema
+    display_table = _sf_name(name) if isinstance(name, exp.Identifier) else table_name
+    manager.record_constraints(
+        display_database,
+        display_schema,
+        display_table,
+        _constraint_rows(schema, display_table),
+    )

@@ -258,6 +258,7 @@ class DuckDBManager:
         # name/arity may carry several overloads; they are dispatched at run time.
         self._create_functions_ext_table(db_ident, schema)
         self._migrate_functions_ext(db_ident, schema)
+        self._create_constraints_ext_table(db_ident, schema)
         self._connection.execute(
             f"""
             CREATE OR REPLACE VIEW {db_ident}.{schema}.columns AS
@@ -327,6 +328,46 @@ class DuckDBManager:
                     [database, schema, table, name, declared_type, comment],
                 )
 
+    def record_constraints(
+        self,
+        database: str,
+        schema: str,
+        table: str,
+        rows: list[tuple[str, str, str, int, str | None, str | None]],
+    ) -> None:
+        """Record table constraints without letting DuckDB enforce them.
+
+        Snowflake accepts primary/unique/foreign-key declarations but does not enforce
+        them; the emulator therefore strips them from the DuckDB DDL and keeps the
+        metadata here for ``SHOW ... KEYS``.
+        """
+        db_ident = _quote_ident(database)
+        ext_ident = _quote_ident(INFORMATION_SCHEMA_SCHEMA)
+        with self._lock:
+            self._connection.execute(
+                f"DELETE FROM {db_ident}.{ext_ident}._sf_constraints_ext "
+                "WHERE lower(table_catalog) = lower(?) AND lower(table_schema) = lower(?) "
+                "AND lower(table_name) = lower(?)",
+                [database, schema, table],
+            )
+            for constraint_name, constraint_type, column_name, key_sequence, ref_table, ref_column in rows:
+                self._connection.execute(
+                    f"INSERT INTO {db_ident}.{ext_ident}._sf_constraints_ext VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        database,
+                        schema,
+                        table,
+                        constraint_name,
+                        constraint_type,
+                        column_name,
+                        key_sequence,
+                        ref_table,
+                        ref_column,
+                        None,
+                    ],
+                )
+
     def _create_functions_ext_table(self, db_ident: str, schema: str) -> None:
         """Create the user-defined function metadata side table if it is missing."""
         self._connection.execute(
@@ -348,6 +389,29 @@ class DuckDBManager:
                 PRIMARY KEY (
                     function_catalog, function_schema, function_name,
                     num_arguments, signature
+                )
+            )
+            """
+        )
+
+    def _create_constraints_ext_table(self, db_ident: str, schema: str) -> None:
+        """Create the constraint metadata side table if it is missing."""
+        self._connection.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {db_ident}.{schema}._sf_constraints_ext (
+                table_catalog VARCHAR,
+                table_schema VARCHAR,
+                table_name VARCHAR,
+                constraint_name VARCHAR,
+                constraint_type VARCHAR,
+                column_name VARCHAR,
+                key_sequence INTEGER,
+                referenced_table VARCHAR,
+                referenced_column VARCHAR,
+                comment VARCHAR,
+                PRIMARY KEY (
+                    table_catalog, table_schema, table_name, constraint_name,
+                    column_name, key_sequence
                 )
             )
             """

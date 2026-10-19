@@ -369,14 +369,15 @@ def execute_show_keys(
         return None
     database, schema, table_name = show_key_scope(statement, session)
 
-    where = ["lower(database_name) = lower(?)"]
+    where = ["lower(table_catalog) = lower(?)"]
     params: list[Any] = [database]
     if schema is not None:
-        where.append("lower(schema_name) = lower(?)")
+        where.append("lower(table_schema) = lower(?)")
         params.append(schema)
     if table_name is not None:
         where.append("lower(table_name) = lower(?)")
         params.append(table_name)
+    source = f'"{database}".{INFORMATION_SCHEMA_SCHEMA}._sf_constraints_ext'
 
     if kind in ("PRIMARY", "UNIQUE"):
         params.insert(0, "PRIMARY KEY" if kind == "PRIMARY" else "UNIQUE")
@@ -384,15 +385,15 @@ def execute_show_keys(
             f"""
             SELECT
                 NULL::TIMESTAMP AS created_on,
-                database_name AS database_name,
-                schema_name AS schema_name,
+                table_catalog AS database_name,
+                table_schema AS schema_name,
                 table_name AS table_name,
-                u.column_name AS column_name,
-                u.key_sequence AS key_sequence,
+                column_name AS column_name,
+                key_sequence AS key_sequence,
                 constraint_name AS constraint_name,
                 NULL::VARCHAR AS rely,
                 NULL::VARCHAR AS comment
-            FROM duckdb_constraints(), UNNEST(constraint_column_names) WITH ORDINALITY AS u(column_name, key_sequence)
+            FROM {source}
             WHERE constraint_type = ? AND {' AND '.join(where)}
             ORDER BY table_name, constraint_name, key_sequence
             """,
@@ -403,15 +404,15 @@ def execute_show_keys(
             f"""
             SELECT
                 NULL::TIMESTAMP AS created_on,
-                database_name AS pk_database_name,
-                schema_name AS pk_schema_name,
+                table_catalog AS pk_database_name,
+                table_schema AS pk_schema_name,
                 referenced_table AS pk_table_name,
-                referenced_column_names[u.key_sequence] AS pk_column_name,
-                database_name AS fk_database_name,
-                schema_name AS fk_schema_name,
+                referenced_column AS pk_column_name,
+                table_catalog AS fk_database_name,
+                table_schema AS fk_schema_name,
                 table_name AS fk_table_name,
-                u.column_name AS fk_column_name,
-                u.key_sequence AS key_sequence,
+                column_name AS fk_column_name,
+                key_sequence AS key_sequence,
                 NULL::VARCHAR AS update_rule,
                 NULL::VARCHAR AS delete_rule,
                 constraint_name AS fk_name,
@@ -419,7 +420,7 @@ def execute_show_keys(
                 NULL::VARCHAR AS deferrability,
                 NULL::VARCHAR AS rely,
                 NULL::VARCHAR AS comment
-            FROM duckdb_constraints(), UNNEST(constraint_column_names) WITH ORDINALITY AS u(column_name, key_sequence)
+            FROM {source}
             WHERE constraint_type = 'FOREIGN KEY' AND {' AND '.join(where)}
             ORDER BY table_name, constraint_name, key_sequence
             """,

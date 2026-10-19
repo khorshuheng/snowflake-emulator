@@ -425,3 +425,70 @@ def test_backslash_escapes_stay_literal_in_string_literals(client):
     assert _post(client, r"INSERT INTO esc_t VALUES ('C:\Users\me')").status_code == 200
     resp = _post(client, "SELECT s FROM esc_t")
     assert resp.json()["data"] == [["C:\\Users\\me"]]
+
+
+def test_constraints_are_recorded_but_not_enforced(client):
+    """Snowflake records PK/UNIQUE/FK/CHECK but only enforces NOT NULL."""
+    assert _post(client, "CREATE TABLE parent_nf (id INT PRIMARY KEY)").status_code == 200
+    assert (
+        _post(
+            client,
+            "CREATE TABLE child_nf ("
+            "id INT PRIMARY KEY, "
+            "u INT UNIQUE, "
+            "c INT CHECK (c > 0), "
+            "pid INT REFERENCES parent_nf(id))",
+        ).status_code
+        == 200
+    )
+
+    # Duplicate primary key and unique value, a failing CHECK and an orphan FK are all
+    # accepted, matching Snowflake's non-enforcement.
+    assert (
+        _post(client, "INSERT INTO child_nf VALUES (1, 1, 1, 99)").status_code == 200
+    )
+    assert (
+        _post(client, "INSERT INTO child_nf VALUES (1, 1, -1, 99)").status_code == 200
+    )
+    assert _post(client, "SELECT COUNT(*) AS n FROM child_nf").json()["data"] == [[2]]
+
+    rows = _post(client, "SHOW PRIMARY KEYS IN TABLE child_nf").json()["data"]
+    assert [(row[4], row[5]) for row in rows] == [("ID", 1)]
+    rows = _post(client, "SHOW UNIQUE KEYS IN TABLE child_nf").json()["data"]
+    assert [row[4] for row in rows] == ["U"]
+    rows = _post(client, "SHOW FOREIGN KEYS IN TABLE child_nf").json()["data"]
+    assert any(row[4] == "ID" and row[8] == "PID" for row in rows)
+
+    # NOT NULL is the one constraint Snowflake does enforce.
+    assert _post(client, "CREATE TABLE nn_nf (v INT NOT NULL)").status_code == 200
+    assert _post(client, "INSERT INTO nn_nf VALUES (NULL)").status_code == 422
+
+
+def test_transactions_commit_and_rollback(client):
+    assert _post(client, "CREATE TABLE tx_t (a INT)").status_code == 200
+    assert _post(client, "INSERT INTO tx_t VALUES (1)").status_code == 200
+
+    assert _post(client, "BEGIN").status_code == 200
+    assert _post(client, "INSERT INTO tx_t VALUES (2)").status_code == 200
+    assert _post(client, "ROLLBACK").status_code == 200
+    assert _post(client, "SELECT * FROM tx_t ORDER BY a").json()["data"] == [[1]]
+
+    assert _post(client, "BEGIN").status_code == 200
+    assert _post(client, "INSERT INTO tx_t VALUES (3)").status_code == 200
+    assert _post(client, "COMMIT").status_code == 200
+    assert _post(client, "SELECT * FROM tx_t ORDER BY a").json()["data"] == [[1], [3]]
+
+    # A multi-statement request shares the same transaction.
+    resp = _post(
+        client,
+        "BEGIN; INSERT INTO tx_t VALUES (4); ROLLBACK; "
+        "SELECT * FROM tx_t ORDER BY a",
+    )
+    assert resp.status_code == 200
+    assert resp.json()["data"] == [[1], [3]]
+
+
+def test_commit_or_rollback_outside_transaction_is_a_noop(client):
+    for statement in ("COMMIT", "ROLLBACK"):
+        assert _post(client, statement).status_code == 200
+    assert _post(client, "SELECT 1 AS x").json()["data"] == [[1]]
