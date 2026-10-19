@@ -76,6 +76,20 @@ from snowflake_emulator.type_mapping import duckdb_type_to_snowflake
 from snowflake_emulator.user_functions import SessionUserFunctionResolver
 
 
+_COPY_RESULT_COLUMNS = [
+    ColumnMeta(name="file", type="text"),
+    ColumnMeta(name="status", type="text"),
+    ColumnMeta(name="rows_parsed", type="fixed", duckdb_type="BIGINT"),
+    ColumnMeta(name="rows_loaded", type="fixed", duckdb_type="BIGINT"),
+    ColumnMeta(name="error_limit", type="fixed", duckdb_type="BIGINT"),
+    ColumnMeta(name="errors_seen", type="fixed", duckdb_type="BIGINT"),
+    ColumnMeta(name="first_error", type="text"),
+    ColumnMeta(name="first_error_line", type="fixed", duckdb_type="BIGINT"),
+    ColumnMeta(name="first_error_character", type="fixed", duckdb_type="BIGINT"),
+    ColumnMeta(name="first_error_column_name", type="text"),
+]
+
+
 def execute_sql(
     manager: DuckDBManager,
     session: SessionContext,
@@ -259,11 +273,12 @@ def _execute_sql(
 
         batch = bind_batch if len(statements) == 1 else None
         batch_affected = 0
+        copy_loaded: list[tuple[str, int]] | None = None
         try:
             if stage_copy is not None:
                 table_sql, stage_ref, file_format, pattern, projection = stage_copy
                 file_format = resolve_file_format(session, file_format)
-                duckdb_sql = build_copy_sql(
+                copy_plan = build_copy_sql(
                     session,
                     table_sql,
                     stage_ref,
@@ -272,7 +287,16 @@ def _execute_sql(
                     pattern,
                     projection,
                 )
-            if batch is not None:
+                copy_loaded = []
+                for file_label, copy_sql in copy_plan:
+                    cursor.execute(copy_sql)
+                    loaded = 0
+                    if cursor.description:
+                        fetched = cursor.fetchone()
+                        if fetched and isinstance(fetched[0], int):
+                            loaded = fetched[0]
+                    copy_loaded.append((file_label, loaded))
+            elif batch is not None:
                 # An array binding (executemany) runs the statement once per row.
                 for row in batch:
                     cursor.execute(duckdb_sql, list(row))
@@ -296,7 +320,24 @@ def _execute_sql(
             record_declared_columns(manager, session, statement)
             record_temp_table_owner(manager, session, statement)
 
-        if batch is not None:
+        if copy_loaded is not None:
+            row_type = _COPY_RESULT_COLUMNS
+            rows = [
+                [
+                    file_label,
+                    "LOADED",
+                    loaded,
+                    loaded,
+                    0,
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                ]
+                for file_label, loaded in copy_loaded
+            ]
+        elif batch is not None:
             # Report the total affected rows across the batch, as Snowflake does for a
             # multi-row DML, instead of the last row's count.
             row_type = [ColumnMeta(name="Count", type="fixed", duckdb_type="BIGINT")]

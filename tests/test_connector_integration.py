@@ -241,8 +241,14 @@ def test_put_csv_then_copy_into(connection, tmp_path):
     assert row[6] == "UPLOADED"
 
     cur.execute("CREATE OR REPLACE TABLE staged_csv (a INT, b VARCHAR)")
-    cur.execute("COPY INTO staged_csv FROM @~/staged FILE_FORMAT = (TYPE = CSV)")
-    assert cur.fetchall() == [(2,)]
+    cur.execute(
+        "COPY INTO staged_csv FROM @~/staged "
+        "FILE_FORMAT = (TYPE = CSV, SKIP_HEADER = 1)"
+    )
+    loaded = cur.fetchall()
+    assert len(loaded) == 1
+    assert loaded[0][1] == "LOADED"
+    assert loaded[0][3] == 2
 
     cur.execute("SELECT * FROM staged_csv ORDER BY a")
     assert cur.fetchall() == [(1, "x"), (2, "y")]
@@ -258,7 +264,10 @@ def test_put_json_then_copy_into(connection, tmp_path):
 
     cur.execute("CREATE OR REPLACE TABLE staged_json (a INT, b VARCHAR)")
     cur.execute("COPY INTO staged_json FROM @~/staged FILE_FORMAT = (TYPE = JSON)")
-    assert cur.fetchall() == [(2,)]
+    loaded = cur.fetchall()
+    assert len(loaded) == 1
+    assert loaded[0][1] == "LOADED"
+    assert loaded[0][3] == 2
 
     cur.execute("SELECT * FROM staged_json ORDER BY a")
     assert cur.fetchall() == [(3, "z"), (4, "w")]
@@ -346,8 +355,13 @@ def test_named_stage_roundtrip(connection, tmp_path):
     assert any(row[0] == "my_stage" for row in stages)
 
     cur.execute("CREATE OR REPLACE TABLE named_t (a INT, b VARCHAR)")
-    cur.execute("COPY INTO named_t FROM @my_stage FILE_FORMAT = (TYPE = CSV)")
-    assert cur.fetchall() == [(2,)]
+    cur.execute(
+        "COPY INTO named_t FROM @my_stage "
+        "FILE_FORMAT = (TYPE = CSV, SKIP_HEADER = 1)"
+    )
+    loaded = cur.fetchall()
+    assert len(loaded) == 1
+    assert loaded[0][3] == 2
     cur.execute("SELECT * FROM named_t ORDER BY a")
     assert cur.fetchall() == [(1, "x"), (2, "y")]
 
@@ -365,7 +379,8 @@ def test_copy_into_file_format_options(connection, tmp_path):
     cur.execute(f"PUT file://{headerless} @~/nh")
     cur.execute("CREATE OR REPLACE TABLE th (a INT, b VARCHAR)")
     cur.execute("COPY INTO th FROM @~/nh FILE_FORMAT = (TYPE = CSV, SKIP_HEADER = 1)")
-    assert cur.fetchall() == [(1,)]
+    loaded = cur.fetchall()
+    assert loaded[0][3] == 1
     cur.execute("SELECT * FROM th ORDER BY a")
     assert cur.fetchall() == [(2, "y")]
 
@@ -374,9 +389,11 @@ def test_copy_into_file_format_options(connection, tmp_path):
     cur.execute(f"PUT file://{tsv} @~/t")
     cur.execute("CREATE OR REPLACE TABLE tt (a INT, b VARCHAR)")
     cur.execute(
-        "COPY INTO tt FROM @~/t FILE_FORMAT = (TYPE = CSV, FIELD_DELIMITER = '\\t')"
+        "COPY INTO tt FROM @~/t "
+        "FILE_FORMAT = (TYPE = CSV, FIELD_DELIMITER = '\\t', SKIP_HEADER = 1)"
     )
-    assert cur.fetchall() == [(1,)]
+    loaded = cur.fetchall()
+    assert loaded[0][3] == 1
     cur.execute("SELECT * FROM tt")
     assert cur.fetchall() == [(5, "q")]
 

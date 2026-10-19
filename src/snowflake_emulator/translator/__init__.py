@@ -7,8 +7,8 @@ from dataclasses import dataclass
 
 import sqlglot
 from sqlglot import exp
-from sqlglot.dialects import Snowflake
 
+from snowflake_emulator import sqlglot_patch  # noqa: F401  (global parser settings)
 from snowflake_emulator.core.ast import drop_target_table  # re-exported for compatibility
 from snowflake_emulator.core.constants import INFORMATION_SCHEMA_SCHEMA
 from snowflake_emulator.translator.ast_helpers import _quoted_identifier
@@ -41,19 +41,6 @@ from snowflake_emulator.translator.parsing import (
     split_statements,
 )
 from snowflake_emulator.translator.transforms import _apply_transforms
-
-
-# sqlglot 30.21 began decoding backslash escapes in Snowflake string literals: an
-# unknown escape (``\d``, ``\.``, ``\U``) lost its backslash, and numeric escapes
-# (``\x41``, ``\u0041``, octal ``\101``) were decoded to their character. Snowflake
-# keeps unknown escapes literal and does not decode those numeric forms, so restoring
-# the pre-30.21 tokenizer settings here keeps regex patterns and paths intact (e.g.
-# ``REGEXP_REPLACE(x, '\d', ...)`` and ``'C:\Users\me'``). Set on the imported
-# ``Snowflake.Tokenizer`` rather than a subclass: ``sqlglot.parse(..., read="snowflake")``
-# resolves the dialect class, so replacing ``Tokenizer`` afterwards has no effect.
-Snowflake.Tokenizer.DROP_UNKNOWN_ESCAPES = False
-Snowflake.Tokenizer.NUMERIC_ESCAPES = {}
-
 
 
 _USE_RE = re.compile(

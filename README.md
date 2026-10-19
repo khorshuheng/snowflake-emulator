@@ -270,6 +270,12 @@ Supported stage commands:
 | `COPY INTO t FROM @stage[/path/file] [PATTERN='...'] [FILE_FORMAT=(TYPE=CSV\|JSON\|PARQUET, ...)]` | Load staged files into an existing table via DuckDB; a path prefix or one exact file both work, and `PATTERN` filters the files read. |
 | `CREATE STAGE` / `DROP STAGE` / `ALTER STAGE` / `SHOW STAGES` | Stage metadata; `@name` resolves in the session's current database/schema. |
 
+`COPY INTO` follows Snowflake's CSV defaults (no header row; `SKIP_HEADER` is a line
+count) and returns one result row per file with Snowflake's load-report columns
+(`file`, `status`, `rows_parsed`, `rows_loaded`, ...). Options the emulator cannot honor
+(`ON_ERROR`, `PURGE`, `FORCE`, `MATCH_BY_COLUMN_NAME`, a direct `STRIP_OUTER_ARRAY`, or
+an unsupported file-format option) are rejected rather than silently ignored.
+
 Stage references supported: `@~` (user stage, private per session), `@name`,
 `@db.schema.name`, `@%table` (table stage), `@%` (internal stage). A stage reference is a
 namespace: a sub-path that escapes its stage (`@stage/../x`, `@..`) is rejected rather

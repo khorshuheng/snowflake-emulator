@@ -743,12 +743,16 @@ def test_stage_put_list_copy_into_csv(client, tmp_path):
     copied = client.post(
         "/api/v2/statements",
         json={
-            "statement": "COPY INTO staged_t FROM @~/staged FILE_FORMAT = (TYPE = CSV)"
+            "statement": "COPY INTO staged_t FROM @~/staged "
+        "FILE_FORMAT = (TYPE = CSV, SKIP_HEADER = 1)"
         },
         headers=headers,
     )
     assert copied.status_code == 200
-    assert copied.json()["data"] == [[2]]
+    copied_rows = copied.json()["data"]
+    assert len(copied_rows) == 1
+    assert copied_rows[0][1] == "LOADED"
+    assert copied_rows[0][3] == 2
 
     selected = client.post(
         "/api/v2/statements",
@@ -783,7 +787,10 @@ def test_stage_put_json_and_copy_into(client, tmp_path):
         headers=headers,
     )
     assert copied.status_code == 200
-    assert copied.json()["data"] == [[1]]
+    copied_rows = copied.json()["data"]
+    assert len(copied_rows) == 1
+    assert copied_rows[0][1] == "LOADED"
+    assert copied_rows[0][3] == 1
 
     selected = client.post(
         "/api/v2/statements",
@@ -1194,13 +1201,13 @@ def test_copy_into_parquet_file(client, tmp_path):
 
     # An exact file reference is enough: the extension selects the reader.
     inferred = _select(client, headers, "COPY INTO pq_inferred FROM @~/staged/people.parquet")
-    assert inferred["data"] == [[2]]
+    assert inferred["data"][0][3] == 2
     typed = _select(
         client,
         headers,
         "COPY INTO pq_typed FROM @~/staged/people.parquet FILE_FORMAT = (TYPE = PARQUET)",
     )
-    assert typed["data"] == [[2]]
+    assert typed["data"][0][3] == 2
 
     for table in ("pq_inferred", "pq_typed"):
         rows = _select(client, headers, f"SELECT * FROM {table} ORDER BY age")
@@ -1218,9 +1225,10 @@ def test_copy_into_from_exact_file_reference(client, tmp_path):
     copied = _select(
         client,
         headers,
-        "COPY INTO from_file FROM @~/staged/data.csv FILE_FORMAT = (TYPE = CSV)",
+        "COPY INTO from_file FROM @~/staged/data.csv "
+        "FILE_FORMAT = (TYPE = CSV, SKIP_HEADER = 1)",
     )
-    assert copied["data"] == [[2]]
+    assert copied["data"][0][3] == 2
     rows = _select(client, headers, "SELECT * FROM from_file ORDER BY a")
     assert rows["data"] == [[1, "x"], [2, "y"]]
 
@@ -1241,14 +1249,15 @@ def test_copy_into_pattern_filters_staged_files(client, tmp_path):
         "COPY INTO patterned FROM @~/staged PATTERN = '.*part1[.]csv' "
         "FILE_FORMAT = (TYPE = CSV)",
     )
-    assert first["data"] == [[1]]
+    assert first["data"][0][3] == 1
     both = _select(
         client,
         headers,
         "COPY INTO patterned FROM @~/staged PATTERN = '.*[.]csv' "
         "FILE_FORMAT = (TYPE = CSV)",
     )
-    assert both["data"] == [[2]]
+    assert len(both["data"]) == 2
+    assert sum(row[3] for row in both["data"]) == 2
     rows = _select(client, headers, "SELECT b FROM patterned ORDER BY b")
     assert [row[0] for row in rows["data"]] == ["part1.csv", "part1.csv", "part2.csv"]
 
@@ -1276,9 +1285,10 @@ def test_copy_into_stage_source_is_not_rewritten_as_a_query(client, tmp_path):
     copied = _select(
         client,
         headers,
-        "COPY INTO copied FROM @~/staged FILE_FORMAT = (TYPE = CSV)",
+        "COPY INTO copied FROM @~/staged "
+        "FILE_FORMAT = (TYPE = CSV, SKIP_HEADER = 1)",
     )
-    assert copied["data"] == [[2]]
+    assert copied["data"][0][3] == 2
 
 
 def test_copy_into_stage_subquery_applies_projection(client, tmp_path):
@@ -1295,7 +1305,7 @@ def test_copy_into_stage_subquery_applies_projection(client, tmp_path):
         "COPY INTO projected FROM (SELECT $1:name AS n, $1:age AS a "
         "FROM @~/staged/data.json) FILE_FORMAT = (TYPE = JSON)",
     )
-    assert copied["data"] == [[2]]
+    assert copied["data"][0][3] == 2
 
     # The projection, not a 1:1 column copy, is what landed in the table.
     stored = _select(client, headers, "SELECT * FROM projected ORDER BY a")
@@ -1317,7 +1327,7 @@ def test_copy_into_stage_subquery_honours_strip_outer_array(client, tmp_path):
         "COPY INTO projected FROM (SELECT $1:a AS a FROM @~/staged/array.json) "
         "FILE_FORMAT = (TYPE = JSON, STRIP_OUTER_ARRAY = TRUE)",
     )
-    assert copied["data"] == [[2]]
+    assert copied["data"][0][3] == 2
     assert _select(client, headers, "SELECT * FROM projected ORDER BY a")["data"] == [
         [1],
         [2],
@@ -1550,7 +1560,7 @@ def test_copy_into_compressed_csv_with_explicit_type(client, tmp_path):
         headers,
         "COPY INTO gz_t FROM @~/staged/data.csv.gz FILE_FORMAT = (TYPE = CSV)",
     )
-    assert copied["data"] == [[2]]
+    assert copied["data"][0][3] == 2
 
 
 def test_select_from_stage_rejects_unsupported_file_format_options(client, tmp_path):
@@ -1580,3 +1590,122 @@ def test_select_from_stage_rejects_unsupported_file_format_options(client, tmp_p
         "EMPTY_FIELD_AS_NULL = TRUE, COMPRESSION = AUTO))",
     )
     assert accepted["data"] == [[1, " x "]]
+
+
+def test_copy_into_returns_snowflake_load_report(client, tmp_path):
+    csv_path = tmp_path / "data.csv"
+    csv_path.write_text("1,x\n2,y\n")
+    headers = _stage_headers(client)
+    _stage(client, headers, csv_path, "@~/staged")
+    _select(client, headers, "CREATE TABLE report_t (a INT, b VARCHAR)")
+
+    copied = _select(
+        client,
+        headers,
+        "COPY INTO report_t FROM @~/staged FILE_FORMAT = (TYPE = CSV)",
+    )
+    names = [col["name"] for col in copied["resultSetMetaData"]["rowType"]]
+    assert names == [
+        "file",
+        "status",
+        "rows_parsed",
+        "rows_loaded",
+        "error_limit",
+        "errors_seen",
+        "first_error",
+        "first_error_line",
+        "first_error_character",
+        "first_error_column_name",
+    ]
+    assert len(copied["data"]) == 1
+    row = copied["data"][0]
+    assert row[0] == "staged/data.csv"
+    assert row[1] == "LOADED"
+    assert row[2] == 2
+    assert row[3] == 2
+    assert row[4] == 0
+    assert row[5] == 0
+
+
+def test_copy_into_skip_header_is_a_count(client, tmp_path):
+    csv_path = tmp_path / "data.csv"
+    csv_path.write_text("a,b\njunk,junk\n1,x\n2,y\n")
+    headers = _stage_headers(client)
+    _stage(client, headers, csv_path, "@~/staged")
+    _select(client, headers, "CREATE TABLE skip_t (a INT, b VARCHAR)")
+
+    _select(
+        client,
+        headers,
+        "COPY INTO skip_t FROM @~/staged "
+        "FILE_FORMAT = (TYPE = CSV, SKIP_HEADER = 2)",
+    )
+    assert _select(client, headers, "SELECT * FROM skip_t ORDER BY a")["data"] == [
+        [1, "x"],
+        [2, "y"],
+    ]
+
+
+def test_copy_into_multiple_files_reports_one_row_per_file(client, tmp_path):
+    for name in ("part1.csv", "part2.csv"):
+        (tmp_path / name).write_text("1,x\n")
+    headers = _stage_headers(client)
+    for name in ("part1.csv", "part2.csv"):
+        _stage(client, headers, tmp_path / name, "@~/staged")
+    _select(client, headers, "CREATE TABLE multi_copy (a INT, b VARCHAR)")
+
+    copied = _select(
+        client,
+        headers,
+        "COPY INTO multi_copy FROM @~/staged PATTERN = '.*[.]csv' "
+        "FILE_FORMAT = (TYPE = CSV)",
+    )
+    assert sorted(row[0] for row in copied["data"]) == [
+        "staged/part1.csv",
+        "staged/part2.csv",
+    ]
+    assert sum(row[3] for row in copied["data"]) == 2
+
+
+def test_copy_into_rejects_options_it_cannot_honor(client, tmp_path):
+    csv_path = tmp_path / "data.csv"
+    csv_path.write_text("1,x\n")
+    headers = _stage_headers(client)
+    _stage(client, headers, csv_path, "@~/staged")
+    _select(client, headers, "CREATE TABLE reject_t (a INT, b VARCHAR)")
+
+    trimmed = client.post(
+        "/api/v2/statements",
+        json={
+            "statement": "COPY INTO reject_t FROM @~/staged "
+            "FILE_FORMAT = (TYPE = CSV, TRIM_SPACE = TRUE)"
+        },
+        headers=headers,
+    )
+    assert trimmed.status_code == 422
+    assert "TRIM_SPACE" in trimmed.json()["detail"]["message"]
+
+    on_error = client.post(
+        "/api/v2/statements",
+        json={
+            "statement": "COPY INTO reject_t FROM @~/staged "
+            "FILE_FORMAT = (TYPE = CSV) ON_ERROR = 'CONTINUE'"
+        },
+        headers=headers,
+    )
+    assert on_error.status_code == 422
+    assert "ON_ERROR" in on_error.json()["detail"]["message"]
+
+    json_path = tmp_path / "data.json"
+    json_path.write_text('{"a": 1}\n')
+    _stage(client, headers, json_path, "@~/staged")
+    strip = client.post(
+        "/api/v2/statements",
+        json={
+            "statement": "COPY INTO reject_t FROM @~/staged/data.json "
+            "FILE_FORMAT = (TYPE = JSON, STRIP_OUTER_ARRAY = TRUE)"
+        },
+        headers=headers,
+    )
+    assert strip.status_code == 422
+    assert "STRIP_OUTER_ARRAY" in strip.json()["detail"]["message"]

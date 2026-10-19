@@ -8,6 +8,7 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.tokens import TokenType
 
+from snowflake_emulator import sqlglot_patch  # noqa: F401  (global parser settings)
 from snowflake_emulator.translator.constants import (
     READ_DIALECT,
     _ARRAY_FLATTEN_NAME,

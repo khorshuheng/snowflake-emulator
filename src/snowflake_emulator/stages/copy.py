@@ -17,6 +17,7 @@ from snowflake_emulator.stages.refs import (
     StageError,
     StageRef,
     _compile_pattern,
+    _split_top_level,
     _unquote_literal,
     parse_stage_ref,
 )
@@ -60,9 +61,40 @@ def copy_stage_source(
         if not stage_ref.startswith("@"):
             return None
         projection = None
+    if len(files) > 1:
+        raise StageError(
+            "COPY INTO with multiple source references is not supported by the emulator."
+        )
+    _check_copy_options(copy_node)
     table_sql = copy_node.this.sql(dialect="duckdb")
     file_format = _extract_file_format(copy_node)
     return table_sql, stage_ref, file_format, _copy_param(copy_node, "PATTERN"), projection
+
+
+# Options the emulator does not implement. A value equal to Snowflake's default is
+# accepted (it changes nothing); anything else is rejected instead of silently ignored.
+_COPY_OPTION_DEFAULTS = {
+    "ON_ERROR": "ABORT_STATEMENT",
+    "PURGE": "FALSE",
+    "FORCE": "FALSE",
+    "LOAD_UNCERTAIN_FILES": "FALSE",
+    "MATCH_BY_COLUMN_NAME": "NONE",
+}
+
+
+def _check_copy_options(copy_node: exp.Copy) -> None:
+    for name, default in _COPY_OPTION_DEFAULTS.items():
+        value = _copy_param(copy_node, name)
+        if value is not None and value.strip().upper() != default:
+            raise StageError(
+                f"COPY INTO option {name} = {value} is not supported by the emulator."
+            )
+    for name in ("INCLUDE_METADATA", "VALIDATION_MODE"):
+        value = _copy_param(copy_node, name)
+        if value is not None:
+            raise StageError(
+                f"COPY INTO option {name} = {value} is not supported by the emulator."
+            )
 
 
 # Only these SELECT clauses are carried into the staged reader. Every other clause
@@ -276,8 +308,12 @@ def build_copy_sql(
     manager: StageManager,
     pattern: str | None = None,
     projection: str | None = None,
-) -> str:
-    """Build DuckDB SQL that loads the staged files into ``table_sql``."""
+) -> list[tuple[str, str]]:
+    """Build one DuckDB load statement per staged file.
+
+    Returns ``(stage_relative_path, sql)`` pairs, so the caller can report one
+    Snowflake-shaped COPY result row per file.
+    """
     stage = parse_stage_ref(stage_ref_sql)
     fmt_type = file_format.get("TYPE", "").upper()
 
@@ -299,17 +335,18 @@ def build_copy_sql(
     if not matches:
         raise StageError(f"No files found in stage location: {stage_ref_sql}")
 
-    groups: dict[str, list[str]] = {"CSV": [], "JSON": [], "PARQUET": []}
-    for _rel, abs_path in matches:
+    groups: dict[str, list[tuple[str, str]]] = {"CSV": [], "JSON": [], "PARQUET": []}
+    for rel, abs_path in matches:
         # The extension decides the reader, and pins the files a stated TYPE covers: the
         # extension helper strips compression suffixes, so a `.csv.gz` still counts as CSV.
         file_format_name = _extension_file_format(abs_path)
         if stated_format is not None and file_format_name != stated_format:
             continue
-        groups[stated_format or file_format_name].append(abs_path)
+        groups[stated_format or file_format_name].append((rel, abs_path))
 
     _check_staged_compression(
-        sorted(groups["CSV"] + groups["JSON"] + groups["PARQUET"]), stage_ref_sql
+        sorted(abs_path for group in groups.values() for _rel, abs_path in group),
+        stage_ref_sql,
     )
 
     # A projection is carried only for JSON, whose raw reader exposes it as `$1`; the
@@ -320,26 +357,33 @@ def build_copy_sql(
             "JSON files; CSV and Parquet sources must be copied without one."
         )
 
-    statements: list[str] = []
-    if groups["CSV"]:
-        statements.append(_copy_csv_sql(table_sql, groups["CSV"], file_format))
-    if groups["JSON"]:
-        statements.append(
-            _copy_json_sql(
-                table_sql,
-                groups["JSON"],
-                stage_ref_sql,
-                projection,
-                _bool_option(file_format, "STRIP_OUTER_ARRAY"),
+    for format_name, entries in groups.items():
+        if entries:
+            _check_file_format_options(file_format, format_name, stage_ref_sql)
+
+    plan: list[tuple[str, str]] = []
+    for rel, abs_path in groups["CSV"]:
+        plan.append((rel, _copy_csv_sql(table_sql, [abs_path], file_format)))
+    for rel, abs_path in groups["JSON"]:
+        plan.append(
+            (
+                rel,
+                _copy_json_sql(
+                    table_sql,
+                    [abs_path],
+                    stage_ref_sql,
+                    projection,
+                    _bool_option(file_format, "STRIP_OUTER_ARRAY"),
+                ),
             )
         )
-    if groups["PARQUET"]:
-        statements.append(_copy_parquet_sql(table_sql, groups["PARQUET"]))
-    if not statements:
+    for rel, abs_path in groups["PARQUET"]:
+        plan.append((rel, _copy_parquet_sql(table_sql, [abs_path])))
+    if not plan:
         raise StageError(
             f"No {fmt_type or 'matching'} files found in stage location: {stage_ref_sql}"
         )
-    return ";\n".join(statements)
+    return plan
 
 
 def _stage_matches(
@@ -347,6 +391,79 @@ def _stage_matches(
 ) -> list[tuple[str, str]]:
     """List the files a stage reference resolves to, as (stage-relative, absolute) pairs."""
     return manager._list_matches(manager.stage_base_dir(session, stage), stage.path, None)
+
+
+def _int_option(options: dict[str, Any], key: str) -> int | None:
+    value = options.get(key)
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return int(str(value).strip())
+    except ValueError:
+        raise StageError(f"Invalid {key} value in a staged file query: {value!r}") from None
+
+
+def _bool_option_explicitly_false(options: dict[str, Any], key: str) -> bool:
+    """True only when the option is present and set to a false value."""
+    value = options.get(key)
+    return value is not None and str(value).strip().upper() in ("FALSE", "0", "NO", "OFF")
+
+
+def _string_list_option(value: Any) -> list[str]:
+    """Reduce a Snowflake single-or-list option value to a list of plain strings."""
+    inner = str(value).strip()
+    if inner[:1] in ("(", "["):
+        inner = inner[1:-1]
+    return [item.strip("'\"") for item in _split_top_level(inner)]
+
+
+def _stage_csv_reader(files: list[str], options: dict[str, Any]) -> str:
+    """Build the DuckDB CSV reader call for a staged file query.
+
+    The options follow Snowflake's CSV file format defaults, which differ from DuckDB's:
+    no header row (``header=false``: a header is skipped via ``SKIP_HEADER`` rather than
+    becoming column names), no quoting (``FIELD_OPTIONALLY_ENCLOSED_BY`` defaults to
+    NONE) and empty fields reading as NULL (``EMPTY_FIELD_AS_NULL`` with ``NULL_IF``
+    defaulting to ``\\N``). ``union_by_name`` widens a location whose files differ in width
+    instead of silently dropping the extra fields of the narrower file.
+    """
+    args = ["header=false", "union_by_name=true", f"max_line_size={_MAX_RECORD_BYTES}"]
+    skip_header = _int_option(options, "SKIP_HEADER")
+    if skip_header:
+        args.append(f"skip={skip_header}")
+    if options.get("FIELD_DELIMITER") is not None:
+        args.append(f"delim={_sql_string(str(options['FIELD_DELIMITER']))}")
+
+    enclosed_by = options.get("FIELD_OPTIONALLY_ENCLOSED_BY")
+    if enclosed_by is None or str(enclosed_by).strip().upper() == "NONE":
+        args.append("quote=''")
+    else:
+        args.append(f"quote={_sql_string(str(enclosed_by))}")
+    if options.get("ESCAPE") is not None:
+        args.append(f"escape={_sql_string(str(options['ESCAPE']))}")
+    unenclosed = options.get("ESCAPE_UNENCLOSED_FIELD")
+    if unenclosed is not None and str(unenclosed).strip().upper() != "NONE":
+        # DuckDB only escapes enclosed fields, so honouring this would change results.
+        raise StageError(
+            "ESCAPE_UNENCLOSED_FIELD is not supported by the emulator (DuckDB escapes "
+            "enclosed fields only); drop the option or set it to NONE."
+        )
+
+    null_if = _string_list_option(options["NULL_IF"]) if options.get("NULL_IF") else ["\\N"]
+    if not _bool_option_explicitly_false(options, "EMPTY_FIELD_AS_NULL"):
+        null_if = ["", *null_if]
+    if null_if:  # DuckDB rejects an empty nullstr list
+        args.append("nullstr=[" + ", ".join(_sql_string(v) for v in null_if) + "]")
+
+    compression = str(options.get("COMPRESSION", "")).strip().upper()
+    if compression in ("GZIP", "ZSTD", "NONE"):
+        args.append(f"compression={_sql_string(compression.lower())}")
+    elif compression and compression not in ("AUTO", "AUTO_DETECT"):
+        raise StageError(
+            f"COMPRESSION = {compression} is not supported by the emulator "
+            "(use AUTO, GZIP, ZSTD or NONE)."
+        )
+    return f"read_csv_auto({_format_file_list(files)}, {', '.join(args)})"
 
 
 def _bool_option(options: dict[str, Any], key: str) -> bool:
@@ -368,20 +485,7 @@ def _extension_file_format(path: str) -> str:
 
 
 def _copy_csv_sql(table_sql: str, files: list[str], file_format: dict[str, Any]) -> str:
-    # read_csv_auto is auto-detecting by default; pass explicit options only when
-    # the FILE_FORMAT overrides the defaults.
-    options: list[str] = []
-    skip_header = file_format.get("SKIP_HEADER")
-    if skip_header is not None:
-        try:
-            options.append(f"header={bool(int(skip_header))}".lower())
-        except ValueError:
-            pass
-    if file_format.get("FIELD_DELIMITER"):
-        options.append(f"delim='{_sql_escape(file_format['FIELD_DELIMITER'])}'")
-    suffix = f", {', '.join(options)}" if options else ""
-    read_call = f"read_csv_auto({_format_file_list(files)}{suffix})"
-    return f"INSERT INTO {table_sql} SELECT * FROM {read_call}"
+    return f"INSERT INTO {table_sql} SELECT * FROM {_stage_csv_reader(files, file_format)}"
 
 
 def _copy_json_sql(
@@ -392,6 +496,11 @@ def _copy_json_sql(
     strip_outer_array: bool = False,
 ) -> str:
     if projection is None:
+        if strip_outer_array:
+            raise StageError(
+                "STRIP_OUTER_ARRAY is only supported for "
+                "COPY INTO ... FROM (SELECT ... FROM @stage) by the emulator."
+            )
         return (
             f"INSERT INTO {table_sql} SELECT * "
             f"FROM read_json_auto({_format_file_list(files)})"
@@ -488,10 +597,6 @@ def _format_file_list(files: list[str]) -> str:
 
 def _sql_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
-
-
-def _sql_escape(value: str) -> str:
-    return value.replace("'", "''")
 
 
 def _option_value_text(value_node: exp.Expression) -> str:

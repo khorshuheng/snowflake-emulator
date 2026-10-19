@@ -237,6 +237,56 @@ def _unquote_literal(value: str) -> str:
     if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
         return text[1:-1].replace(text[0] * 2, text[0])
     return text
+def _quoted_spans(sql: str) -> list[tuple[int, int]]:
+    """Return the [start, end) ranges of single- and double-quoted strings in `sql`.
+
+    Used so a stage reference or `)` inside a string literal is not mistaken for SQL.
+    """
+    spans: list[tuple[int, int]] = []
+    i = 0
+    while i < len(sql):
+        quote = sql[i]
+        if quote not in ("'", '"'):
+            i += 1
+            continue
+        start = i
+        i += 1
+        while i < len(sql):
+            if sql[i] == quote:
+                if sql[i + 1 : i + 2] == quote:  # a doubled quote is an escape
+                    i += 2
+                    continue
+                break
+            i += 1
+        spans.append((start, min(i + 1, len(sql))))
+        i += 1
+    return spans
+
+
+def _split_top_level(text: str) -> list[str]:
+    """Split a comma-separated option list on its top-level commas."""
+    quoted = _quoted_spans(text)
+
+    def in_string(index: int) -> bool:
+        return any(start <= index < end for start, end in quoted)
+
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    for index, char in enumerate(text):
+        if in_string(index):
+            continue
+        if char in "([":
+            depth += 1
+        elif char in ")]":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append(text[start:index])
+            start = index + 1
+    parts.append(text[start:])
+    return [part.strip() for part in parts if part.strip()]
+
+
 def _compile_pattern(pattern: str | None) -> re.Pattern[str] | None:
     if not pattern:
         return None

@@ -30,6 +30,7 @@ from typing import Any
 import sqlglot
 from sqlglot import exp
 
+from snowflake_emulator import sqlglot_patch  # noqa: F401  (global parser settings)
 from snowflake_emulator.file_formats import resolve_file_format
 from snowflake_emulator.sessions import SessionContext
 from snowflake_emulator.settings import settings
@@ -40,6 +41,7 @@ from snowflake_emulator.stages.copy import (
     _extract_file_format,
     _filter_matches,
     _MAX_RECORD_BYTES,
+    _stage_csv_reader,
     _bool_option,
     _format_file_list,
     _option_value_text,
@@ -66,6 +68,8 @@ from snowflake_emulator.stages.refs import (
     StagedFile,
     _compile_pattern,
     _parse_stage_options,
+    _quoted_spans,
+    _split_top_level,
     _unquote_literal,
     match_stage_command,
     match_stage_ddl,
@@ -145,30 +149,6 @@ def _decode_options(value: str | None) -> dict[str, Any] | None:
     return decoded if isinstance(decoded, dict) else None
 
 
-def _quoted_spans(sql: str) -> list[tuple[int, int]]:
-    """Return the [start, end) ranges of single- and double-quoted strings in `sql`.
-
-    Used so a stage reference or `)` inside a string literal is not mistaken for SQL.
-    """
-    spans: list[tuple[int, int]] = []
-    i = 0
-    while i < len(sql):
-        quote = sql[i]
-        if quote not in ("'", '"'):
-            i += 1
-            continue
-        start = i
-        i += 1
-        while i < len(sql):
-            if sql[i] == quote:
-                if sql[i + 1 : i + 2] == quote:  # a doubled quote is an escape
-                    i += 2
-                    continue
-                break
-            i += 1
-        spans.append((start, min(i + 1, len(sql))))
-        i += 1
-    return spans
 
 
 def _matching_paren(sql: str, open_index: int, quoted: list[tuple[int, int]]) -> str:
@@ -190,28 +170,6 @@ def _matching_paren(sql: str, open_index: int, quoted: list[tuple[int, int]]) ->
     raise StageError("Unbalanced parentheses in a staged file FILE_FORMAT clause.")
 
 
-def _split_top_level(text: str) -> list[str]:
-    """Split a comma-separated option list on its top-level commas."""
-    quoted = _quoted_spans(text)
-
-    def in_string(index: int) -> bool:
-        return any(start <= index < end for start, end in quoted)
-
-    parts: list[str] = []
-    depth = 0
-    start = 0
-    for index, char in enumerate(text):
-        if in_string(index):
-            continue
-        if char in "([":
-            depth += 1
-        elif char in ")]":
-            depth -= 1
-        elif char == "," and depth == 0:
-            parts.append(text[start:index])
-            start = index + 1
-    parts.append(text[start:])
-    return [part.strip() for part in parts if part.strip()]
 
 
 def parse_stage_file_options(clause: str) -> dict[str, Any]:
@@ -339,30 +297,12 @@ def _stage_file_options(session: SessionContext, table: exp.Table) -> dict[str, 
     return options
 
 
-def _int_option(options: dict[str, Any], key: str) -> int | None:
-    value = options.get(key)
-    if value is None or str(value).strip() == "":
-        return None
-    try:
-        return int(str(value).strip())
-    except ValueError:
-        raise StageError(f"Invalid {key} value in a staged file query: {value!r}") from None
 
 
 
 
-def _bool_option_explicitly_false(options: dict[str, Any], key: str) -> bool:
-    """True only when the option is present and set to a false value."""
-    value = options.get(key)
-    return value is not None and str(value).strip().upper() in ("FALSE", "0", "NO", "OFF")
 
 
-def _string_list_option(value: Any) -> list[str]:
-    """Reduce a Snowflake single-or-list option value to a list of plain strings."""
-    inner = str(value).strip()
-    if inner[:1] in ("(", "["):
-        inner = inner[1:-1]
-    return [item.strip("'\"") for item in _split_top_level(inner)]
 
 
 def _quoted_identifier(name: str) -> str:
@@ -388,53 +328,6 @@ def _infer_file_format(files: list[str], ref: str) -> str:
 
 
 
-def _stage_csv_reader(files: list[str], options: dict[str, Any]) -> str:
-    """Build the DuckDB CSV reader call for a staged file query.
-
-    The options follow Snowflake's CSV file format defaults, which differ from DuckDB's:
-    no header row (``header=false``: a header is skipped via ``SKIP_HEADER`` rather than
-    becoming column names), no quoting (``FIELD_OPTIONALLY_ENCLOSED_BY`` defaults to
-    NONE) and empty fields reading as NULL (``EMPTY_FIELD_AS_NULL`` with ``NULL_IF``
-    defaulting to ``\\N``). ``union_by_name`` widens a location whose files differ in width
-    instead of silently dropping the extra fields of the narrower file.
-    """
-    args = ["header=false", "union_by_name=true", f"max_line_size={_MAX_RECORD_BYTES}"]
-    skip_header = _int_option(options, "SKIP_HEADER")
-    if skip_header:
-        args.append(f"skip={skip_header}")
-    if options.get("FIELD_DELIMITER") is not None:
-        args.append(f"delim={_sql_string(str(options['FIELD_DELIMITER']))}")
-
-    enclosed_by = options.get("FIELD_OPTIONALLY_ENCLOSED_BY")
-    if enclosed_by is None or str(enclosed_by).strip().upper() == "NONE":
-        args.append("quote=''")
-    else:
-        args.append(f"quote={_sql_string(str(enclosed_by))}")
-    if options.get("ESCAPE") is not None:
-        args.append(f"escape={_sql_string(str(options['ESCAPE']))}")
-    unenclosed = options.get("ESCAPE_UNENCLOSED_FIELD")
-    if unenclosed is not None and str(unenclosed).strip().upper() != "NONE":
-        # DuckDB only escapes enclosed fields, so honouring this would change results.
-        raise StageError(
-            "ESCAPE_UNENCLOSED_FIELD is not supported by the emulator (DuckDB escapes "
-            "enclosed fields only); drop the option or set it to NONE."
-        )
-
-    null_if = _string_list_option(options["NULL_IF"]) if options.get("NULL_IF") else ["\\N"]
-    if not _bool_option_explicitly_false(options, "EMPTY_FIELD_AS_NULL"):
-        null_if = ["", *null_if]
-    if null_if:  # DuckDB rejects an empty nullstr list
-        args.append("nullstr=[" + ", ".join(_sql_string(v) for v in null_if) + "]")
-
-    compression = str(options.get("COMPRESSION", "")).strip().upper()
-    if compression in ("GZIP", "ZSTD", "NONE"):
-        args.append(f"compression={_sql_string(compression.lower())}")
-    elif compression and compression not in ("AUTO", "AUTO_DETECT"):
-        raise StageError(
-            f"COMPRESSION = {compression} is not supported by the emulator "
-            "(use AUTO, GZIP, ZSTD or NONE)."
-        )
-    return f"read_csv_auto({_format_file_list(files)}, {', '.join(args)})"
 
 
 def _reader_columns(cursor: Any, reader: str, ref: str) -> list[str]:
