@@ -33,10 +33,18 @@ class RowType(BaseModel):
     scale: int | None = None
 
 
+class PartitionInfo(BaseModel):
+    """One result partition, as Snowflake reports it in ``partitionInfo``."""
+
+    rowCount: int
+    uncompressedSize: int = 0
+
+
 class ResultSetMetaData(BaseModel):
     numRows: int
     format: str = "jsonv2"
     rowType: list[RowType]
+    partitionInfo: list[PartitionInfo] = Field(default_factory=list)
 
 
 class StatementResponse(BaseModel):

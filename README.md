@@ -423,6 +423,7 @@ rejected with a Snowflake-shaped error rather than failing silently).
 | Feature | Status |
 | --- | --- |
 | Snowflake SQL API v2 (`/api/v2/statements`, statement handles, cancel) | ✅ |
+| Async submission (`?async=true`) and `?partition=` polling | ✅ (one materialized partition) |
 | Connector wire protocol (`/session/v1/login-request`, `/queries/v1/query-request`) | ✅ |
 | `statementTypeId`, `describeOnly`, `finalDatabaseName/Schema/Warehouse/Role` | ✅ |
 | `GET /monitoring/queries/{sfqid}` | ✅ |

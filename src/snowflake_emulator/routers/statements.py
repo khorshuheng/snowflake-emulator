@@ -5,14 +5,21 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from fastapi import APIRouter, Header, HTTPException, status
+from fastapi import APIRouter, Header, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 
 from snowflake_emulator.bindings import decode_bindings
 from snowflake_emulator.core.results import ColumnMeta, ExecutionResult
 from snowflake_emulator.database import get_manager
 from snowflake_emulator.core.errors import error_code_pair
 from snowflake_emulator.executor import execute_sql
-from snowflake_emulator.schemas import ResultSetMetaData, RowType, StatementRequest, StatementResponse
+from snowflake_emulator.schemas import (
+    PartitionInfo,
+    ResultSetMetaData,
+    RowType,
+    StatementRequest,
+    StatementResponse,
+)
 from snowflake_emulator.sessions import SessionContext, get_session_manager
 from snowflake_emulator.statement_store import get_statement_store
 
@@ -88,19 +95,25 @@ def _json_cell(value: Any, col: ColumnMeta) -> Any:
     return value
 
 
-def _to_response(result: ExecutionResult) -> StatementResponse:
+def _to_response(
+    result: ExecutionResult, partition: int | None = None
+) -> StatementResponse:
+    # The emulator materializes the whole result as one partition. A request for a
+    # later partition still gets the correct metadata, with an empty rowset.
+    rows = result.rows if partition in (None, 0) else []
     return StatementResponse(
         statementHandle=result.handle,
         statementStatusUrl=f"/api/v2/statements/{result.handle}",
         message=result.message,
         createdOn=result.created_on,
         resultSetMetaData=ResultSetMetaData(
-            numRows=len(result.rows),
+            numRows=len(rows),
             rowType=[RowType(name=col.name, type=col.type) for col in result.row_type],
+            partitionInfo=[PartitionInfo(rowCount=len(result.rows))],
         ),
         data=[
             [_json_cell(value, col) for value, col in zip(row, result.row_type)]
-            for row in result.rows
+            for row in rows
         ],
     )
 
@@ -109,7 +122,8 @@ def _to_response(result: ExecutionResult) -> StatementResponse:
 def submit_statement(
     body: StatementRequest,
     authorization: str | None = Header(default=None),
-) -> StatementResponse:
+    async_: bool = Query(default=False, alias="async"),
+):
     token = _extract_token(authorization)
     session = get_session_manager().get_or_create(token)
     _apply_overrides(session, body)
@@ -132,18 +146,34 @@ def submit_statement(
 
     session.last_query_id = result.handle
     get_statement_store().put(result)
+    if async_:
+        # Execution is synchronous, but the SQL API contract is to return 202 and let
+        # the client poll the handle.
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content={
+                "statementHandle": result.handle,
+                "statementStatusUrl": f"/api/v2/statements/{result.handle}",
+                "message": result.message,
+                "sqlState": "00000",
+                "code": "090001",
+                "createdOn": result.created_on,
+            },
+        )
     return _to_response(result)
 
 
 @router.get("/{handle}", response_model=StatementResponse)
-def get_statement_result(handle: str) -> StatementResponse:
+def get_statement_result(
+    handle: str, partition: int | None = Query(default=None, ge=0)
+) -> StatementResponse:
     result = get_statement_store().get(handle)
     if result is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"message": f"Statement handle not found: {handle}", "sqlState": "02000"},
         )
-    return _to_response(result)
+    return _to_response(result, partition)
 
 
 @router.post("/{handle}/cancel")

@@ -1709,3 +1709,42 @@ def test_copy_into_rejects_options_it_cannot_honor(client, tmp_path):
     )
     assert strip.status_code == 422
     assert "STRIP_OUTER_ARRAY" in strip.json()["detail"]["message"]
+
+
+def test_async_statement_returns_202_and_is_pollable(client):
+    submitted = client.post(
+        "/api/v2/statements?async=true", json={"statement": "SELECT 1 AS x"}
+    )
+    assert submitted.status_code == 202
+    body = submitted.json()
+    assert "resultSetMetaData" not in body
+    handle = body["statementHandle"]
+
+    polled = client.get(f"/api/v2/statements/{handle}")
+    assert polled.status_code == 200
+    polled_body = polled.json()
+    assert polled_body["data"] == [[1]]
+    assert polled_body["resultSetMetaData"]["partitionInfo"] == [
+        {"rowCount": 1, "uncompressedSize": 0}
+    ]
+
+
+def test_get_statement_supports_partition_polling(client):
+    submitted = client.post(
+        "/api/v2/statements",
+        json={"statement": "SELECT 1 AS x UNION ALL SELECT 2 AS x"},
+    )
+    handle = submitted.json()["statementHandle"]
+
+    first = client.get(f"/api/v2/statements/{handle}?partition=0").json()
+    assert first["data"] == [[1], [2]]
+    assert first["resultSetMetaData"]["partitionInfo"] == [
+        {"rowCount": 2, "uncompressedSize": 0}
+    ]
+
+    # The emulator has one materialized partition; later partitions are empty but
+    # still report the same metadata.
+    second = client.get(f"/api/v2/statements/{handle}?partition=1").json()
+    assert second["data"] == []
+    assert second["resultSetMetaData"]["numRows"] == 0
+    assert second["resultSetMetaData"]["rowType"][0]["name"] == "X"
