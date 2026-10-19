@@ -8,9 +8,10 @@ from typing import Any
 from fastapi import APIRouter, Header, HTTPException, status
 
 from snowflake_emulator.bindings import decode_bindings
+from snowflake_emulator.core.results import ColumnMeta, ExecutionResult
 from snowflake_emulator.database import get_manager
-from snowflake_emulator.errors import error_code_pair
-from snowflake_emulator.executor import ColumnMeta, ExecutionResult, execute_sql
+from snowflake_emulator.core.errors import error_code_pair
+from snowflake_emulator.executor import execute_sql
 from snowflake_emulator.schemas import ResultSetMetaData, RowType, StatementRequest, StatementResponse
 from snowflake_emulator.sessions import SessionContext, get_session_manager
 from snowflake_emulator.statement_store import get_statement_store

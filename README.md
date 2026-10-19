@@ -364,6 +364,11 @@ src/snowflake_emulator/
     statements.py      # POST/GET /api/v2/statements
     auth.py            # session/login endpoints (SQL API v2 + wire protocol)
     queries.py           # /queries/v1/query-request etc. (connector wire protocol)
+  core/                 # shared types/errors/constants/AST helpers (no engine imports)
+    results.py          # ColumnMeta, FileTransfer, ExecutionResult
+    errors.py           # ExecutionError + DuckDB -> Snowflake error classification
+    constants.py        # INFORMATION_SCHEMA schema name
+    ast.py              # shared sqlglot AST helpers
   translator.py         # sqlglot-based Snowflake -> DuckDB translation
   executor.py            # statement execution against DuckDB
   database.py             # DuckDB connection/catalog management

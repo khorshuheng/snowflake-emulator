@@ -12,7 +12,7 @@ from snowflake_emulator import statement_types
 from snowflake_emulator.arrow import encode_arrow
 from snowflake_emulator.bindings import decode_bindings
 from snowflake_emulator.database import get_manager
-from snowflake_emulator.errors import error_code_pair
+from snowflake_emulator.core.errors import error_code_pair
 from snowflake_emulator.executor import describe_sql, execute_sql
 from snowflake_emulator.routers.auth import _extract_token
 from snowflake_emulator.sessions import get_session_manager

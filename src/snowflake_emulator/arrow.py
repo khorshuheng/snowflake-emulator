@@ -18,7 +18,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from snowflake_emulator.executor import ColumnMeta
+from snowflake_emulator.core.results import ColumnMeta
 from snowflake_emulator.type_mapping import parse_precision_scale
 
 

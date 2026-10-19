@@ -11,6 +11,8 @@ from sqlglot import exp
 from sqlglot.dialects import Snowflake
 from sqlglot.tokens import TokenType
 
+from snowflake_emulator.core.ast import drop_target_table  # re-exported for compatibility
+from snowflake_emulator.core.constants import INFORMATION_SCHEMA_SCHEMA
 from snowflake_emulator.type_mapping import duckdb_type_to_snowflake_sql_type
 
 READ_DIALECT = "snowflake"
@@ -67,12 +69,6 @@ _JSON_ARRAY_FUNCTIONS = (
 _ARRAY_CALL_NAMES = ("ARRAY_UNIQUE", "ARRAY_REPEAT", _FLATTEN_MARKER)
 # Calls whose second operand is a value searched for in, or inserted into, the array.
 _ARRAY_VALUE_FUNCTIONS = (exp.ArrayAppend, exp.ArrayInsert, exp.ArrayRemove)
-
-# DuckDB reserves the ``information_schema`` schema name, so Snowflake's
-# ``INFORMATION_SCHEMA`` is exposed under a non-reserved name and references are
-# rewritten at the AST level (see ``_rewrite_information_schema``). The name is
-# kept uppercase so it matches the emulator's Snowflake-style identifier casing.
-INFORMATION_SCHEMA_SCHEMA = "SF_INFORMATION_SCHEMA"
 
 # Snowflake's ``CURRENT_VERSION()`` reports the server's own release version. DuckDB's
 # ``VERSION()`` returns ``v1.5.5`` (with a leading ``v``), which breaks clients such as
@@ -295,19 +291,6 @@ def _make_drop_table(table: exp.Table) -> exp.Drop:
     the project no longer supports).
     """
     return exp.Drop(tables=[table.copy()], kind="TABLE", exists=True)
-
-
-def drop_target_table(statement: exp.Drop) -> exp.Table | None:
-    """Return the table a ``DROP`` targets.
-
-    Returns ``None`` when there is no single table target (e.g. a multi-target drop,
-    which the emulator does not emulate).
-    """
-    tables = statement.args.get("tables")
-    if tables:
-        target = tables[0]
-        return target if isinstance(target, exp.Table) else None
-    return None
 
 
 def _make_sequence_create(

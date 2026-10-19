@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 from collections import OrderedDict
 
-from snowflake_emulator.executor import ExecutionResult
+from snowflake_emulator.core.results import ExecutionResult
 from snowflake_emulator.settings import settings
 
 

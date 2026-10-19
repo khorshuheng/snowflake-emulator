@@ -6,13 +6,15 @@ import os
 import re
 import time
 import uuid
-from dataclasses import dataclass
 from typing import Any
 
 from sqlglot import exp
 
+from snowflake_emulator.core.ast import drop_target_table
+from snowflake_emulator.core.constants import INFORMATION_SCHEMA_SCHEMA
+from snowflake_emulator.core.errors import ExecutionError, classify_exception
+from snowflake_emulator.core.results import ColumnMeta, ExecutionResult, FileTransfer
 from snowflake_emulator.database import DuckDBManager
-from snowflake_emulator.errors import classify_exception
 from snowflake_emulator.file_formats import (
     FileFormatError,
     get_file_format_manager,
@@ -20,6 +22,7 @@ from snowflake_emulator.file_formats import (
 )
 from snowflake_emulator.sessions import SessionContext
 from snowflake_emulator.settings import settings
+from snowflake_emulator.statement_store import get_statement_store
 from snowflake_emulator.statement_types import (
     number_of_binds,
     statement_type_id,
@@ -43,10 +46,8 @@ from snowflake_emulator.stages import (
     show_stages,
 )
 from snowflake_emulator.translator import (
-    INFORMATION_SCHEMA_SCHEMA,
     TranslationError,
     UseStatement,
-    drop_target_table,
     is_alter_session,
     is_transaction_control,
     match_use_statement,
@@ -68,27 +69,6 @@ from snowflake_emulator.user_functions import (
 )
 
 
-class ExecutionError(RuntimeError):
-    """Raised when a translated statement fails to execute against DuckDB.
-
-    Carries the Snowflake ``errno``/``sqlstate`` pair so routers can answer with the
-    same error classification Snowflake clients branch on. Defaults to the generic
-    compilation-error pair for failures the emulator raises itself (stages, duplicate
-    databases).
-    """
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        errno: str = "100132",
-        sqlstate: str = "42000",
-    ) -> None:
-        super().__init__(message)
-        self.errno = errno
-        self.sqlstate = sqlstate
-
-
 def _as_execution_error(exc: BaseException) -> ExecutionError:
     """Wrap a failure as an ``ExecutionError`` with a Snowflake error classification."""
     if isinstance(exc, TranslationError):
@@ -96,36 +76,6 @@ def _as_execution_error(exc: BaseException) -> ExecutionError:
         return ExecutionError(str(exc), errno="001003", sqlstate="42000")
     errno, sqlstate = classify_exception(exc)
     return ExecutionError(str(exc), errno=errno, sqlstate=sqlstate)
-
-
-@dataclass
-class ColumnMeta:
-    name: str
-    type: str
-    duckdb_type: str = ""
-
-
-@dataclass
-class FileTransfer:
-    """Wire-protocol description of a connector-side PUT/GET file transfer."""
-
-    kind: str  # "UPLOAD" | "DOWNLOAD"
-    src_locations: list[str]
-    stage_location: str
-    local_location: str | None = None
-    overwrite: bool = False
-
-
-@dataclass
-class ExecutionResult:
-    handle: str
-    created_on: int
-    row_type: list[ColumnMeta]
-    rows: list[list[Any]]
-    message: str = "Statement executed successfully."
-    file_transfer: FileTransfer | None = None
-    statement_type_id: int = 0
-    number_of_binds: int = 0
 
 
 def execute_sql(
@@ -527,9 +477,6 @@ def _matches_noop(sql: str) -> bool:
 
 
 def _lookup_cached_result(handle: str) -> ExecutionResult | None:
-    # Imported lazily: statement_store imports ExecutionResult from this module.
-    from snowflake_emulator.statement_store import get_statement_store
-
     return get_statement_store().get(handle)
 
 

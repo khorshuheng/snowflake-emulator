@@ -29,8 +29,8 @@ from typing import Any, Iterator
 
 import duckdb
 
+from snowflake_emulator.core.constants import INFORMATION_SCHEMA_SCHEMA
 from snowflake_emulator.settings import settings
-from snowflake_emulator.translator import INFORMATION_SCHEMA_SCHEMA
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 

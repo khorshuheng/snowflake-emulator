@@ -36,10 +36,10 @@ from typing import Any
 import sqlglot
 from sqlglot import exp
 
+from snowflake_emulator.core.ast import drop_target_table
 from snowflake_emulator.file_formats import resolve_file_format
 from snowflake_emulator.sessions import SessionContext
 from snowflake_emulator.settings import settings
-from snowflake_emulator.translator import drop_target_table
 
 # -- Command detection (mirrors snowflake.connector._sql_util.get_file_transfer_type) --
 

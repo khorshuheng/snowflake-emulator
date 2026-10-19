@@ -14,7 +14,7 @@ import decimal
 import json
 from typing import Any
 
-from snowflake_emulator.executor import ColumnMeta
+from snowflake_emulator.core.results import ColumnMeta
 from snowflake_emulator.type_mapping import (
     duckdb_timestamp_scale,
     parse_precision_scale,
