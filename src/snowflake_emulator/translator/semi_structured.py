@@ -12,15 +12,51 @@ from snowflake_emulator.translator.constants import (
     EMULATED_SNOWFLAKE_VERSION,
     WRITE_DIALECT,
 )
+from snowflake_emulator.translator.errors import TranslationError
 
 
-def _flatten_subquery(input_expr: exp.Expression) -> exp.Subquery:
+def _flatten_kwargs(explode: exp.Explode) -> dict[str, exp.Expression]:
+    """Return the named arguments of a FLATTEN call."""
+    kwargs: dict[str, exp.Expression] = {}
+    for item in explode.expressions or []:
+        if isinstance(item, exp.Kwarg) and isinstance(item.this, exp.Var):
+            kwargs[item.this.name.upper()] = item.expression
+    return kwargs
+
+
+def _flatten_bool(node: exp.Expression | None) -> bool:
+    if isinstance(node, exp.Boolean):
+        return bool(node.this)
+    if isinstance(node, exp.Literal) and node.is_string:
+        return str(node.this).strip().upper() in ("TRUE", "1", "YES", "ON")
+    return False
+
+
+def _flatten_arguments(explode: exp.Explode) -> tuple[exp.Expression, bool, str | None]:
+    """Return ``(input, outer, path)`` for a FLATTEN call, rejecting unsupported options."""
+    kwargs = _flatten_kwargs(explode)
+    if "RECURSIVE" in kwargs and _flatten_bool(kwargs["RECURSIVE"]):
+        raise TranslationError(
+            "FLATTEN recursive => TRUE is not supported by the emulator."
+        )
+    path: str | None = None
+    path_node = kwargs.get("PATH")
+    if path_node is not None:
+        if not (isinstance(path_node, exp.Literal) and path_node.is_string):
+            raise TranslationError("FLATTEN path must be a string literal.")
+        path = str(path_node.this)
+    return explode.this.expression, _flatten_bool(kwargs.get("OUTER")), path
+
+
+def _flatten_subquery(
+    input_expr: exp.Expression, *, outer: bool = False, path: str | None = None
+) -> exp.Subquery:
     """Build the DuckDB subquery equivalent of Snowflake's ``FLATTEN(input => X)``.
 
     Snowflake's FLATTEN exposes SEQ/KEY/PATH/INDEX/VALUE/THIS. DuckDB's
     ``json_each()`` exposes key/value/fullkey/...; we map those onto Snowflake's
     names. INDEX is approximated as the array index (``TRY_CAST(key AS BIGINT)``),
-    which is NULL for object keys — matching Snowflake's object behaviour.
+    which is NULL for object keys -- matching Snowflake's object behaviour.
 
     The operand is rewritten first and cast to JSON: a VARIANT column is not JSON to
     DuckDB (``json_each`` rejects it), and this pass runs before the operand's own
@@ -31,13 +67,22 @@ def _flatten_subquery(input_expr: exp.Expression) -> exp.Subquery:
         exp.DataType.build("JSON"),
         dialect=WRITE_DIALECT,
     )
+    if path is not None:
+        operand = exp.func("json_extract", operand, exp.Literal.string(f"$.{path}"))
     x = operand.sql(dialect=WRITE_DIALECT)
-    select = sqlglot.parse_one(
+    rows = (
         f"SELECT ROW_NUMBER() OVER () - 1 AS seq, key, fullkey AS path, "
         f"TRY_CAST(key AS BIGINT) AS index, value, {x} AS this "
-        f"FROM json_each({x})",
-        read=WRITE_DIALECT,
+        f"FROM json_each({x})"
     )
+    if outer:
+        rows = (
+            f"({rows}) UNION ALL "
+            "SELECT NULL::BIGINT AS seq, NULL::VARCHAR AS key, NULL::VARCHAR AS path, "
+            f"NULL::BIGINT AS index, NULL::JSON AS value, {x} AS this "
+            f"WHERE NOT EXISTS (SELECT 1 FROM json_each({x}))"
+        )
+    select = sqlglot.parse_one(rows, read=WRITE_DIALECT)
     return exp.Subquery(this=select)
 
 
@@ -169,8 +214,9 @@ def _rewrite_snowflake_specifics(node: exp.Expression) -> exp.Expression:
     ):
         key = node.this.this.args.get("this")
         if getattr(key, "name", None) and key.name.upper() == "INPUT":
+            input_expr, outer, path = _flatten_arguments(node.this)
             new = node.copy()
-            new.set("this", _flatten_subquery(node.this.this.expression))
+            new.set("this", _flatten_subquery(input_expr, outer=outer, path=path))
             alias = new.args.get("alias")
             if alias is not None:
                 alias.set("columns", [])
@@ -184,7 +230,8 @@ def _rewrite_snowflake_specifics(node: exp.Expression) -> exp.Expression:
     ):
         key = node.this.this.args.get("this")
         if getattr(key, "name", None) and key.name.upper() == "INPUT":
-            sub = _flatten_subquery(node.this.this.expression)
+            input_expr, outer, path = _flatten_arguments(node.this)
+            sub = _flatten_subquery(input_expr, outer=outer, path=path)
             sub.set("alias", node.args.get("alias"))
             return sub
 

@@ -446,7 +446,8 @@ rejected with a Snowflake-shaped error rather than failing silently).
 | `CREATE TABLE ... CLONE` | ✅ (rows copied, not zero-copy) |
 | `AUTOINCREMENT`/`IDENTITY`, `CREATE SEQUENCE`, `seq.NEXTVAL` | ✅ |
 | `VARIANT`/`OBJECT`/`ARRAY`, `PARSE_JSON`, `OBJECT_CONSTRUCT`, `ARRAY_CONSTRUCT` | ✅ |
-| `LATERAL FLATTEN(...)`, `TABLE(FLATTEN(...))` | ✅ |
+| `LATERAL FLATTEN(...)`, `TABLE(FLATTEN(...))`, including `outer`/`path` | ✅ |
+| `FLATTEN(... recursive => TRUE)` | ❌ rejected |
 | `DESCRIBE TABLE`; `{db}.INFORMATION_SCHEMA` tables/columns/views/sequences/constraints/databases | ✅ |
 | `CREATE [OR REPLACE] DATABASE`, `DROP [IF EXISTS] DATABASE` | ✅ |
 | `SHOW` schemas/tables/views/objects/columns/keys/stages/databases/sequences/… | ✅ |

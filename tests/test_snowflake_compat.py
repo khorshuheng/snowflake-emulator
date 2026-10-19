@@ -532,3 +532,36 @@ def test_alter_table_add_constraint_is_recorded_not_enforced(client):
     assert _post(client, "INSERT INTO alter_c VALUES (1)").status_code == 200
     rows = _post(client, "SHOW PRIMARY KEYS IN TABLE alter_c").json()["data"]
     assert [(row[4], row[5]) for row in rows] == [("ID", 1)]
+
+
+def test_flatten_outer_and_path_options(client):
+    empty = _post(
+        client,
+        "SELECT f.value FROM (SELECT PARSE_JSON('[]') AS a) t, "
+        "LATERAL FLATTEN(input => t.a, outer => TRUE) f",
+    )
+    assert empty.status_code == 200
+    assert empty.json()["data"] == [[None]]
+
+    nonempty = _post(
+        client,
+        "SELECT f.value FROM (SELECT PARSE_JSON('[1]') AS a) t, "
+        "LATERAL FLATTEN(input => t.a, outer => TRUE) f",
+    )
+    assert nonempty.json()["data"] == [[1]]
+
+    path = _post(
+        client,
+        "SELECT f.value FROM (SELECT PARSE_JSON('{\"a\":[1,2]}') AS a) t, "
+        "LATERAL FLATTEN(input => t.a, path => 'a') f ORDER BY f.value",
+    )
+    assert path.status_code == 200
+    assert path.json()["data"] == [[1], [2]]
+
+    recursive = _post(
+        client,
+        "SELECT f.value FROM (SELECT PARSE_JSON('[[1]]') AS a) t, "
+        "LATERAL FLATTEN(input => t.a, recursive => TRUE) f",
+    )
+    assert recursive.status_code == 422
+    assert "recursive" in recursive.json()["detail"]["message"].lower()
