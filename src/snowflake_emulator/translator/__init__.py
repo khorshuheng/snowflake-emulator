@@ -374,6 +374,31 @@ def _strip_table_constraints(statement: exp.Expression) -> exp.Expression:
     return rewritten
 
 
+def _reject_unsupported_ddl(statement: exp.Expression) -> None:
+    """Reject DDL the emulator cannot emulate faithfully instead of downgrading it."""
+    if isinstance(statement, exp.Command):
+        text = str(statement.args.get("expression") or "").lstrip().upper()
+        if text.startswith("RECURSIVE VIEW"):
+            raise TranslationError(
+                "CREATE RECURSIVE VIEW is not supported by the emulator."
+            )
+        return
+    if not isinstance(statement, exp.Create):
+        return
+    kind = str(statement.args.get("kind") or "").upper()
+    if kind == "INDEX":
+        raise TranslationError("CREATE INDEX is not supported by Snowflake or the emulator.")
+    if kind == "VIEW":
+        properties = statement.args.get("properties")
+        if properties is not None and any(
+            isinstance(prop, exp.MaterializedProperty)
+            for prop in properties.expressions
+        ):
+            raise TranslationError(
+                "CREATE MATERIALIZED VIEW is not supported by the emulator."
+            )
+
+
 def transpile_to_duckdb(
     statement: exp.Expression,
     user_functions: UserFunctionResolver | None = None,
@@ -385,6 +410,7 @@ def transpile_to_duckdb(
     """
     try:
         _reject_unsupported_function(statement)
+        _reject_unsupported_ddl(statement)
         statement = _rewrite_clone(statement)
         statement = _apply_transforms(statement)
         if user_functions is not None:

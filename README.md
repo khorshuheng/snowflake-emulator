@@ -482,6 +482,8 @@ enforced. This covers both `CREATE TABLE` and `ALTER TABLE ... ADD CONSTRAINT`.
 | JavaScript / Python / Java / Scala UDFs | ❌ rejected with a clear error (no runtime) |
 | `RETURNS TABLE (...)` UDFs, and multi-column `SELECT` bodies | ❌ rejected with a clear error |
 | `CREATE TASK`, `CREATE STREAM` | ❌ syntax error |
+| `CREATE MATERIALIZED VIEW`, `CREATE INDEX`, `CREATE RECURSIVE VIEW` | ❌ rejected with a clear error |
+| `TRANSIENT` tables, `CLUSTER BY`, `SECURE` | ⚠️ accepted without operational effect |
 | Time travel (`AT`/`BEFORE`, `RESULT_SCAN` of a past state) | ❌ rejected |
 | `CLONE` of a schema or database | ❌ rejected with a clear error |
 | Stored procedures | ❌ |

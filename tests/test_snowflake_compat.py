@@ -565,3 +565,14 @@ def test_flatten_outer_and_path_options(client):
     )
     assert recursive.status_code == 422
     assert "recursive" in recursive.json()["detail"]["message"].lower()
+
+
+def test_ddl_that_cannot_be_emulated_fails_loudly(client):
+    for statement, message in (
+        ("CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a", "MATERIALIZED VIEW"),
+        ("CREATE INDEX ix ON t(a)", "CREATE INDEX"),
+        ("CREATE RECURSIVE VIEW rv AS SELECT 1 AS a", "RECURSIVE VIEW"),
+    ):
+        response = _post(client, statement)
+        assert response.status_code == 422
+        assert message in response.json()["detail"]["message"]
