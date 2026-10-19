@@ -370,10 +370,13 @@ src/snowflake_emulator/
     constants.py        # INFORMATION_SCHEMA schema name
     ast.py              # shared sqlglot AST helpers
   engine/
+    errors.py           # TranslationError -> ExecutionError wrapping
     handlers/
       common.py         # result-column and temp-table helpers
       show.py           # Snowflake-shaped SHOW handlers
       describe.py       # DESCRIBE handlers and describeOnly
+      ddl.py            # database/function/file-format DDL
+      stage.py          # PUT/GET/LIST/REMOVE and stage DDL
   translator.py         # sqlglot-based Snowflake -> DuckDB translation
   executor.py            # statement execution against DuckDB
   database.py             # DuckDB connection/catalog management

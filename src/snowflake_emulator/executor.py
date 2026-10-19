@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 import time
 import uuid
@@ -10,11 +9,23 @@ from typing import Any
 
 from sqlglot import exp
 
-from snowflake_emulator.core.ast import drop_target_table
-from snowflake_emulator.core.errors import ExecutionError, classify_exception
-from snowflake_emulator.core.results import ColumnMeta, ExecutionResult, FileTransfer
+from snowflake_emulator.core.errors import ExecutionError
+from snowflake_emulator.core.results import (
+    ColumnMeta,
+    ExecutionResult,
+    FileTransfer,  # re-exported for compatibility
+)
 from snowflake_emulator.database import DuckDBManager
+from snowflake_emulator.engine.errors import as_execution_error
 from snowflake_emulator.engine.handlers.common import convert_describe_types
+from snowflake_emulator.engine.handlers.ddl import (
+    execute_create_database,
+    execute_file_format_ddl,
+    execute_function_ddl,
+    is_ddl_status_artifact,
+    record_declared_columns,
+    record_temp_table_owner,
+)
 from snowflake_emulator.engine.handlers.describe import (
     describe_sql,  # re-exported for the wire-protocol router
     execute_function_describe,
@@ -26,9 +37,12 @@ from snowflake_emulator.engine.handlers.show import (
     execute_show_misc,
     execute_snowflake_show,
 )
+from snowflake_emulator.engine.handlers.stage import (
+    execute_stage_command,
+    execute_stage_ddl,
+)
 from snowflake_emulator.file_formats import (
     FileFormatError,
-    get_file_format_manager,
     resolve_file_format,
 )
 from snowflake_emulator.sessions import SessionContext
@@ -42,19 +56,11 @@ from snowflake_emulator.stages import (
     StageError,
     build_copy_sql,
     copy_stage_source,
-    create_stage,
-    drop_stage,
-    get_stage_manager,
     has_stage_file_table,
     match_stage_command,
     match_stage_ddl,
-    parse_get,
-    parse_list,
-    parse_put,
-    parse_remove,
     preprocess_stage_file_clauses,
     rewrite_stage_file_tables,
-    show_stages,
 )
 from snowflake_emulator.translator import (
     TranslationError,
@@ -62,27 +68,11 @@ from snowflake_emulator.translator import (
     is_alter_session,
     is_transaction_control,
     match_use_statement,
-    normalize_function_signature,
     split_statements,
-    translate_create_function,
     transpile_to_duckdb,
 )
 from snowflake_emulator.type_mapping import duckdb_type_to_snowflake
-from snowflake_emulator.user_functions import (
-    SessionUserFunctionResolver,
-    UserFunctionError,
-    execute_create_function,
-    execute_drop_function,
-)
-
-
-def _as_execution_error(exc: BaseException) -> ExecutionError:
-    """Wrap a failure as an ``ExecutionError`` with a Snowflake error classification."""
-    if isinstance(exc, TranslationError):
-        # sqlglot could not parse or transpile the statement: a SQL compilation error.
-        return ExecutionError(str(exc), errno="001003", sqlstate="42000")
-    errno, sqlstate = classify_exception(exc)
-    return ExecutionError(str(exc), errno=errno, sqlstate=sqlstate)
+from snowflake_emulator.user_functions import SessionUserFunctionResolver
 
 
 def execute_sql(
@@ -133,7 +123,7 @@ def _execute_sql(
 
     stage_command = match_stage_command(raw_sql)
     if stage_command is not None:
-        return _execute_stage_command(manager, session, raw_sql, stage_command)
+        return execute_stage_command(manager, session, raw_sql, stage_command)
 
     # `FROM @stage/file (FILE_FORMAT => (...))` is not valid sqlglot syntax; the options
     # are captured here (and decoded again in `rewrite_stage_file_tables`).
@@ -142,7 +132,7 @@ def _execute_sql(
     try:
         statements = split_statements(raw_sql)
     except TranslationError as exc:
-        raise _as_execution_error(exc) from exc
+        raise as_execution_error(exc) from exc
 
     row_type: list[ColumnMeta] = []
     rows: list[list[Any]] = []
@@ -201,20 +191,20 @@ def _execute_sql(
 
         stage_ddl = match_stage_ddl(statement)
         if stage_ddl is not None:
-            row_type, rows = _execute_stage_ddl(manager, session, statement, stage_ddl)
+            row_type, rows = execute_stage_ddl(manager, session, statement, stage_ddl)
             continue
 
-        file_format_ddl = _execute_file_format_ddl(session, statement)
+        file_format_ddl = execute_file_format_ddl(session, statement)
         if file_format_ddl is not None:
             row_type, rows = file_format_ddl
             continue
 
-        create_db = _execute_create_database(manager, statement)
+        create_db = execute_create_database(manager, statement)
         if create_db is not None:
             row_type, rows = create_db
             continue
 
-        function_ddl = _execute_function_ddl(manager, cursor, session, statement)
+        function_ddl = execute_function_ddl(manager, cursor, session, statement)
         if function_ddl is not None:
             row_type, rows = function_ddl
             continue
@@ -258,7 +248,7 @@ def _execute_sql(
         try:
             duckdb_sql = transpile_to_duckdb(statement, user_functions)
         except TranslationError as exc:
-            raise _as_execution_error(exc) from exc
+            raise as_execution_error(exc) from exc
 
         stage_copy = None
         if isinstance(statement, exp.Copy):
@@ -288,14 +278,14 @@ def _execute_sql(
         except (StageError, FileFormatError) as exc:
             raise ExecutionError(str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - re-raised as a typed execution error
-            raise _as_execution_error(exc) from exc
+            raise as_execution_error(exc) from exc
 
         if (
             isinstance(statement, exp.Create)
             and str(statement.args.get("kind") or "").upper() == "TABLE"
         ):
-            _record_declared_columns(manager, session, statement)
-            _record_temp_table_owner(manager, session, statement)
+            record_declared_columns(manager, session, statement)
+            record_temp_table_owner(manager, session, statement)
 
         if batch is not None:
             # Report the total affected rows across the batch, as Snowflake does for a
@@ -304,7 +294,7 @@ def _execute_sql(
             rows = [[batch_affected]]
         elif cursor.description:
             description = cursor.description
-            if _is_ddl_status_artifact(statement, description):
+            if is_ddl_status_artifact(statement, description):
                 # DuckDB DDL (CREATE/DROP/ALTER) reports a bare Count/Success column;
                 # Snowflake returns a plain status, so report it that way too.
                 row_type = [ColumnMeta(name="status", type="text")]
@@ -514,407 +504,6 @@ def _substitute_variables(statement: exp.Expression, session: SessionContext) ->
         return node
 
     return statement.transform(replace)
-
-
-def _execute_function_ddl(
-    manager: DuckDBManager,
-    cursor: Any,
-    session: SessionContext,
-    statement: exp.Expression,
-) -> tuple[list[ColumnMeta], list[list[Any]]] | None:
-    """Handle ``CREATE FUNCTION`` / ``DROP FUNCTION`` for user-defined functions.
-
-    Snowflake UDFs are emulated as DuckDB macros, with the Snowflake-side metadata kept
-    in the catalog's side table (see ``user_functions``). Returns ``None`` for other DDL.
-    """
-    kind = str(statement.args.get("kind") or "").upper()
-    status = [ColumnMeta(name="status", type="text")]
-    if isinstance(statement, exp.Create) and kind == "FUNCTION":
-        try:
-            spec = translate_create_function(statement)
-            message = execute_create_function(manager, cursor, session, spec)
-        except (TranslationError, UserFunctionError) as exc:
-            raise _as_execution_error(exc) from exc
-        return status, [[message]]
-    if isinstance(statement, exp.Drop) and kind == "FUNCTION":
-        this = drop_target_table(statement)
-        if this is None:
-            return None
-        # `DROP FUNCTION f(a NUMBER, b NUMBER)` names one overload; the types are
-        # normalized the same way they were recorded so the drop cannot match the wrong
-        # one. Without a signature every overload of the name is dropped.
-        types = list(statement.expressions)
-        try:
-            message = execute_drop_function(
-                manager,
-                cursor,
-                session,
-                this.name,
-                len(types) if types else None,
-                signature=normalize_function_signature(types) if types else None,
-                if_exists=bool(statement.args.get("exists")),
-            )
-        except UserFunctionError as exc:
-            raise _as_execution_error(exc) from exc
-        return status, [[message]]
-    return None
-
-
-def _is_ddl_status_artifact(statement: exp.Expression, description: list[Any]) -> bool:
-    """Return True when DuckDB reports DDL as a single ``Count``/``Success`` column.
-
-    DuckDB's Python API reports CREATE/DROP/ALTER as a one-column result named
-    ``Count`` or ``Success`` with no rows. Snowflake returns a plain status instead,
-    so those statements are routed to the standard status result.
-    """
-    if len(description) != 1 or description[0][0] not in ("Count", "Success"):
-        return False
-    return isinstance(statement, (exp.Create, exp.Drop, exp.Alter))
-
-
-def _execute_create_database(
-    manager: DuckDBManager,
-    statement: exp.Expression,
-) -> tuple[list[ColumnMeta], list[list[Any]]] | None:
-    """Execute ``CREATE DATABASE`` by attaching a fresh catalog (DuckDB has no
-    ``CREATE DATABASE``). Returns ``None`` for non-database CREATE statements.
-    """
-    if not (isinstance(statement, exp.Create) and str(statement.args.get("kind") or "").upper() == "DATABASE"):
-        return None
-    if isinstance(statement.args.get("clone"), exp.Clone):
-        # Snowflake can clone a database; the emulator cannot rebuild the catalog's
-        # contents, so it fails loudly instead of creating an empty database.
-        raise ExecutionError(
-            "CREATE DATABASE ... CLONE is not supported by the emulator "
-            "(only CREATE TABLE ... CLONE is)."
-        )
-    this = statement.args.get("this")
-    ident = this.this if isinstance(this, exp.Table) else this
-    if not isinstance(ident, exp.Identifier) or not ident.name:
-        return None
-    # Unquoted identifiers are uppercased (Snowflake semantics); quoted preserved.
-    name = ident.name if ident.args.get("quoted") else ident.name.upper()
-
-    if statement.args.get("replace"):
-        manager.replace_database(name)
-    else:
-        if not statement.args.get("exists") and manager.has_database(name):
-            raise ExecutionError(f"Database {name} already exists.")
-        manager.ensure_namespace(name, "PUBLIC")
-    return (
-        [ColumnMeta(name="status", type="text")],
-        [[f"Database {name} successfully created."]],
-    )
-
-
-def _file_format_options(statement: exp.Expression) -> dict[str, str]:
-    """Extract the ``TYPE = CSV, SKIP_HEADER = 1, ...`` options from a CREATE node."""
-    options: dict[str, str] = {}
-    properties = statement.args.get("properties")
-    for prop in properties.expressions if properties else []:
-        if not isinstance(prop, exp.Property):
-            continue
-        value = prop.args.get("value")
-        if value is None:
-            continue
-        if isinstance(value, exp.Literal) and value.is_string:
-            options[str(prop.this).upper()] = str(value.this)
-        else:
-            options[str(prop.this).upper()] = value.sql(dialect="snowflake")
-    return options
-
-
-def _execute_file_format_ddl(
-    session: SessionContext, statement: exp.Expression
-) -> tuple[list[ColumnMeta], list[list[Any]]] | None:
-    """Handle CREATE/DROP FILE FORMAT and SHOW FILE FORMATS."""
-    kind = str(statement.args.get("kind") or "").upper()
-    if isinstance(statement, exp.Create) and kind == "FILE FORMAT":
-        name = statement.this.name if isinstance(statement.this, exp.Table) else ""
-        if not name:
-            return None
-        get_file_format_manager().create(
-            session,
-            name,
-            _file_format_options(statement),
-            replace=bool(statement.args.get("replace")),
-            if_not_exists=bool(statement.args.get("exists")),
-        )
-        return [ColumnMeta(name="status", type="text")], [
-            [f"File format {name.upper()} successfully created."]
-        ]
-    if isinstance(statement, exp.Drop) and kind == "FILE FORMAT":
-        target = drop_target_table(statement)
-        name = target.name if target is not None else ""
-        if not name:
-            return None
-        get_file_format_manager().drop(session, name, if_exists=bool(statement.args.get("exists")))
-        return [ColumnMeta(name="status", type="text")], [
-            [f"File format {name.upper()} successfully dropped."]
-        ]
-    if isinstance(statement, exp.Show) and str(statement.args.get("this") or "").upper() == "FILE FORMATS":
-        rows = [
-            [fmt.name, fmt.database, fmt.schema, fmt.options.get("TYPE", "")]
-            for fmt in get_file_format_manager().list(session)
-        ]
-        return (
-            [
-                ColumnMeta(name="name", type="text"),
-                ColumnMeta(name="database_name", type="text"),
-                ColumnMeta(name="schema_name", type="text"),
-                ColumnMeta(name="type", type="text"),
-            ],
-            rows,
-        )
-    return None
-
-
-def _created_table_target(
-    session: SessionContext, statement: exp.Create
-) -> tuple[str, str, str] | None:
-    """Return the ``(database, schema, table)`` a CREATE TABLE targets, else None."""
-    schema = statement.this
-    if not (isinstance(schema, exp.Schema) and isinstance(schema.this, exp.Table)):
-        return None
-    table = schema.this
-    catalog = table.args.get("catalog")
-    db = table.args.get("db")
-    database = catalog.name if isinstance(catalog, exp.Identifier) else session.database
-    table_schema = db.name if isinstance(db, exp.Identifier) else session.schema
-    return database, table_schema, table.name
-
-
-def _is_temporary_table_create(statement: exp.Create) -> bool:
-    """Return True for a ``CREATE TEMPORARY|VOLATILE TABLE``.
-
-    ``VOLATILE`` is checked as written: it reaches here before the translator rewrites it
-    into the ``TEMPORARY`` property.
-    """
-    properties = statement.args.get("properties")
-    if properties is None:
-        return False
-    return any(
-        isinstance(prop, (exp.TemporaryProperty, exp.VolatileProperty))
-        for prop in properties.expressions
-    )
-
-
-def _record_declared_columns(
-    manager: DuckDBManager, session: SessionContext, statement: exp.Create
-) -> None:
-    """Persist the declared Snowflake column types for a freshly created table.
-
-    DuckDB drops ``VARCHAR`` lengths, so the type as written is kept in the
-    per-catalog side table so ``DESCRIBE`` / ``INFORMATION_SCHEMA.COLUMNS`` can report it.
-
-    Temporary tables are skipped: that side table is keyed by (catalog, schema, table),
-    which two sessions' same-named temporary tables would share, and a temporary table
-    shadowing a permanent one would overwrite -- and so silently lose -- the permanent
-    table's declared types. A temporary table therefore reports DuckDB's own type.
-    """
-    target = _created_table_target(session, statement)
-    if target is None or _is_temporary_table_create(statement):
-        return
-    database, table_schema, table_name = target
-    columns: list[tuple[str, str | None, str | None]] = []
-    for column in statement.this.expressions:
-        if isinstance(column, exp.ColumnDef):
-            kind = column.args.get("kind")
-            declared = kind.sql(dialect="snowflake") if kind is not None else None
-            columns.append((column.this.name, declared, None))
-    if columns:
-        manager.record_columns(database, table_schema, table_name, columns)
-
-
-def _record_temp_table_owner(
-    manager: DuckDBManager, session: SessionContext, statement: exp.Create
-) -> None:
-    """Remember which database a session's temporary table was created in.
-
-    ``CREATE OR REPLACE DATABASE`` uses this to drop the temporary tables it owned, the
-    way Snowflake drops them with the schema they belong to (DuckDB keeps them in a
-    separate connection-local catalog that a database replacement does not touch).
-    """
-    if not _is_temporary_table_create(statement):
-        return
-    target = _created_table_target(session, statement)
-    if target is None:
-        return
-    database, _, table_name = target
-    manager.record_temp_table(session.token, table_name, database)
-
-
-def _execute_stage_command(
-    manager: DuckDBManager,
-    session: SessionContext,
-    raw_sql: str,
-    command: str,
-) -> ExecutionResult:
-    """Handle PUT/GET/LIST/REMOVE statements locally (no DuckDB involved)."""
-    stages = get_stage_manager()
-    try:
-        if command == "PUT":
-            put = parse_put(raw_sql)
-            files, target_dir = stages.put_files(session, put)
-            row_type = [
-                ColumnMeta(name="source", type="text"),
-                ColumnMeta(name="target", type="text"),
-                ColumnMeta(name="source_size", type="fixed", duckdb_type="BIGINT"),
-                ColumnMeta(name="target_size", type="fixed", duckdb_type="BIGINT"),
-                ColumnMeta(name="source_compression", type="text"),
-                ColumnMeta(name="target_compression", type="text"),
-                ColumnMeta(name="status", type="text"),
-                ColumnMeta(name="message", type="text"),
-            ]
-            rows = [
-                [
-                    os.path.basename(f.rel_path),
-                    f.rel_path,
-                    f.size,
-                    f.size,
-                    "NONE",
-                    "NONE",
-                    f.status,
-                    f.message,
-                ]
-                for f in files
-            ]
-            overwrite = put.options.get("OVERWRITE", "FALSE").upper() in (
-                "TRUE",
-                "1",
-                "YES",
-                "ON",
-            )
-            return ExecutionResult(
-                handle=str(uuid.uuid4()),
-                created_on=int(time.time() * 1000),
-                row_type=row_type,
-                rows=rows,
-                message=f"{len(files)} file(s) staged successfully.",
-                file_transfer=FileTransfer(
-                    kind="UPLOAD",
-                    src_locations=_strip_file_prefixes(put.files),
-                    stage_location=target_dir,
-                    overwrite=overwrite,
-                ),
-            )
-
-        if command == "GET":
-            get = parse_get(raw_sql)
-            files, stage_base = stages.get_files(session, get)
-            row_type = [
-                ColumnMeta(name="file", type="text"),
-                ColumnMeta(name="size", type="fixed", duckdb_type="BIGINT"),
-                ColumnMeta(name="status", type="text"),
-                ColumnMeta(name="message", type="text"),
-            ]
-            rows = [
-                [f.rel_path, f.size, f.status, f.message] for f in files
-            ]
-            local_dir = os.path.abspath(os.path.expanduser(get.local_dir))
-            return ExecutionResult(
-                handle=str(uuid.uuid4()),
-                created_on=int(time.time() * 1000),
-                row_type=row_type,
-                rows=rows,
-                message=f"{len(files)} file(s) downloaded.",
-                file_transfer=FileTransfer(
-                    kind="DOWNLOAD",
-                    src_locations=[f.rel_path for f in files],
-                    stage_location=stage_base,
-                    local_location=local_dir,
-                ),
-            )
-
-        if command == "LIST":
-            files = stages.list_files(session, parse_list(raw_sql))
-            row_type = [
-                ColumnMeta(name="name", type="text"),
-                ColumnMeta(name="size", type="fixed", duckdb_type="BIGINT"),
-                ColumnMeta(name="md5", type="text"),
-                ColumnMeta(name="last_modified", type="text"),
-            ]
-            rows = [
-                [f.rel_path, f.size, f.md5, f.last_modified] for f in files
-            ]
-            return ExecutionResult(
-                handle=str(uuid.uuid4()),
-                created_on=int(time.time() * 1000),
-                row_type=row_type,
-                rows=rows,
-                message=f"{len(files)} file(s) listed.",
-            )
-
-        if command == "REMOVE":
-            files = stages.remove_files(session, parse_remove(raw_sql))
-            row_type = [
-                ColumnMeta(name="name", type="text"),
-                ColumnMeta(name="result", type="text"),
-                ColumnMeta(name="message", type="text"),
-            ]
-            rows = [[f.rel_path, f.status, f.message] for f in files]
-            return ExecutionResult(
-                handle=str(uuid.uuid4()),
-                created_on=int(time.time() * 1000),
-                row_type=row_type,
-                rows=rows,
-                message=f"{len(files)} file(s) removed.",
-            )
-    except StageError as exc:
-        raise ExecutionError(str(exc)) from exc
-    raise ExecutionError(f"Unsupported stage command: {command}")
-
-
-def _strip_file_prefixes(files: list[str]) -> list[str]:
-    """Strip ``file://`` so the connector's local storage client sees plain paths."""
-    stripped = []
-    for f in files:
-        if f.startswith("file://"):
-            f = f[len("file://") :]
-        stripped.append(f)
-    return stripped
-
-
-def _execute_stage_ddl(
-    manager: DuckDBManager,
-    session: SessionContext,
-    statement: exp.Expression,
-    kind: str,
-) -> tuple[list[ColumnMeta], list[list[Any]]]:
-    """Handle CREATE/DROP/ALTER STAGE and SHOW STAGES without DuckDB."""
-    stages = get_stage_manager()
-    try:
-        if kind == "CREATE_STAGE":
-            create_stage(stages, session, statement)
-            return (
-                [ColumnMeta(name="status", type="text")],
-                [[f"Stage {statement.this.name} successfully created."]],
-            )
-        if kind == "DROP_STAGE":
-            name = drop_stage(stages, session, statement)
-            return (
-                [ColumnMeta(name="status", type="text")],
-                [[f"Stage {name} successfully dropped."]],
-            )
-        if kind == "ALTER_STAGE":
-            return (
-                [ColumnMeta(name="status", type="text")],
-                [["Statement executed successfully."]],
-            )
-        if kind == "SHOW_STAGES":
-            rows = [[name, db, schema, url] for name, db, schema, url in show_stages(stages, session)]
-            return (
-                [
-                    ColumnMeta(name="name", type="text"),
-                    ColumnMeta(name="database_name", type="text"),
-                    ColumnMeta(name="schema_name", type="text"),
-                    ColumnMeta(name="url", type="text"),
-                ],
-                rows,
-            )
-    except StageError as exc:
-        raise ExecutionError(str(exc)) from exc
-    raise ExecutionError(f"Unsupported stage DDL: {kind}")
 
 
 def _apply_use_statement(
