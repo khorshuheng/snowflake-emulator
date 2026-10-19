@@ -378,8 +378,12 @@ src/snowflake_emulator/
       ddl.py            # database/function/file-format DDL
       stage.py          # PUT/GET/LIST/REMOVE and stage DDL
   translator/           # sqlglot-based Snowflake -> DuckDB translation
-    __init__.py         # public API, core transpile and non-array rewrites
+    __init__.py         # public API, core transpile and DDL rewrites
     arrays.py           # array-function rewrites over JSON/VARIANT arrays
+    functions.py        # SQL UDF translation and macro rendering
+    parsing.py          # statement splitting and ARRAY_FLATTEN preprocessing
+    semi_structured.py  # JSON/VARIANT, FLATTEN and Snowflake-specific rewrites
+    transforms.py       # rewrite pipeline shared by statements and UDF bodies
     constants.py        # dialect names and parser markers
     errors.py           # TranslationError
   executor.py            # statement execution against DuckDB

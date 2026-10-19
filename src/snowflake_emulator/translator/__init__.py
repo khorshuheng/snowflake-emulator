@@ -4,28 +4,43 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Protocol
 
 import sqlglot
 from sqlglot import exp
 from sqlglot.dialects import Snowflake
-from sqlglot.tokens import TokenType
 
 from snowflake_emulator.core.ast import drop_target_table  # re-exported for compatibility
 from snowflake_emulator.core.constants import INFORMATION_SCHEMA_SCHEMA
-from snowflake_emulator.translator.arrays import (
-    _is_json_value,
-    _is_variant_value,
-    _rewrite_json_array_functions,
-)
+from snowflake_emulator.translator.ast_helpers import _quoted_identifier
 from snowflake_emulator.translator.constants import (
+    EMULATED_SNOWFLAKE_VERSION,
     READ_DIALECT,
     WRITE_DIALECT,
-    _ARRAY_FLATTEN_NAME,
-    _FLATTEN_MARKER,
+    _SIMPLE_IDENTIFIER_RE,
 )
 from snowflake_emulator.translator.errors import TranslationError
-from snowflake_emulator.type_mapping import duckdb_type_to_snowflake_sql_type
+from snowflake_emulator.translator.functions import (
+    UserFunctionArgument,
+    UserFunctionCall,
+    UserFunctionResolver,
+    UserFunctionSpec,
+    _reject_unsupported_function,
+    _rewrite_user_function_calls,
+    normalize_function_signature,
+    render_create_macro,
+    render_drop_macro,
+    render_qualified_name,
+    translate_create_function,
+    translate_function_body,
+    user_function_dispatch_name,
+    user_function_macro_name,
+    user_function_sub_macro_name,
+)
+from snowflake_emulator.translator.parsing import (
+    preprocess_array_flatten,
+    split_statements,
+)
+from snowflake_emulator.translator.transforms import _apply_transforms
 
 
 # sqlglot 30.21 began decoding backslash escapes in Snowflake string literals: an
@@ -40,11 +55,6 @@ Snowflake.Tokenizer.DROP_UNKNOWN_ESCAPES = False
 Snowflake.Tokenizer.NUMERIC_ESCAPES = {}
 
 
-# Snowflake's ``CURRENT_VERSION()`` reports the server's own release version. DuckDB's
-# ``VERSION()`` returns ``v1.5.5`` (with a leading ``v``), which breaks clients such as
-# snowflake-sqlalchemy that parse each dot-separated component as an ``int``. Answer
-# with a Snowflake-compatible dotted-numeric version instead.
-EMULATED_SNOWFLAKE_VERSION = "8.23.1"
 
 _USE_RE = re.compile(
     r"^\s*USE\s+(DATABASE|SCHEMA|WAREHOUSE|ROLE)\s+(.+?)\s*;?\s*$",
@@ -68,8 +78,6 @@ def _unwrap_identifier_fn(name: str) -> str:
     m = _IDENTIFIER_FN_RE.match(name)
     return m.group(2) if m else name
 
-
-_SIMPLE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 
 
 def _upper_if_simple(name: str) -> str:
@@ -139,79 +147,8 @@ def match_use_statement(sql: str) -> UseStatement | None:
     return UseStatement(kind=kind, name=name)
 
 
-def preprocess_array_flatten(sql: str) -> str:
-    """Rename ``ARRAY_FLATTEN(x, depth)`` so sqlglot's one-argument limit accepts it.
-
-    sqlglot's ``ArrayFlatten`` node takes a single argument, so the documented
-    two-argument Snowflake form fails to parse before any rewrite can run. Only the call's
-    name is renamed, located by token position so a literal that mentions it is untouched;
-    the translator then rewrites the renamed call (``_rewrite_array_flatten``).
-    """
-    tokens = sqlglot.Dialect.get_or_raise(READ_DIALECT).tokenize(sql)
-    spans = [
-        (token.start, token.end)
-        for index, token in enumerate(tokens[:-1])
-        if token.text.upper() == _ARRAY_FLATTEN_NAME
-        and tokens[index + 1].token_type == TokenType.L_PAREN
-    ]
-    if not spans:
-        return sql
-    parts: list[str] = []
-    cursor = 0
-    for start, end in spans:
-        parts.append(sql[cursor:start])
-        parts.append(_FLATTEN_MARKER)
-        cursor = end + 1  # Token.end is the index of the token's last character
-    parts.append(sql[cursor:])
-    return "".join(parts)
 
 
-# sqlglot underlines the offending token with ANSI escapes, which say nothing in an HTTP
-# error body.
-_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-# Snowflake orders a SHOW's clauses as ``SHOW <object> [LIKE '<pattern>'] [IN <scope>]
-# [STARTS WITH '<name>']``, so the MySQL order (``... IN SCHEMA s LIKE 'x'``) does not
-# parse. The hint is confined to one statement, so a multi-statement body cannot
-# trigger it on an unrelated failure.
-_SHOW_CLAUSE_ORDER_RE = re.compile(
-    r"^\s*SHOW\b[^;]*\bIN\b[^;]*\bLIKE\b", re.IGNORECASE | re.DOTALL
-)
-
-
-def _parse_error_message(sql: str, exc: Exception) -> str:
-    """Explain a parse failure, naming the Snowflake clause order where that is the cause."""
-    message = _ANSI_ESCAPE_RE.sub("", str(exc))
-    if _SHOW_CLAUSE_ORDER_RE.search(sql):
-        message += (
-            "\nSnowflake puts LIKE before IN, e.g. "
-            "SHOW TABLES LIKE '<pattern>' IN SCHEMA <database>.<schema>."
-        )
-    return message
-
-
-def split_statements(sql: str) -> list[exp.Expression]:
-    """Split a (possibly multi-statement) Snowflake SQL string into parsed expressions.
-
-    Returning parsed `exp.Expression` objects (rather than re-serialized SQL text)
-    avoids a lossy parse -> Snowflake-text -> re-parse -> DuckDB-text round trip,
-    which can drop information that doesn't survive an intermediate Snowflake-dialect
-    print (e.g. `VARCHAR[]` collapsing to a bare `ARRAY`).
-    """
-    try:
-        expressions = sqlglot.parse(preprocess_array_flatten(sql), read=READ_DIALECT)
-    except Exception as exc:  # noqa: BLE001 - surfaced to the caller as a translation error
-        raise TranslationError(f"Failed to parse SQL: {_parse_error_message(sql, exc)}") from exc
-
-    statements = [expr for expr in expressions if expr is not None]
-    if not statements:
-        raise TranslationError("No SQL statements found.")
-    return statements
-
-
-def _quoted_identifier(name: str) -> str:
-    """Quote an identifier for use inside a DuckDB SQL string literal."""
-    return '"' + name.replace('"', '""') + '"'
 
 
 def _auto_increment_constraint(col: exp.ColumnDef) -> exp.ColumnConstraint | None:
@@ -358,247 +295,6 @@ def _rewrite_autoincrement_create(
     return pre_statements, rewritten
 
 
-def _flatten_subquery(input_expr: exp.Expression) -> exp.Subquery:
-    """Build the DuckDB subquery equivalent of Snowflake's ``FLATTEN(input => X)``.
-
-    Snowflake's FLATTEN exposes SEQ/KEY/PATH/INDEX/VALUE/THIS. DuckDB's
-    ``json_each()`` exposes key/value/fullkey/...; we map those onto Snowflake's
-    names. INDEX is approximated as the array index (``TRY_CAST(key AS BIGINT)``),
-    which is NULL for object keys — matching Snowflake's object behaviour.
-
-    The operand is rewritten first and cast to JSON: a VARIANT column is not JSON to
-    DuckDB (``json_each`` rejects it), and this pass runs before the operand's own
-    ``col:path`` rewrite, so the cast has to be applied here.
-    """
-    operand = exp.cast(
-        input_expr.transform(_rewrite_snowflake_specifics),
-        exp.DataType.build("JSON"),
-        dialect=WRITE_DIALECT,
-    )
-    x = operand.sql(dialect=WRITE_DIALECT)
-    select = sqlglot.parse_one(
-        f"SELECT ROW_NUMBER() OVER () - 1 AS seq, key, fullkey AS path, "
-        f"TRY_CAST(key AS BIGINT) AS index, value, {x} AS this "
-        f"FROM json_each({x})",
-        read=WRITE_DIALECT,
-    )
-    return exp.Subquery(this=select)
-
-
-def _uppercase_unquoted_identifiers(node: exp.Expression) -> exp.Expression:
-    """Uppercase unquoted identifiers to match Snowflake's identifier casing.
-
-    Snowflake uppercases unquoted identifiers (quoted ones stay case-sensitive).
-    DuckDB preserves whatever case the client typed, so without this, table/column/
-    alias names round-trip in the as-written case instead of Snowflake's uppercase
-    canonical form. Quoted identifiers are left untouched.
-    """
-    if isinstance(node, exp.Identifier):
-        if not node.args.get("quoted") and isinstance(node.this, str):
-            node.set("this", node.this.upper())
-    return node
-
-
-def _is_information_schema(ident: exp.Identifier) -> bool:
-    """Return True if ``ident`` names Snowflake's system ``INFORMATION_SCHEMA``.
-
-    Unquoted references are case-insensitive (Snowflake uppercases them), while a
-    quoted reference only resolves to the system schema when spelled exactly
-    ``INFORMATION_SCHEMA``. Quoted mixed-case spellings name a different, unrelated
-    schema and are left alone.
-    """
-    name = ident.name
-    if not name or name.upper() != "INFORMATION_SCHEMA":
-        return False
-    if ident.args.get("quoted"):
-        return name == "INFORMATION_SCHEMA"
-    return True
-
-
-def _rewrite_information_schema(node: exp.Expression) -> exp.Expression:
-    """Map Snowflake's ``INFORMATION_SCHEMA`` onto the emulator's compat schema.
-
-    Applied on the parsed AST (rather than rewriting raw SQL) so string literals and
-    comments mentioning INFORMATION_SCHEMA are left untouched. Only the schema slot
-    of a qualified name (``{db}.INFORMATION_SCHEMA.<obj>``) is rewritten.
-    """
-    if isinstance(node, (exp.Table, exp.Column)):
-        db = node.args.get("db")
-        if isinstance(db, exp.Identifier) and _is_information_schema(db):
-            node.set("db", exp.Identifier(this=INFORMATION_SCHEMA_SCHEMA))
-    return node
-
-
-
-
-# Types Snowflake casts a semi-structured value to for its text form.
-_TEXT_TYPES = (
-    exp.DataType.Type.VARCHAR,
-    exp.DataType.Type.CHAR,
-    exp.DataType.Type.NCHAR,
-    exp.DataType.Type.NVARCHAR,
-    exp.DataType.Type.TEXT,
-)
-
-
-def _is_text_type(data_type: exp.Expression | None) -> bool:
-    """True for a text type, with or without a length (``VARCHAR``, ``VARCHAR(10)``)."""
-    return isinstance(data_type, exp.DataType) and data_type.this in _TEXT_TYPES
-
-
-def _json_root_extract(operand: exp.Expression) -> exp.Expression:
-    """``operand ->> '$'``: the text of a JSON value (a string without its quotes)."""
-    return exp.JSONExtractScalar(
-        this=operand, expression=exp.JSONPath(expressions=[exp.JSONPathRoot()])
-    )
-
-
-def _rewrite_semi_structured_text_cast(node: exp.Expression) -> exp.Expression:
-    """Make ``col:path::VARCHAR`` return the value's text, not DuckDB's JSON serialization.
-
-    ``col:path`` evaluates to a DuckDB JSON value, and ``CAST(<json> AS VARCHAR)`` serializes
-    it -- a JSON string keeps its quotes (``'"y"'`` where Snowflake returns ``y``).
-    ``->> '$'`` yields the text of a JSON scalar instead, and of a JSON object/array the
-    document text, as Snowflake does. An explicit VARIANT is serialized to JSON first for
-    the same reason; a bare VARIANT column is left alone, since DuckDB's own VARIANT cast
-    already returns a string variant's text (whether a bare column holds one is not known
-    until run time).
-
-    The operand is rewritten here rather than serialized: replacing a node stops the walk
-    from descending into its children, and a ``col:path`` operand is not yet a JSON value.
-    """
-    operand = node.this
-    if not (_is_json_value(operand) or _is_variant_value(operand)):
-        return node
-    inner = operand.transform(_rewrite_snowflake_specifics)
-    if _is_variant_value(inner):
-        inner = exp.cast(inner, exp.DataType.build("JSON"), dialect=WRITE_DIALECT)
-    extracted = _json_root_extract(inner)
-    if isinstance(node, exp.ToChar):
-        return extracted  # its DuckDB rendering is already a text cast
-    return exp.Cast(this=extracted, to=node.to)
-
-
-def _rewrite_snowflake_specifics(node: exp.Expression) -> exp.Expression:
-    """Rewrite Snowflake nodes that sqlglot can't fully transpile to DuckDB."""
-    # ``CURRENT_VERSION()`` -> a Snowflake-style dotted-numeric version literal.
-    if isinstance(node, exp.CurrentVersion):
-        return exp.Literal.string(EMULATED_SNOWFLAKE_VERSION)
-
-    # ``col:path::VARCHAR`` / ``TO_VARCHAR(col:path)``.
-    if isinstance(node, exp.Cast) and _is_text_type(node.to):
-        return _rewrite_semi_structured_text_cast(node)
-    if isinstance(node, exp.ToChar) and node.args.get("format") is None:
-        return _rewrite_semi_structured_text_cast(node)
-
-    # Snowflake JSON path extraction (``col:path``, ``GET_PATH``) transpiles to
-    # DuckDB's ``->``/``->>``, which parses its operand as JSON on the fly. A VALUE
-    # bound from a Python dict is stored by DuckDB in a Python-repr form (e.g.
-    # ``{'a': 1}``) that is not valid JSON, so the extraction raises. Casting the
-    # operand to JSON first makes it round-trip through real JSON instead of the
-    # VARIANT/VARCHAR repr. ``exp.cast`` skips an operand that is already cast to JSON.
-    if isinstance(node, (exp.JSONExtract, exp.JSONExtractScalar)):
-        if not isinstance(node.this, exp.ParseJSON):
-            node.set(
-                "this",
-                exp.cast(node.this, exp.DataType.build("JSON"), dialect=WRITE_DIALECT),
-            )
-        return node
-
-    # ``LATERAL FLATTEN(input => X)`` -> DuckDB json_each-based lateral subquery.
-    if (
-        isinstance(node, exp.Lateral)
-        and isinstance(node.this, exp.Explode)
-        and isinstance(node.this.this, exp.Kwarg)
-    ):
-        key = node.this.this.args.get("this")
-        if getattr(key, "name", None) and key.name.upper() == "INPUT":
-            new = node.copy()
-            new.set("this", _flatten_subquery(node.this.this.expression))
-            alias = new.args.get("alias")
-            if alias is not None:
-                alias.set("columns", [])
-            return new
-
-    # ``TABLE(FLATTEN(input => X))`` -> the same subquery, unwrapped from TABLE(...).
-    if (
-        isinstance(node, exp.TableFromRows)
-        and isinstance(node.this, exp.Explode)
-        and isinstance(node.this.this, exp.Kwarg)
-    ):
-        key = node.this.this.args.get("this")
-        if getattr(key, "name", None) and key.name.upper() == "INPUT":
-            sub = _flatten_subquery(node.this.this.expression)
-            sub.set("alias", node.args.get("alias"))
-            return sub
-
-    # Snowflake sequence pseudo-column ``seq.NEXTVAL`` -> ``nextval('seq')``.
-    if (
-        isinstance(node, exp.Column)
-        and node.name
-        and node.name.upper() == "NEXTVAL"
-        and node.args.get("table") is not None
-    ):
-        parts = [
-            node.args.get("catalog"),
-            node.args.get("db"),
-            node.args.get("table"),
-        ]
-        seq_name = ".".join(_quoted_identifier(p.name) for p in parts if p is not None)
-        return exp.func("nextval", exp.Literal.string(seq_name))
-
-    # Snowflake semi-structured column types. VARIANT is already accepted by DuckDB;
-    # bare OBJECT/ARRAY have no DuckDB DDL equivalent, so map them to JSON. An ARRAY
-    # with an element type (e.g. VARCHAR[]) already transpiles to DuckDB's ``TEXT[]``.
-    if isinstance(node, exp.DataType):
-        if node.this == exp.DataType.Type.OBJECT:
-            return exp.DataType.build("JSON")
-        if node.this == exp.DataType.Type.ARRAY and not node.expressions:
-            return exp.DataType.build("JSON")
-        # Snowflake's TIMESTAMP_TZ(p)/TIMESTAMP_LTZ(p) accept a precision parameter,
-        # but DuckDB's ``TIMESTAMP WITH [LOCAL] TIME ZONE`` takes none -- sqlglot
-        # renders ``TIMESTAMP_LTZ(3)`` as ``TIMESTAMPTZ(3)``, which DuckDB rejects.
-        # Drop the modifier so the DDL/CAST is accepted; DuckDB stores microsecond
-        # precision either way (reported honestly via the timestamp scale mapping).
-        if (
-            node.this
-            in (exp.DataType.Type.TIMESTAMPTZ, exp.DataType.Type.TIMESTAMPLTZ)
-            and node.expressions
-        ):
-            stripped = node.copy()
-            stripped.set("expressions", [])
-            return stripped
-
-    # ``CREATE VOLATILE TABLE`` is Snowflake's (deprecated) synonym for
-    # ``CREATE TEMPORARY TABLE``. sqlglot's DuckDB generator drops the VOLATILE marker,
-    # which would silently create a permanent table, so it is swapped for the property
-    # DuckDB understands and the table keeps its session-scoped lifetime.
-    if isinstance(node, exp.Create):
-        properties = node.args.get("properties")
-        if properties is not None and any(
-            isinstance(prop, exp.VolatileProperty) for prop in properties.expressions
-        ):
-            rewritten = node.copy()
-            rewritten_properties = rewritten.args["properties"]
-            rewritten_properties.set(
-                "expressions",
-                [
-                    exp.TemporaryProperty() if isinstance(prop, exp.VolatileProperty) else prop
-                    for prop in rewritten_properties.expressions
-                ],
-            )
-            return rewritten
-
-    # ``MERGE ... UPDATE SET t.col = ...`` -> unqualified target column. DuckDB rejects
-    # the target-table qualifier on the left side of a SET assignment.
-    if isinstance(node, exp.Update):
-        for eq in node.expressions:
-            if isinstance(eq, exp.EQ) and isinstance(eq.this, exp.Column):
-                for key in ("table", "db", "catalog"):
-                    eq.this.args.pop(key, None)
-        return node
-
-    return node
 
 
 def _rewrite_clone(statement: exp.Expression) -> exp.Expression:
@@ -635,382 +331,6 @@ def _rewrite_clone(statement: exp.Expression) -> exp.Expression:
     return rewritten
 
 
-def _apply_transforms(statement: exp.Expression) -> exp.Expression:
-    """Apply the Snowflake-to-DuckDB AST rewrites shared by statements and UDF bodies.
-
-    A ``CREATE FUNCTION`` body is Snowflake SQL in its own right, so it has to go
-    through exactly the same rewrites as a top-level statement -- that is what turns
-    e.g. ``EQUAL_NULL(a, b)`` into DuckDB's ``a IS NOT DISTINCT FROM b``.
-    """
-    statement = statement.transform(_uppercase_unquoted_identifiers)
-    statement = statement.transform(_rewrite_information_schema)
-    statement = statement.transform(_rewrite_snowflake_specifics)
-    # After the rewrites above: an array call is rebuilt from its operands' SQL, so
-    # those operands must already be in their final DuckDB form.
-    return _rewrite_json_array_functions(statement)
-
-
-# User-defined functions are emulated as DuckDB macros. A DuckDB macro name cannot be
-# overloaded -- a second ``CREATE MACRO f(...)`` with a different signature is a
-# "Macro Function with name f already exists" error -- while Snowflake resolves UDFs by
-# signature. Each function is therefore stored under a name mangled with its arity, and
-# call sites are rewritten to match. ``__SFUDF_`` keeps the emulator's own macros
-# distinguishable from DuckDB built-ins and user tables.
-USER_FUNCTION_MACRO_PREFIX = "__SFUDF_"
-
-
-def user_function_macro_name(name: str, arity: int) -> str:
-    """Return the DuckDB macro name backing a function with a single overload."""
-    return f"{USER_FUNCTION_MACRO_PREFIX}{name}__{arity}"
-
-
-def user_function_dispatch_name(database: str, schema: str, name: str, arity: int) -> str:
-    """Return the name of the Python function dispatching an overloaded (name, arity).
-
-    A DuckDB function registered through the Python API is *not* schema-scoped, unlike a
-    macro, so the database and schema are part of the name to keep two schemas that each
-    define the same function from colliding.
-    """
-    return f"{USER_FUNCTION_MACRO_PREFIX}{database}_{schema}_{name}__{arity}"
-
-
-def user_function_sub_macro_name(
-    database: str, schema: str, name: str, arity: int, index: int
-) -> str:
-    """Return the macro name holding one overload's body behind a dispatcher."""
-    return f"{user_function_dispatch_name(database, schema, name, arity)}__{index}"
-
-
-def _identifier(name: str) -> exp.Identifier:
-    """Build an identifier node, quoting it only when it is not a plain identifier."""
-    if _SIMPLE_IDENTIFIER_RE.match(name):
-        return exp.to_identifier(name)
-    return exp.to_identifier(name, quoted=True)
-
-
-def _snowflake_name(identifier: exp.Identifier) -> str:
-    """Return an identifier's name in Snowflake casing (unquoted names are uppercased)."""
-    return identifier.name if identifier.args.get("quoted") else identifier.name.upper()
-
-
-def _render_identifier(name: str) -> str:
-    """Render an identifier as SQL text, quoted only when it needs to be."""
-    return _identifier(name).sql(dialect=WRITE_DIALECT)
-
-
-def render_qualified_name(*parts: str) -> str:
-    """Render a dotted, per-part-quoted name for use in a DuckDB statement."""
-    return ".".join(_render_identifier(part) for part in parts)
-
-
-@dataclass(frozen=True)
-class UserFunctionArgument:
-    """A user-defined function's parameter, in Snowflake identifier casing.
-
-    ``name`` is the *effective* name after Snowflake's identifier casing is applied
-    (unquoted names are uppercased), so it matches the names the translated body refers
-    to.
-    """
-
-    name: str
-    declared_type: str | None
-
-
-@dataclass(frozen=True)
-class UserFunctionSpec:
-    """A Snowflake SQL UDF, translated into the DuckDB macro that emulates it."""
-
-    name: str
-    arguments: tuple[UserFunctionArgument, ...]
-    return_type: str
-    #: The declared return type in DuckDB's spelling, which is what the Python API needs
-    #: to register the dispatcher for an overloaded function.
-    return_type_duckdb: str
-    language: str
-    body: str
-    body_sql: str
-    database: str | None = None
-    schema: str | None = None
-    replace: bool = False
-    if_not_exists: bool = False
-
-    @property
-    def arity(self) -> int:
-        return len(self.arguments)
-
-    @property
-    def macro_name(self) -> str:
-        return user_function_macro_name(self.name, self.arity)
-
-    @property
-    def type_signature(self) -> str:
-        """The declared argument types, identifying one overload of a name/arity."""
-        types = [argument.declared_type or "VARCHAR" for argument in self.arguments]
-        return "|".join(types)
-
-    @property
-    def show_signature(self) -> str:
-        """The argument list as Snowflake's ``SHOW FUNCTIONS`` reports it."""
-        types = [argument.declared_type or "VARCHAR" for argument in self.arguments]
-        return f"{self.name}({', '.join(types)}) RETURN {self.return_type}"
-
-
-def _function_properties(statement: exp.Create) -> tuple[exp.DataType | None, str, bool]:
-    """Return a ``CREATE FUNCTION``'s declared ``(return type, language, is_table)``."""
-    returns: exp.DataType | None = None
-    language = "SQL"
-    is_table = False
-    properties = statement.args.get("properties")
-    for prop in properties.expressions if properties else []:
-        if isinstance(prop, exp.ReturnsProperty):
-            is_table = bool(prop.args.get("is_table"))
-            if isinstance(prop.this, exp.DataType):
-                returns = prop.this
-        elif isinstance(prop, exp.LanguageProperty) and prop.this is not None:
-            language = (prop.this.name or "SQL").upper() or "SQL"
-    return returns, language, is_table
-
-
-def _function_body_text(statement: exp.Create) -> str:
-    """Return a ``CREATE FUNCTION``'s body as written.
-
-    Snowflake accepts the body either dollar-quoted (``AS $$ ... $$``, parsed as a
-    ``RawString``) or as a plain string literal (``AS 'x + 1'``).
-    """
-    body = statement.args.get("expression")
-    if isinstance(body, exp.RawString):
-        return str(body.this)
-    if isinstance(body, exp.Literal) and body.is_string:
-        return str(body.this)
-    raise TranslationError("CREATE FUNCTION requires a body (AS $$ ... $$).")
-
-
-def normalize_function_signature(type_nodes: list[exp.Expression]) -> str:
-    """Normalize a ``DROP``/``DESCRIBE FUNCTION`` argument list to the stored signature.
-
-    The types in a signature are written the way the client spelled them (``STRING``,
-    ``NUMBER(10,2)``) and may parse as a ``DataType`` or a bare ``Identifier``, so they
-    are pushed through the same Snowflake-to-DuckDB normalization used when the function
-    was recorded. Without this, ``DROP FUNCTION f(STRING, STRING)`` would not match the
-    stored ``VARCHAR|VARCHAR`` and would silently drop the wrong overload -- or none.
-    """
-    parts: list[str] = []
-    for node in type_nodes:
-        if isinstance(node, exp.DataType):
-            duckdb_type = node.sql(dialect=WRITE_DIALECT)
-        else:
-            # ``DESCRIBE FUNCTION f(ARRAY, ARRAY)`` parses the types as identifiers.
-            built = exp.DataType.build(node.sql(dialect=READ_DIALECT), dialect=READ_DIALECT)
-            duckdb_type = built.sql(dialect=WRITE_DIALECT)
-        parts.append(duckdb_type_to_snowflake_sql_type(duckdb_type))
-    return "|".join(parts)
-
-
-def translate_function_body(body: str) -> str:
-    """Translate a SQL UDF body into a DuckDB scalar expression.
-
-    Snowflake allows the body to be either a bare expression (``AS $$ x + 1 $$``) or a
-    single-column ``SELECT`` (``AS $$ SELECT x + 1 $$``). A body selecting more than one
-    column is a table function, which is rejected here because the emulator only
-    emulates scalar UDFs.
-    """
-    if not body.strip():
-        raise TranslationError("CREATE FUNCTION requires a non-empty body.")
-    try:
-        parsed = sqlglot.parse_one(preprocess_array_flatten(body), read=READ_DIALECT)
-    except Exception as exc:  # noqa: BLE001 - reported as a translation error
-        raise TranslationError(
-            f"Failed to parse the function body as SQL: {exc}"
-        ) from exc
-    if parsed is None:
-        raise TranslationError("CREATE FUNCTION requires a non-empty body.")
-    if isinstance(parsed, exp.Select):
-        if len(parsed.expressions) != 1:
-            raise TranslationError(
-                "A SQL UDF body selecting more than one column is a table function, "
-                "which the emulator does not support (only scalar UDFs are)."
-            )
-        parsed = parsed.expressions[0]
-        if isinstance(parsed, exp.Alias):
-            parsed = parsed.this
-    return _apply_transforms(parsed).sql(dialect=WRITE_DIALECT)
-
-
-def translate_create_function(statement: exp.Expression) -> UserFunctionSpec:
-    """Translate a ``CREATE [OR REPLACE] FUNCTION`` into a DuckDB-macro spec.
-
-    Raises :class:`TranslationError` for anything the emulator cannot emulate
-    faithfully, rather than letting DuckDB create a function that silently returns the
-    body text (DuckDB reads ``CREATE FUNCTION f(x) AS 'x + 1'`` as a reference to a
-    native function named ``x + 1``).
-    """
-    if not (
-        isinstance(statement, exp.Create)
-        and str(statement.args.get("kind") or "").upper() == "FUNCTION"
-    ):
-        raise TranslationError("Not a CREATE FUNCTION statement.")
-    udf = statement.this
-    if not isinstance(udf, exp.UserDefinedFunction) or not isinstance(udf.this, exp.Table):
-        raise TranslationError("Unsupported CREATE FUNCTION form.")
-    table = udf.this
-
-    returns, language, is_table = _function_properties(statement)
-    if language != "SQL":
-        raise TranslationError(
-            f"{language} UDFs are not supported by the emulator "
-            f"(no {language.lower()} runtime available)."
-        )
-    if is_table:
-        raise TranslationError(
-            "Table-returning user-defined functions (RETURNS TABLE ...) are not "
-            "supported by the emulator (only scalar SQL UDFs are)."
-        )
-    if returns is None:
-        raise TranslationError("CREATE FUNCTION requires a RETURNS <type> clause.")
-
-    arguments: list[UserFunctionArgument] = []
-    for argument in udf.expressions:
-        kind = argument.args.get("kind") if isinstance(argument, exp.ColumnDef) else None
-        identifier = argument.this
-        if not isinstance(identifier, exp.Identifier):
-            raise TranslationError("Unsupported CREATE FUNCTION argument list.")
-        name = _snowflake_name(identifier)
-        # Rendered through DuckDB first so the reported argument types match the
-        # reported return type (``NUMBER`` -> ``DECIMAL(38, 0)`` -> ``NUMBER(38,0)``).
-        declared = (
-            duckdb_type_to_snowflake_sql_type(kind.sql(dialect=WRITE_DIALECT))
-            if isinstance(kind, exp.DataType)
-            else None
-        )
-        arguments.append(UserFunctionArgument(name=name, declared_type=declared))
-
-    catalog = table.args.get("catalog")
-    db = table.args.get("db")
-    # The function name (and any qualifier) needs Snowflake's identifier casing here:
-    # ``CREATE FUNCTION`` is handled before the generic transpile path, so the
-    # uppercase-identifiers transform never sees this statement.
-    function_name = (
-        _snowflake_name(table.this)
-        if isinstance(table.this, exp.Identifier)
-        else table.name
-    )
-    body = _function_body_text(statement)
-    return UserFunctionSpec(
-        name=function_name,
-        arguments=tuple(arguments),
-        # Report the return type the way ``DESCRIBE``/``SHOW FUNCTIONS`` do for tables,
-        # normalising DuckDB's spelling back to Snowflake's (DECIMAL -> NUMBER).
-        return_type=duckdb_type_to_snowflake_sql_type(returns.sql(dialect=WRITE_DIALECT)),
-        return_type_duckdb=returns.sql(dialect=WRITE_DIALECT),
-        language=language,
-        body=body,
-        body_sql=translate_function_body(body),
-        database=_snowflake_name(catalog) if isinstance(catalog, exp.Identifier) else None,
-        schema=_snowflake_name(db) if isinstance(db, exp.Identifier) else None,
-        replace=bool(statement.args.get("replace")),
-        if_not_exists=bool(statement.args.get("exists")),
-    )
-
-
-def render_create_macro(
-    spec: UserFunctionSpec, database: str, schema: str, macro_name: str | None = None
-) -> str:
-    """Render the DuckDB ``CREATE MACRO`` statement holding a SQL UDF's body.
-
-    The macro is catalog/schema-qualified so it lands in the function's Snowflake
-    namespace regardless of what the executing cursor's current schema happens to be.
-    `macro_name` overrides the name the macro is created under, which is how one
-    overload of a dispatched function is stored behind its dispatcher.
-    """
-    clauses = ""
-    if spec.replace:
-        clauses = " OR REPLACE"
-    elif spec.if_not_exists:
-        clauses = " IF NOT EXISTS"
-    params = ", ".join(_render_identifier(argument.name) for argument in spec.arguments)
-    name = render_qualified_name(database, schema, macro_name or spec.macro_name)
-    return f"CREATE{clauses} MACRO {name}({params}) AS ({spec.body_sql})"
-
-
-def render_drop_macro(
-    macro_name: str, database: str, schema: str, *, if_exists: bool = False
-) -> str:
-    """Render the DuckDB ``DROP MACRO`` statement removing a user-defined function."""
-    clause = " IF EXISTS" if if_exists else ""
-    return f"DROP MACRO{clause} {render_qualified_name(database, schema, macro_name)}"
-
-
-@dataclass(frozen=True)
-class UserFunctionCall:
-    """How a resolved Snowflake UDF call is reached in DuckDB."""
-
-    callable_name: str
-    #: A Python dispatcher needs each argument's DuckDB type appended to the call, since
-    #: a generic callback receives values only -- and cannot, for instance, tell a JSON
-    #: array column from a text value (both arrive as ``str``).
-    dispatch: bool
-
-
-class UserFunctionResolver(Protocol):
-    """Resolves a Snowflake UDF call to the DuckDB callable that emulates it."""
-
-    def resolve(self, name: str, arity: int) -> UserFunctionCall | None:
-        """Return the callable for `name` called with `arity` arguments."""
-        ...
-
-
-def _rewrite_user_function_calls(
-    statement: exp.Expression, resolver: UserFunctionResolver
-) -> exp.Expression:
-    """Point calls to user-defined functions at the macro or dispatcher backing them.
-
-    Only ``Anonymous`` calls are considered: a UDF whose name matches a function sqlglot
-    models natively (``COALESCE``, ``ARRAY_SIZE``, ...) is parsed into that node instead
-    and keeps its built-in behaviour.
-    """
-    for call in list(statement.find_all(exp.Anonymous)):
-        resolved = resolver.resolve(call.name, len(call.expressions))
-        if resolved is None:
-            continue
-        if resolved.dispatch:
-            arguments = list(call.expressions)
-            call.set(
-                "expressions",
-                [
-                    *arguments,
-                    *(
-                        exp.Anonymous(this="typeof", expressions=[argument.copy()])
-                        for argument in arguments
-                    ),
-                ],
-            )
-        call.set("this", _identifier(resolved.callable_name))
-    return statement
-
-
-def _reject_unsupported_function(statement: exp.Expression) -> None:
-    """Raise for ``CREATE FUNCTION`` statements the emulator can't faithfully emulate.
-
-    DuckDB has no JavaScript/Python/Java/Scala runtime, so a Snowflake UDF with a
-    non-SQL ``LANGUAGE`` clause would be silently translated into a broken function
-    (the body becomes a string literal). Reject it loudly instead.
-
-    Kept as a guard for the generic transpile path: ``CREATE FUNCTION`` is normally
-    handled by :func:`translate_create_function` before reaching it.
-    """
-    if not (isinstance(statement, exp.Create) and statement.args.get("kind") == "FUNCTION"):
-        return
-    props = statement.args.get("properties")
-    if props is None:
-        return
-    for prop in props.expressions:
-        if isinstance(prop, exp.LanguageProperty) and prop.this is not None:
-            lang = (prop.this.name or "").upper()
-            if lang and lang != "SQL":
-                raise TranslationError(
-                    f"{lang} UDFs are not supported by the emulator "
-                    f"(no {lang.lower()} runtime available)."
-                )
 
 
 def transpile_to_duckdb(

@@ -1,0 +1,257 @@
+"""Semi-structured and Snowflake-specific AST rewrites."""
+
+from __future__ import annotations
+
+import sqlglot
+from sqlglot import exp
+
+from snowflake_emulator.core.constants import INFORMATION_SCHEMA_SCHEMA
+from snowflake_emulator.translator.arrays import _is_json_value, _is_variant_value
+from snowflake_emulator.translator.ast_helpers import _quoted_identifier
+from snowflake_emulator.translator.constants import (
+    EMULATED_SNOWFLAKE_VERSION,
+    WRITE_DIALECT,
+)
+
+
+def _flatten_subquery(input_expr: exp.Expression) -> exp.Subquery:
+    """Build the DuckDB subquery equivalent of Snowflake's ``FLATTEN(input => X)``.
+
+    Snowflake's FLATTEN exposes SEQ/KEY/PATH/INDEX/VALUE/THIS. DuckDB's
+    ``json_each()`` exposes key/value/fullkey/...; we map those onto Snowflake's
+    names. INDEX is approximated as the array index (``TRY_CAST(key AS BIGINT)``),
+    which is NULL for object keys — matching Snowflake's object behaviour.
+
+    The operand is rewritten first and cast to JSON: a VARIANT column is not JSON to
+    DuckDB (``json_each`` rejects it), and this pass runs before the operand's own
+    ``col:path`` rewrite, so the cast has to be applied here.
+    """
+    operand = exp.cast(
+        input_expr.transform(_rewrite_snowflake_specifics),
+        exp.DataType.build("JSON"),
+        dialect=WRITE_DIALECT,
+    )
+    x = operand.sql(dialect=WRITE_DIALECT)
+    select = sqlglot.parse_one(
+        f"SELECT ROW_NUMBER() OVER () - 1 AS seq, key, fullkey AS path, "
+        f"TRY_CAST(key AS BIGINT) AS index, value, {x} AS this "
+        f"FROM json_each({x})",
+        read=WRITE_DIALECT,
+    )
+    return exp.Subquery(this=select)
+
+
+def _uppercase_unquoted_identifiers(node: exp.Expression) -> exp.Expression:
+    """Uppercase unquoted identifiers to match Snowflake's identifier casing.
+
+    Snowflake uppercases unquoted identifiers (quoted ones stay case-sensitive).
+    DuckDB preserves whatever case the client typed, so without this, table/column/
+    alias names round-trip in the as-written case instead of Snowflake's uppercase
+    canonical form. Quoted identifiers are left untouched.
+    """
+    if isinstance(node, exp.Identifier):
+        if not node.args.get("quoted") and isinstance(node.this, str):
+            node.set("this", node.this.upper())
+    return node
+
+
+def _is_information_schema(ident: exp.Identifier) -> bool:
+    """Return True if ``ident`` names Snowflake's system ``INFORMATION_SCHEMA``.
+
+    Unquoted references are case-insensitive (Snowflake uppercases them), while a
+    quoted reference only resolves to the system schema when spelled exactly
+    ``INFORMATION_SCHEMA``. Quoted mixed-case spellings name a different, unrelated
+    schema and are left alone.
+    """
+    name = ident.name
+    if not name or name.upper() != "INFORMATION_SCHEMA":
+        return False
+    if ident.args.get("quoted"):
+        return name == "INFORMATION_SCHEMA"
+    return True
+
+
+def _rewrite_information_schema(node: exp.Expression) -> exp.Expression:
+    """Map Snowflake's ``INFORMATION_SCHEMA`` onto the emulator's compat schema.
+
+    Applied on the parsed AST (rather than rewriting raw SQL) so string literals and
+    comments mentioning INFORMATION_SCHEMA are left untouched. Only the schema slot
+    of a qualified name (``{db}.INFORMATION_SCHEMA.<obj>``) is rewritten.
+    """
+    if isinstance(node, (exp.Table, exp.Column)):
+        db = node.args.get("db")
+        if isinstance(db, exp.Identifier) and _is_information_schema(db):
+            node.set("db", exp.Identifier(this=INFORMATION_SCHEMA_SCHEMA))
+    return node
+
+
+
+
+# Types Snowflake casts a semi-structured value to for its text form.
+_TEXT_TYPES = (
+    exp.DataType.Type.VARCHAR,
+    exp.DataType.Type.CHAR,
+    exp.DataType.Type.NCHAR,
+    exp.DataType.Type.NVARCHAR,
+    exp.DataType.Type.TEXT,
+)
+
+
+def _is_text_type(data_type: exp.Expression | None) -> bool:
+    """True for a text type, with or without a length (``VARCHAR``, ``VARCHAR(10)``)."""
+    return isinstance(data_type, exp.DataType) and data_type.this in _TEXT_TYPES
+
+
+def _json_root_extract(operand: exp.Expression) -> exp.Expression:
+    """``operand ->> '$'``: the text of a JSON value (a string without its quotes)."""
+    return exp.JSONExtractScalar(
+        this=operand, expression=exp.JSONPath(expressions=[exp.JSONPathRoot()])
+    )
+
+
+def _rewrite_semi_structured_text_cast(node: exp.Expression) -> exp.Expression:
+    """Make ``col:path::VARCHAR`` return the value's text, not DuckDB's JSON serialization.
+
+    ``col:path`` evaluates to a DuckDB JSON value, and ``CAST(<json> AS VARCHAR)`` serializes
+    it -- a JSON string keeps its quotes (``'"y"'`` where Snowflake returns ``y``).
+    ``->> '$'`` yields the text of a JSON scalar instead, and of a JSON object/array the
+    document text, as Snowflake does. An explicit VARIANT is serialized to JSON first for
+    the same reason; a bare VARIANT column is left alone, since DuckDB's own VARIANT cast
+    already returns a string variant's text (whether a bare column holds one is not known
+    until run time).
+
+    The operand is rewritten here rather than serialized: replacing a node stops the walk
+    from descending into its children, and a ``col:path`` operand is not yet a JSON value.
+    """
+    operand = node.this
+    if not (_is_json_value(operand) or _is_variant_value(operand)):
+        return node
+    inner = operand.transform(_rewrite_snowflake_specifics)
+    if _is_variant_value(inner):
+        inner = exp.cast(inner, exp.DataType.build("JSON"), dialect=WRITE_DIALECT)
+    extracted = _json_root_extract(inner)
+    if isinstance(node, exp.ToChar):
+        return extracted  # its DuckDB rendering is already a text cast
+    return exp.Cast(this=extracted, to=node.to)
+
+
+def _rewrite_snowflake_specifics(node: exp.Expression) -> exp.Expression:
+    """Rewrite Snowflake nodes that sqlglot can't fully transpile to DuckDB."""
+    # ``CURRENT_VERSION()`` -> a Snowflake-style dotted-numeric version literal.
+    if isinstance(node, exp.CurrentVersion):
+        return exp.Literal.string(EMULATED_SNOWFLAKE_VERSION)
+
+    # ``col:path::VARCHAR`` / ``TO_VARCHAR(col:path)``.
+    if isinstance(node, exp.Cast) and _is_text_type(node.to):
+        return _rewrite_semi_structured_text_cast(node)
+    if isinstance(node, exp.ToChar) and node.args.get("format") is None:
+        return _rewrite_semi_structured_text_cast(node)
+
+    # Snowflake JSON path extraction (``col:path``, ``GET_PATH``) transpiles to
+    # DuckDB's ``->``/``->>``, which parses its operand as JSON on the fly. A VALUE
+    # bound from a Python dict is stored by DuckDB in a Python-repr form (e.g.
+    # ``{'a': 1}``) that is not valid JSON, so the extraction raises. Casting the
+    # operand to JSON first makes it round-trip through real JSON instead of the
+    # VARIANT/VARCHAR repr. ``exp.cast`` skips an operand that is already cast to JSON.
+    if isinstance(node, (exp.JSONExtract, exp.JSONExtractScalar)):
+        if not isinstance(node.this, exp.ParseJSON):
+            node.set(
+                "this",
+                exp.cast(node.this, exp.DataType.build("JSON"), dialect=WRITE_DIALECT),
+            )
+        return node
+
+    # ``LATERAL FLATTEN(input => X)`` -> DuckDB json_each-based lateral subquery.
+    if (
+        isinstance(node, exp.Lateral)
+        and isinstance(node.this, exp.Explode)
+        and isinstance(node.this.this, exp.Kwarg)
+    ):
+        key = node.this.this.args.get("this")
+        if getattr(key, "name", None) and key.name.upper() == "INPUT":
+            new = node.copy()
+            new.set("this", _flatten_subquery(node.this.this.expression))
+            alias = new.args.get("alias")
+            if alias is not None:
+                alias.set("columns", [])
+            return new
+
+    # ``TABLE(FLATTEN(input => X))`` -> the same subquery, unwrapped from TABLE(...).
+    if (
+        isinstance(node, exp.TableFromRows)
+        and isinstance(node.this, exp.Explode)
+        and isinstance(node.this.this, exp.Kwarg)
+    ):
+        key = node.this.this.args.get("this")
+        if getattr(key, "name", None) and key.name.upper() == "INPUT":
+            sub = _flatten_subquery(node.this.this.expression)
+            sub.set("alias", node.args.get("alias"))
+            return sub
+
+    # Snowflake sequence pseudo-column ``seq.NEXTVAL`` -> ``nextval('seq')``.
+    if (
+        isinstance(node, exp.Column)
+        and node.name
+        and node.name.upper() == "NEXTVAL"
+        and node.args.get("table") is not None
+    ):
+        parts = [
+            node.args.get("catalog"),
+            node.args.get("db"),
+            node.args.get("table"),
+        ]
+        seq_name = ".".join(_quoted_identifier(p.name) for p in parts if p is not None)
+        return exp.func("nextval", exp.Literal.string(seq_name))
+
+    # Snowflake semi-structured column types. VARIANT is already accepted by DuckDB;
+    # bare OBJECT/ARRAY have no DuckDB DDL equivalent, so map them to JSON. An ARRAY
+    # with an element type (e.g. VARCHAR[]) already transpiles to DuckDB's ``TEXT[]``.
+    if isinstance(node, exp.DataType):
+        if node.this == exp.DataType.Type.OBJECT:
+            return exp.DataType.build("JSON")
+        if node.this == exp.DataType.Type.ARRAY and not node.expressions:
+            return exp.DataType.build("JSON")
+        # Snowflake's TIMESTAMP_TZ(p)/TIMESTAMP_LTZ(p) accept a precision parameter,
+        # but DuckDB's ``TIMESTAMP WITH [LOCAL] TIME ZONE`` takes none -- sqlglot
+        # renders ``TIMESTAMP_LTZ(3)`` as ``TIMESTAMPTZ(3)``, which DuckDB rejects.
+        # Drop the modifier so the DDL/CAST is accepted; DuckDB stores microsecond
+        # precision either way (reported honestly via the timestamp scale mapping).
+        if (
+            node.this
+            in (exp.DataType.Type.TIMESTAMPTZ, exp.DataType.Type.TIMESTAMPLTZ)
+            and node.expressions
+        ):
+            stripped = node.copy()
+            stripped.set("expressions", [])
+            return stripped
+
+    # ``CREATE VOLATILE TABLE`` is Snowflake's (deprecated) synonym for
+    # ``CREATE TEMPORARY TABLE``. sqlglot's DuckDB generator drops the VOLATILE marker,
+    # which would silently create a permanent table, so it is swapped for the property
+    # DuckDB understands and the table keeps its session-scoped lifetime.
+    if isinstance(node, exp.Create):
+        properties = node.args.get("properties")
+        if properties is not None and any(
+            isinstance(prop, exp.VolatileProperty) for prop in properties.expressions
+        ):
+            rewritten = node.copy()
+            rewritten_properties = rewritten.args["properties"]
+            rewritten_properties.set(
+                "expressions",
+                [
+                    exp.TemporaryProperty() if isinstance(prop, exp.VolatileProperty) else prop
+                    for prop in rewritten_properties.expressions
+                ],
+            )
+            return rewritten
+
+    # ``MERGE ... UPDATE SET t.col = ...`` -> unqualified target column. DuckDB rejects
+    # the target-table qualifier on the left side of a SET assignment.
+    if isinstance(node, exp.Update):
+        for eq in node.expressions:
+            if isinstance(eq, exp.EQ) and isinstance(eq.this, exp.Column):
+                for key in ("table", "db", "catalog"):
+                    eq.this.args.pop(key, None)
+        return node
+
+    return node
