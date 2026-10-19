@@ -427,6 +427,25 @@ class DuckDBManager:
             FROM {db_ident}.{schema}._sf_constraints_ext
             WHERE constraint_type = 'FOREIGN KEY'
         """
+        functions = f"""
+            CREATE OR REPLACE VIEW {db_ident}.{schema}.functions AS
+            SELECT
+                function_catalog AS FUNCTION_CATALOG,
+                function_schema AS FUNCTION_SCHEMA,
+                function_name AS FUNCTION_NAME,
+                NULL::VARCHAR AS FUNCTION_OWNER,
+                '(' || replace(signature, '|', ', ') || ')' AS ARGUMENT_SIGNATURE,
+                return_type AS DATA_TYPE,
+                language AS FUNCTION_LANGUAGE,
+                body AS FUNCTION_DEFINITION,
+                'SCALAR'::VARCHAR AS FUNCTION_TYPE,
+                'N'::VARCHAR AS IS_SECURE,
+                'N'::VARCHAR AS IS_BUILTIN,
+                created_on AS CREATED,
+                created_on AS LAST_ALTERED,
+                NULL::VARCHAR AS COMMENT
+            FROM {db_ident}.{schema}._sf_functions_ext
+        """
         for sql in (
             views,
             sequences,
@@ -435,6 +454,7 @@ class DuckDBManager:
             key_column_usage,
             constraint_column_usage,
             referential_constraints,
+            functions,
         ):
             self._connection.execute(sql)
 

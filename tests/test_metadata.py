@@ -413,3 +413,26 @@ def test_drop_database_removes_it_and_if_exists_is_accepted(client):
     assert _post(client, "SHOW DATABASES LIKE 'TO_DROP'").json()["data"] == []
     assert _post(client, "DROP DATABASE IF EXISTS TO_DROP").status_code == 200
     assert _post(client, "DROP DATABASE TO_DROP").status_code == 422
+
+
+def test_information_schema_functions_lists_user_functions(client):
+    _post(
+        client,
+        "CREATE FUNCTION info_add(a NUMBER, b NUMBER) RETURNS NUMBER "
+        "AS $$ a + b $$",
+    )
+    _post(
+        client,
+        "CREATE FUNCTION info_upper(s STRING) RETURNS STRING AS $$ UPPER(s) $$",
+    )
+
+    rows = _post(
+        client,
+        "SELECT FUNCTION_NAME, ARGUMENT_SIGNATURE, DATA_TYPE, FUNCTION_LANGUAGE, "
+        "FUNCTION_TYPE, IS_BUILTIN FROM EMULATOR_DB.INFORMATION_SCHEMA.FUNCTIONS "
+        "ORDER BY FUNCTION_NAME",
+    ).json()["data"]
+    assert rows == [
+        ["INFO_ADD", "(NUMBER(38,0), NUMBER(38,0))", "NUMBER(38,0)", "SQL", "SCALAR", "N"],
+        ["INFO_UPPER", "(VARCHAR)", "VARCHAR", "SQL", "SCALAR", "N"],
+    ]

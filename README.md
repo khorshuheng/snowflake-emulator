@@ -448,7 +448,7 @@ rejected with a Snowflake-shaped error rather than failing silently).
 | `VARIANT`/`OBJECT`/`ARRAY`, `PARSE_JSON`, `OBJECT_CONSTRUCT`, `ARRAY_CONSTRUCT` | ✅ |
 | `LATERAL FLATTEN(...)`, `TABLE(FLATTEN(...))`, including `outer`/`path` | ✅ |
 | `FLATTEN(... recursive => TRUE)` | ❌ rejected |
-| `DESCRIBE TABLE`; `{db}.INFORMATION_SCHEMA` tables/columns/views/sequences/constraints/databases | ✅ |
+| `DESCRIBE TABLE`; `{db}.INFORMATION_SCHEMA` tables/columns/views/sequences/constraints/functions/databases | ✅ |
 | `CREATE [OR REPLACE] DATABASE`, `DROP [IF EXISTS] DATABASE` | ✅ |
 | `SHOW` schemas/tables/views/objects/columns/keys/stages/databases/sequences/… | ✅ |
 | `CREATE FUNCTION` (SQL-bodied scalar UDFs), `DESCRIBE`/`DROP FUNCTION` | ✅ |
