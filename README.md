@@ -191,11 +191,6 @@ Not translated, and left as a loud error rather than a guess:
   ARRAY_CONSTRUCT(...) AS n` stores `VARCHAR[]`/`INTEGER[]`) orders correctly too. Only a
   VARIANT column — or one whose name the catalog cannot attribute to a single type — is
   rejected;
-- a **mixed-type** comparison against a bare VARIANT column: DuckDB refuses to compare two
-  VARIANT elements whose values have different types, so
-  `ARRAY_INTERSECTION(nums, ARRAY_CONSTRUCT('2'))` raises `Can't compare values of type
-  VARCHAR (2) and type UBIGINT (3)` when `nums` holds numbers. Read the array through a JSON
-  path (`j:path`, compared as `JSON[]`) when the two sides can hold different types;
 - a **bound array operand**: a positional `?` that holds the array (or the searched value) is
   named in more than one sub-expression by the rebuilt call, so it would need several values;
   bind it as a named parameter (`:arr`) or pass a column. An index bind is fine
@@ -209,6 +204,14 @@ element, as in Snowflake, so `FILTER(j:n, x -> x = 'a')` filters without an enco
 and `TRANSFORM(j:nums, x -> x * 2)` does arithmetic on the element. `TO_JSON` returns VARCHAR
 (JSON text) in Snowflake, so `x -> x = TO_JSON('a')` compares against `'"a"'` and matches
 nothing — use the plain literal.
+
+A comparison spans element types instead of raising: `ARRAY_INTERSECTION`/`ARRAY_EXCEPT`/
+`ARRAYS_OVERLAP` over a VARIANT array compare in JSON space (where a number and the string that
+spells it are simply unequal, rather than DuckDB's `Can't compare values of type VARCHAR and type
+UBIGINT`), and a VARIANT *value* searched in a JSON array (`ARRAY_CONTAINS`, `ARRAY_POSITION`,
+`ARRAY_REMOVE`) compares in VARIANT space, where both sides normalize the same way.
+`ARRAY_REMOVE` removes the value rather than every NULL element (a NULL element survives; a NULL
+value returns NULL, as documented).
 
 `ARRAY_TO_STRING(array, separator)` is the documented two-argument form: a NULL element becomes
 an empty string, a NULL separator returns NULL, and a third argument is rejected (sqlglot would

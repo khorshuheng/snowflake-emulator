@@ -425,6 +425,83 @@ def test_array_ordering_compares_json_numbers_numerically(client):
     assert data("SELECT ARRAY_SORT(ARRAY_CONSTRUCT(10,2,33), FALSE)") == [[[33, 10, 2]]]
 
 
+def test_array_remove_keeps_null_elements(client):
+    """``ARRAY_REMOVE`` drops the value, not every NULL element; a NULL value returns NULL.
+
+    Snowflake's documented example keeps the NULL element (the function is NULL-safe about
+    elements), while ``value_of_elements_to_remove`` being NULL makes the whole call NULL.
+    sqlglot renders ``e <> value``, which is NULL for a NULL element and so dropped it.
+    """
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post("CREATE TABLE rem (v VARIANT)").status_code == 200
+    assert post(
+        'INSERT INTO rem SELECT PARSE_JSON(\'{"n":["a",null,"b","a"],'
+        '"dup":["a",null,null]}\')'
+    ).status_code == 200
+
+    # A NULL element survives the removal of a non-NULL value, in a JSON array and a native one.
+    assert data("SELECT ARRAY_REMOVE(v:n, 'a') FROM rem") == [[[None, 'b']]]
+    assert data("SELECT ARRAY_REMOVE(ARRAY_CONSTRUCT('a', NULL, 'b'), 'a')") == [[[None, 'b']]]
+    assert data("SELECT ARRAY_REMOVE(ARRAY_CONSTRUCT(1, 5, NULL), 5)") == [[[1, None]]]
+    # Every equal element goes, and the documented cast-to-VARIANT form works.
+    assert data("SELECT ARRAY_REMOVE(ARRAY_CONSTRUCT(5, 5), 5)") == [[[]]]
+    assert data(
+        "SELECT ARRAY_REMOVE(ARRAY_CONSTRUCT('a','b','a','c','d','a'), 'a'::VARIANT)"
+    ) == [[['b', 'c', 'd']]]
+    # A NULL value returns NULL, as documented -- it does not mean "remove the NULLs".
+    assert data("SELECT ARRAY_REMOVE(v:n, NULL) FROM rem") == [[None]]
+    assert data("SELECT ARRAY_REMOVE(v:dup, NULL) FROM rem") == [[None]]
+
+
+def test_array_comparisons_span_variant_value_types(client):
+    """A comparison over VARIANT values answers instead of raising, and matches across spaces.
+
+    DuckDB raises for ``CAST('2' AS VARIANT) = CAST(2 AS VARIANT)``, so INTERSECTION/EXCEPT/
+    OVERLAP over a VARIANT array compared in JSON space, where the two are simply unequal. A
+    VARIANT *value* searched in a JSON array compares in VARIANT space, where both sides go
+    through the same normalization (that pair used to answer FALSE for a number the array
+    holds).
+    """
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post("CREATE TABLE cx (n VARIANT, s VARIANT, two VARIANT)").status_code == 200
+    assert post(
+        'INSERT INTO cx SELECT PARSE_JSON(\'[3,1,2]\'), '
+        'PARSE_JSON(\'["2","3"]\'), PARSE_JSON(\'2\')'
+    ).status_code == 200
+
+    # Cross-type pairs over a VARIANT array answer instead of raising.
+    assert data("SELECT ARRAY_INTERSECTION(n, ARRAY_CONSTRUCT('2')) FROM cx") == [[[]]]
+    assert data("SELECT ARRAY_EXCEPT(n, ARRAY_CONSTRUCT('2')) FROM cx") == [[[3, 1, 2]]]
+    assert data("SELECT ARRAYS_OVERLAP(n, ARRAY_CONSTRUCT('2')) FROM cx") == [[False]]
+    assert data("SELECT ARRAY_INTERSECTION(n, s) FROM cx") == [[[]]]
+    assert data("SELECT ARRAYS_OVERLAP(s, n) FROM cx") == [[False]]
+
+    # Same-type comparisons are unchanged.
+    assert data("SELECT ARRAY_INTERSECTION(n, ARRAY_CONSTRUCT(2)) FROM cx") == [[[2]]]
+    assert data("SELECT ARRAY_EXCEPT(s, ARRAY_CONSTRUCT('2')) FROM cx") == [[['3']]]
+
+    # A VARIANT value finds its number in a JSON array.
+    assert data("SELECT ARRAY_CONTAINS(two, PARSE_JSON('[2,3]')) FROM cx") == [[True]]
+    assert data("SELECT ARRAY_POSITION(two, PARSE_JSON('[2,3]')) FROM cx") == [[0]]
+    assert data("SELECT ARRAY_REMOVE(PARSE_JSON('[2,3]'), two) FROM cx") == [[[3]]]
+    # A number is still not the string that spells it.
+    assert data("SELECT ARRAY_CONTAINS('2'::VARIANT, PARSE_JSON('[2,3]')) FROM cx") == [[False]]
+
+
 def test_array_to_string_null_and_argument_shapes(client):
     """``ARRAY_TO_STRING`` over a JSON array: NULL separator, NULL element, nested values.
 

@@ -287,6 +287,24 @@ def _aggregates_to_variant_list(node: exp.Expression) -> bool:
     return _is_variant_typed(argument)
 
 
+def _comparable_array_and_value(
+    array: exp.Expression | None, value: exp.Expression | None
+) -> tuple[exp.Expression | None, exp.Expression | None]:
+    """Pick one element space for an array and the value searched in it.
+
+    A VARIANT value compares in VARIANT space: both sides go through the same normalization
+    round-trip, where a JSON-derived and a text-built variant land on the same representation.
+    The JSON space leaves the variant on one side of the comparison only, and DuckDB then
+    treats it as unequal -- ``ARRAY_CONTAINS(<variant 2>, PARSE_JSON('[2,3]'))`` answered FALSE
+    although the array holds that number. Anything else keeps the array's own space.
+    """
+    if _is_variant_typed(value):
+        if array is not None and not _is_variant_array_value(array):
+            array = _encoded_array_elements(array, "variant")
+        return array, _variant_element(value)
+    return array, _encoded_element(value, array)
+
+
 def _has_variant_list(node: exp.Expression) -> bool:
     """True when `node` holds a ``VARIANT[]`` cast -- the array functions' mark for one."""
     return _is_variant_list(node) or any(
@@ -503,9 +521,9 @@ def _rewrite_array_contains(node: exp.Expression) -> exp.Expression:
     """
     array = _array_list(_rewrite_operand(node.this))
     value = _rewrite_operand(node.args.get("expression"))
-    # A VARIANT/JSON element is encoded so both sides compare as VARIANT values; against a
+    # A VARIANT value compares in VARIANT space and a JSON array in JSON space; against a
     # native list the value keeps its type.
-    value = _encoded_element(value, array)
+    array, value = _comparable_array_and_value(array, value)
     array_sql = _sql(array)
     return sqlglot.parse_one(
         f"COALESCE(ARRAY_CONTAINS({array_sql}, {_sql(value)}), "
@@ -528,8 +546,8 @@ def _rewrite_array_position(node: exp.Expression) -> exp.Expression:
     returns -- for a ``JSON[]`` list, where a JSON null element is the match.
     """
     array = _array_list(_rewrite_operand(node.this))
-    value = _encoded_element(
-        _rewrite_operand(node.args.get("expression")), array
+    array, value = _comparable_array_and_value(
+        array, _rewrite_operand(node.args.get("expression"))
     )
     return sqlglot.parse_one(
         f"ARRAY_POSITION({_sql(array)}, {_sql(value)}) - 1",
@@ -595,6 +613,35 @@ def _encoded_array_elements(node: exp.Expression, kind: str) -> exp.Expression:
     )
 
 
+def _json_from_variant_list(node: exp.Expression | None) -> exp.Expression | None:
+    """Re-encode a ``VARIANT[]``'s elements as JSON, keeping them a LIST.
+
+    DuckDB raises ``Can't compare values of type VARCHAR and type UBIGINT`` for two VARIANT
+    elements of different types (``CAST('2' AS VARIANT) = CAST(2 AS VARIANT)``), while the same
+    values as JSON simply compare unequal. A comparison function over a VARIANT array therefore
+    compares in JSON space, where a number and the string that spells it are distinct instead
+    of an error.
+    """
+    if node is None or not _is_variant_array_value(node):
+        return node
+    return sqlglot.parse_one(
+        f"CAST(LIST_TRANSFORM({_sql(node)}, "
+        f"_sfemu_element -> CAST(_sfemu_element AS JSON)) AS JSON[])",
+        read=WRITE_DIALECT,
+    )
+
+
+def _comparable_pair(
+    left: exp.Expression | None, right: exp.Expression | None
+) -> tuple[exp.Expression | None, exp.Expression | None]:
+    """Coerce two array operands onto one element kind that DuckDB can compare."""
+    left, right = _coerced_array_pair(left, right)
+    if _list_kind(left) == "variant" or _list_kind(right) == "variant":
+        left = _json_from_variant_list(left)
+        right = _json_from_variant_list(right)
+    return left, right
+
+
 def _coerced_array_pair(
     left: exp.Expression | None, right: exp.Expression | None
 ) -> tuple[exp.Expression | None, exp.Expression | None]:
@@ -630,7 +677,7 @@ def _rewrite_array_set_operation(node: exp.Expression) -> exp.Expression:
     right = _array_list(_rewrite_operand(node.args.get("expression")))
     if _list_kind(left) == "native" and _list_kind(right) == "native":
         return node
-    left, right = _coerced_array_pair(left, right)
+    left, right = _comparable_pair(left, right)
     if isinstance(node, exp.ArrayOverlaps):
         return exp.func("list_has_any", left, right)
     node.set("this", left)
@@ -821,6 +868,32 @@ def _rewrite_array_to_string(node: exp.Expression) -> exp.Expression:
     )
 
 
+def _rewrite_array_remove(node: exp.Expression) -> exp.Expression:
+    """``ARRAY_REMOVE`` drops the value, not every NULL element.
+
+    sqlglot renders ``LIST_FILTER(array, e -> e <> value)``. A comparison against a NULL
+    element is NULL, so the filter dropped it: ``ARRAY_REMOVE(['a',null,'b'], 'a')`` returned
+    ``['b']`` where Snowflake returns ``[null,'b']`` (the documented example keeps the NULL
+    element). ``IS DISTINCT FROM`` keeps every element that is not the value, and the
+    documented NULL *value* behaviour -- the whole call is NULL -- is kept as the CASE sqlglot
+    emits, since a NULL value means "return NULL", not "remove the NULLs".
+    """
+    array = _array_list(_rewrite_json_array_functions(node.this))
+    value = _rewrite_json_array_functions(node.args.get("expression"))
+    if _is_variant_array_value(array) and not _is_variant_typed(value):
+        # A VARIANT array with a plain value compares in JSON space, like the other comparison
+        # functions (a VARIANT-vs-VARIANT comparison of different types raises).
+        array = _json_from_variant_list(array)
+    array, value = _comparable_array_and_value(array, value)
+    array_sql, value_sql = _sql(array), _sql(value)
+    return sqlglot.parse_one(
+        f"CASE WHEN {value_sql} IS NULL THEN NULL ELSE "
+        f"LIST_FILTER({array_sql}, _sfemu_element -> "
+        f"_sfemu_element IS DISTINCT FROM {value_sql}) END",
+        read=WRITE_DIALECT,
+    )
+
+
 def _coerce_array_operands(node: exp.Expression) -> exp.Expression:
     """Coerce a two-array call's operands onto one element kind.
 
@@ -838,10 +911,10 @@ def _coerce_array_operands(node: exp.Expression) -> exp.Expression:
         else operand
         for operand in operands
     ]
+    compare = isinstance(node, exp.ArrayIntersect)
     for index in range(1, len(converted)):
-        converted[0], converted[index] = _coerced_array_pair(
-            converted[0], converted[index]
-        )
+        pair = _comparable_pair if compare else _coerced_array_pair
+        converted[0], converted[index] = pair(converted[0], converted[index])
     if isinstance(node, exp.ArrayConcat):
         node.set("this", converted[0])
         node.set("expressions", converted[1:])
@@ -947,6 +1020,8 @@ def _rewrite_json_array_function(node: exp.Expression) -> exp.Expression:
         return _rewrite_array_repeat(node)
     if name == _FLATTEN_MARKER:
         return _rewrite_array_flatten(node)
+    if isinstance(node, exp.ArrayRemove):
+        return _rewrite_array_remove(node)
     if isinstance(node, exp.ArrayContains):
         return _rewrite_array_contains(node)
     if isinstance(node, exp.ArraySize):
