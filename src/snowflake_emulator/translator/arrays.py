@@ -339,13 +339,18 @@ def _rewrite_array_size(node: exp.Expression) -> exp.Expression:
 
 
 def _rewrite_array_position(node: exp.Expression) -> exp.Expression:
-    """``ARRAY_POSITION`` is 0-based, and 0 rather than NULL when the value is absent."""
+    """``ARRAY_POSITION`` is 0-based, and NULL when the value is absent.
+
+    Snowflake documents NULL for a value the array does not contain (not 0), and the position
+    of the first NULL for a NULL value, which is what DuckDB's ``array_position`` already
+    returns -- for a ``JSON[]`` list, where a JSON null element is the match.
+    """
     array = _array_list(_rewrite_json_array_functions(node.this))
     value = _encoded_element(
         _rewrite_json_array_functions(node.args.get("expression")), array
     )
     return sqlglot.parse_one(
-        f"COALESCE(ARRAY_POSITION({_sql(array)}, {_sql(value)}) - 1, 0)",
+        f"ARRAY_POSITION({_sql(array)}, {_sql(value)}) - 1",
         read=WRITE_DIALECT,
     )
 
@@ -376,14 +381,43 @@ def _list_kind(node: exp.Expression | None) -> str:
     return "native"
 
 
+def _multiset_except_sql(left: str, right: str) -> str:
+    """``ARRAY_EXCEPT`` as Snowflake's multiset subtract: a value keeps ``N - M`` copies.
+
+    Snowflake removes as many copies of a value as the excluded array holds, not every copy
+    (``['a','b','b','b','c']`` except ``['b']`` keeps two ``b``s), so a plain
+    ``LIST_FILTER(... NOT LIST_CONTAINS(...))`` is wrong. A copy is kept when its occurrence
+    index (its rank among the equal elements of the source, counted from the front) is at
+    most ``N - M``; the rank is the length of the same-valued prefix, which is what the inner
+    ``LIST_FILTER`` over ``ARRAY_SLICE`` measures. Each operand is therefore named several
+    times, which a bound ``?`` operand does not survive -- the same limitation the other
+    rebuilt calls have.
+    """
+    rank = (
+        f"LIST_COUNT(LIST_FILTER(ARRAY_SLICE({left}, 1, _sfemu_index), "
+        f"_sfemu_seen -> _sfemu_seen = {left}[_sfemu_index]))"
+    )
+    budget = (
+        f"LIST_COUNT(LIST_FILTER({left}, _sfemu_all -> _sfemu_all = {left}[_sfemu_index])) "
+        f"- LIST_COUNT(LIST_FILTER({right}, _sfemu_excluded -> "
+        f"_sfemu_excluded = {left}[_sfemu_index]))"
+    )
+    return (
+        f"LIST_TRANSFORM(LIST_FILTER(RANGE(1, LIST_COUNT({left}) + 1), "
+        f"_sfemu_index -> {rank} <= {budget}), "
+        f"_sfemu_index -> {left}[_sfemu_index])"
+    )
+
+
 def _rewrite_array_set_operation(node: exp.Expression) -> exp.Expression:
     """``ARRAY_EXCEPT``/``ARRAYS_OVERLAP``: sqlglot's rendering does not bind a JSON[]/VARIANT[].
 
     A native pair keeps sqlglot's rendering (and with it the multiset semantics it models);
     a JSON or VARIANT pair is rebuilt, where DuckDB has no equivalent for the ``&&`` operator
-    or the zip-based except. A *mixed* pair -- one JSON/VARIANT operand and one native list --
-    has no common element type (DuckDB compares a JSON or VARIANT element against an ``INT``
-    or ``VARCHAR`` element as unequal), so it is rejected rather than answered wrong.
+    or the zip-based except -- ``_multiset_except_sql`` reproduces the multiset subtract. A
+    *mixed* pair -- one JSON/VARIANT operand and one native list -- has no common element
+    type (DuckDB compares a JSON or VARIANT element against an ``INT`` or ``VARCHAR`` element
+    as unequal), so it is rejected rather than answered wrong.
     """
     left = _array_list(_rewrite_json_array_functions(node.this))
     right = _array_list(_rewrite_json_array_functions(node.args.get("expression")))
@@ -399,9 +433,7 @@ def _rewrite_array_set_operation(node: exp.Expression) -> exp.Expression:
     if isinstance(node, exp.ArrayOverlaps):
         return exp.func("list_has_any", left, right)
     return sqlglot.parse_one(
-        f"LIST_FILTER({_sql(left)}, _sfemu_element -> "
-        f"NOT LIST_CONTAINS({_sql(right)}, _sfemu_element))",
-        read=WRITE_DIALECT,
+        _multiset_except_sql(_sql(left), _sql(right)), read=WRITE_DIALECT
     )
 
 

@@ -188,9 +188,13 @@ Not translated, and left as a loud error rather than a guess:
   the element is a VARIANT, so compare against `TO_JSON('a')` or cast with `TO_VARCHAR(x)`;
 - `ARRAY_FLATTEN`, which needs a constant depth between 1 and 10.
 
-Two behaviours inherited from sqlglot rather than Snowflake, so treat them as unverified:
-`ARRAY_INTERSECTION` keeps duplicate elements (its multiset model), and `ARRAY_POSITION`
-returns 0 for a NULL value as well as for an absent one.
+Verified against Snowflake's documentation, and covered by
+`test_documented_array_semantics`: `ARRAY_INTERSECTION` and `ARRAY_EXCEPT` use multi-set
+("bag") semantics rather than set semantics — a value keeps `min(N, M)` copies after an
+intersection and `N - M` copies after an except, so `['a','b','b','b','c']` except
+`['b']` is `['a','b','b','c']`; `ARRAY_POSITION` is 0-based and returns NULL, not 0, when
+the value is absent (and the position of the first NULL for a NULL value); `ARRAY_AGG`
+omits NULL values.
 
 ### User-defined functions (`CREATE FUNCTION`)
 

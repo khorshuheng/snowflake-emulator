@@ -316,7 +316,7 @@ def test_other_array_functions_over_variant_arrays(client):
         ("SELECT ARRAY_SORT(ARRAY_UNIQUE(j:n)) FROM arr_t", [[['a', 'b']]]),
         ("SELECT ARRAY_REMOVE_AT(j:n, 0) FROM arr_t", [[['b', 'a']]]),
         ("SELECT ARRAY_POSITION('b', j:n) FROM arr_t", [[1]]),
-        ("SELECT ARRAY_POSITION('zz', j:n) FROM arr_t", [[0]]),
+        ("SELECT ARRAY_POSITION('zz', j:n) FROM arr_t", [[None]]),
         ("SELECT ARRAY_PREPEND('z', j:n) FROM arr_t", [[['z', 'a', 'b', 'a']]]),
         ("SELECT ARRAY_REPEAT('x', 3) FROM arr_t", [[['x', 'x', 'x']]]),
         ("SELECT ARRAY_FLATTEN(j:deep, 1) FROM arr_t", [[[1, 2, 3]]]),
@@ -354,10 +354,16 @@ def test_other_array_functions_over_variant_arrays(client):
         assert resp.status_code == 200, (statement, resp.json())
         assert resp.json()["data"] == expected, statement
 
-    # sqlglot models ARRAY_INTERSECTION as a multiset operation, so compare as a set here.
+    # Snowflake's ARRAY_INTERSECTION is a multiset (bag) operation: a value appears
+    # min(N, M) times, where N and M are its counts in each array. ['a','b','a'] against
+    # itself keeps both 'a's, which is what sqlglot's multiset model produces.
     intersected = post("SELECT ARRAY_INTERSECTION(j:n, j:n) FROM arr_t")
     assert intersected.status_code == 200, intersected.json()
-    assert set(intersected.json()["data"][0][0]) == {'a', 'b'}
+    assert intersected.json()["data"] == [[['a', 'b', 'a']]]
+    assert post(
+        "SELECT ARRAY_INTERSECTION(PARSE_JSON('[\"b\",\"b\",\"b\"]'), "
+        "PARSE_JSON('[\"b\",\"b\"]'))"
+    ).json()["data"] == [[['b', 'b']]]
 
 
 def test_array_flatten_requires_a_literal_depth(client):
@@ -513,7 +519,7 @@ def test_array_functions_over_a_bare_variant_array(client):
         ("SELECT ARRAY_CONTAINS(TO_VARIANT(ARRAY_CONSTRUCT(1,2)), deep) FROM bare", [[True]]),
         ("SELECT ARRAY_SIZE(names) FROM bare", [[2]]),
         ("SELECT ARRAY_POSITION('bob', names) FROM bare", [[1]]),
-        ("SELECT ARRAY_POSITION('zoe', names) FROM bare", [[0]]),
+        ("SELECT ARRAY_POSITION('zoe', names) FROM bare", [[None]]),
         ("SELECT ARRAY_SLICE(names, 0, 0) FROM bare", [[['ada']]]),
         ("SELECT ARRAY_CONTAINS('ada', ARRAY_SLICE(names, 0, 0)) FROM bare", [[True]]),
         # Flatten follows an ARRAY_SLICE result, which is a call rather than a CAST.
@@ -526,6 +532,77 @@ def test_array_functions_over_a_bare_variant_array(client):
         resp = post(statement)
         assert resp.status_code == 200, (statement, resp.json())
         assert resp.json()["data"] == expected, statement
+
+
+def test_documented_array_semantics(client):
+    """The four semantics that were inherited from sqlglot, checked against Snowflake's docs.
+
+    Verified on docs.snowflake.com: ``ARRAY_INTERSECTION`` and ``ARRAY_EXCEPT`` compare with
+    multi-set (bag) semantics, ``ARRAY_POSITION`` returns NULL for a value the array does not
+    contain and the position of the first NULL for a NULL value, and ``ARRAY_AGG`` omits NULL
+    values. The multiset intersection and the NULL omission were already what sqlglot models;
+    the 0-based ``ARRAY_POSITION`` fallback of 0 and ARRAY_EXCEPT's set-semantics JSON rebuild
+    were not.
+    """
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post("CREATE TABLE json_arr (j VARIANT)").status_code == 200
+    assert (
+        post(
+            "INSERT INTO json_arr SELECT PARSE_JSON('{\"n\":[\"a\",\"b\",\"b\",\"b\",\"c\"]}')"
+        ).status_code
+        == 200
+    )
+    assert post("CREATE TABLE json_null_arr (j VARIANT)").status_code == 200
+    assert (
+        post("INSERT INTO json_null_arr SELECT PARSE_JSON('{\"n\":[\"a\",null,\"b\"]}')")
+        .status_code
+        == 200
+    )
+    assert post("CREATE TABLE null_arr (x INT)").status_code == 200
+    assert post("INSERT INTO null_arr VALUES (1), (NULL), (2)").status_code == 200
+    assert post("CREATE TABLE variant_arr (n VARIANT)").status_code == 200
+    assert (
+        post("INSERT INTO variant_arr SELECT ARRAY_CONSTRUCT('a','b','b','b','c')").status_code
+        == 200
+    )
+
+    # ARRAY_EXCEPT removes M copies of a value, leaving N - M: ['a','b','b','b','c'] minus
+    # ['b'] keeps two 'b's, for a JSON array and a VARIANT one alike.
+    assert data("SELECT ARRAY_EXCEPT(j:n, PARSE_JSON('[\"b\"]')) FROM json_arr") == [
+        [['a', 'b', 'b', 'c']]
+    ]
+    assert data(
+        "SELECT ARRAY_EXCEPT(PARSE_JSON('[\"a\",\"b\",\"b\",\"b\",\"c\"]'), "
+        "PARSE_JSON('[\"b\"]'))"
+    ) == [[['a', 'b', 'b', 'c']]]
+    assert data(
+        "SELECT ARRAY_EXCEPT(n, TO_VARIANT(ARRAY_CONSTRUCT('b'))) FROM variant_arr"
+    ) == [[['a', 'b', 'b', 'c']]]
+    assert data(
+        "SELECT ARRAY_EXCEPT(ARRAY_CONSTRUCT('a','b','b','b','c'), ARRAY_CONSTRUCT('b'))"
+    ) == [[['a', 'b', 'b', 'c']]]
+    assert data("SELECT ARRAY_EXCEPT(j:n, PARSE_JSON('[\"b\",\"b\"]')) FROM json_arr") == [
+        [['a', 'b', 'c']]
+    ]
+    assert data("SELECT ARRAY_EXCEPT(n, n) FROM variant_arr") == [[[]]]
+
+    # ARRAY_POSITION answers NULL, not 0, for a value the array does not hold...
+    assert data("SELECT ARRAY_POSITION('zz', j:n) FROM json_arr") == [[None]]
+    assert data("SELECT ARRAY_POSITION('zz', ARRAY_CONSTRUCT('a'))") == [[None]]
+    # ...and the position of the first NULL for a NULL value, in a JSON array and a native
+    # list alike.
+    assert data("SELECT ARRAY_POSITION(NULL, j:n) FROM json_null_arr") == [[1]]
+    assert data("SELECT ARRAY_POSITION(NULL, ARRAY_CONSTRUCT('a', NULL, 'b'))") == [[1]]
+
+    # ARRAY_AGG omits NULL values.
+    assert data("SELECT ARRAY_AGG(x) FROM null_arr") == [[[1, 2]]]
 
 
 def test_array_set_operation_rejects_a_mixed_pair(client):
