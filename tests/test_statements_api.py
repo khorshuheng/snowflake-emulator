@@ -1853,6 +1853,77 @@ def test_select_from_staged_json_strip_outer_array(client, tmp_path):
     assert selected["data"] == [[1], [2]]
 
 
+def test_copy_json_array_document_is_one_record_without_strip(client, tmp_path):
+    """Both JSON readers agree: without STRIP_OUTER_ARRAY an array document is one record.
+
+    ``read_json_auto`` auto-detects an outer array and explodes it, so the direct COPY INTO
+    loaded ``[{...},{...}]`` as one row per element while the projected reader loaded it as a
+    single record. The direct reader now forces the newline-delimited format, so an array
+    document is that one record's value (Snowflake's model) and a pretty-printed document is
+    rejected by the same check on both paths.
+    """
+    ndjson = tmp_path / "rows.json"
+    ndjson.write_text('{"a": 1}\n{"a": 2}\n')
+    single_line_array = tmp_path / "array.json"
+    single_line_array.write_text('[{"a": 1}, {"a": 2}]\n')
+    pretty = tmp_path / "pretty.json"
+    pretty.write_text(json.dumps([{"a": 1}, {"a": 2}], indent=2))
+    headers = _stage_headers(client)
+    _stage(client, headers, ndjson, "@~/staged")
+    _stage(client, headers, single_line_array, "@~/staged")
+    _stage(client, headers, pretty, "@~/staged")
+
+    def copy(statement):
+        return client.post(
+            "/api/v2/statements", json={"statement": statement}, headers=headers
+        )
+
+    def count(table):
+        resp = client.post(
+            "/api/v2/statements",
+            json={"statement": f"SELECT COUNT(*) FROM {table}"},
+            headers=headers,
+        )
+        assert resp.status_code == 200, resp.json()
+        return resp.json()["data"][0][0]
+
+    for form, source in (
+        ("direct", "COPY INTO {table} FROM @~/staged/{name} FILE_FORMAT = (TYPE = JSON)"),
+        (
+            "projected",
+            "COPY INTO {table} FROM (SELECT $1 FROM @~/staged/{name}) "
+            "FILE_FORMAT = (TYPE = JSON)",
+        ),
+    ):
+        ok = copy("CREATE OR REPLACE TABLE arr_t (v VARIANT)")
+        assert ok.status_code == 200, ok.json()
+        assert copy(source.format(table="arr_t", name="rows.json")).status_code == 200
+        assert count("arr_t") == 2, form
+
+        ok = copy("CREATE OR REPLACE TABLE arr_t (v VARIANT)")
+        assert ok.status_code == 200, ok.json()
+        assert copy(source.format(table="arr_t", name="array.json")).status_code == 200
+        # One record, holding the array -- not one row per element.
+        assert count("arr_t") == 1, form
+
+        ok = copy("CREATE OR REPLACE TABLE arr_t (v VARIANT)")
+        assert ok.status_code == 200, ok.json()
+        rejected = copy(source.format(table="arr_t", name="pretty.json"))
+        assert rejected.status_code == 422, (form, rejected.json())
+        assert "newline-delimited" in rejected.json()["detail"]["message"], form
+
+    # STRIP_OUTER_ARRAY stays available on the projected form, where it explodes the array.
+    assert copy(
+        "CREATE OR REPLACE TABLE arr_t (v VARIANT)"
+    ).status_code == 200
+    stripped = copy(
+        "COPY INTO arr_t FROM (SELECT $1 FROM @~/staged/array.json) "
+        "FILE_FORMAT = (TYPE = JSON, STRIP_OUTER_ARRAY = TRUE)"
+    )
+    assert stripped.status_code == 200, stripped.json()
+    assert count("arr_t") == 2
+
+
 def test_select_from_staged_file_rejects_non_newline_json(client, tmp_path):
     json_path = tmp_path / "pretty.json"
     json_path.write_text(json.dumps({"col": 1}, indent=2))

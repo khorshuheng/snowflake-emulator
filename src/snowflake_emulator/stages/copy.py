@@ -501,9 +501,16 @@ def _copy_json_sql(
                 "STRIP_OUTER_ARRAY is only supported for "
                 "COPY INTO ... FROM (SELECT ... FROM @stage) by the emulator."
             )
+        # ``read_json_auto`` auto-detects an outer array and explodes it into rows, so a
+        # ``[{...},{...}]`` document loaded without STRIP_OUTER_ARRAY silently became one row
+        # per element while the projected reader (and Snowflake) load it as a single record.
+        # Forcing the newline-delimited format keeps both readers on one model: one record per
+        # line, and an array document is that one record's value.
+        _check_newline_delimited_json(files, ref)
         return (
             f"INSERT INTO {table_sql} SELECT * "
-            f"FROM read_json_auto({_format_file_list(files)})"
+            f"FROM read_json_auto({_format_file_list(files)}, "
+            "format='newline_delimited')"
         )
     # A projected `FROM (SELECT ... FROM @stage)` addresses each record as `$1`, so the
     # reader must expose the raw document as that single value (read_json_auto flattens

@@ -309,7 +309,10 @@ Supported stage commands:
 count) and returns one result row per file with Snowflake's load-report columns
 (`file`, `status`, `rows_parsed`, `rows_loaded`, ...). Options the emulator cannot honor
 (`ON_ERROR`, `PURGE`, `FORCE`, `MATCH_BY_COLUMN_NAME`, a direct `STRIP_OUTER_ARRAY`, or
-an unsupported file-format option) are rejected rather than silently ignored.
+an unsupported file-format option) are rejected rather than silently ignored. A JSON load
+reads one record per line: a single-line `[{...},{...}]` document is one record whose value
+is the array (matching the projected reader, and Snowflake without `STRIP_OUTER_ARRAY`),
+and a pretty-printed document is rejected on both paths.
 
 Stage references supported: `@~` (user stage, private per session), `@name`,
 `@db.schema.name`, `@%table` (table stage), `@%` (internal stage). A stage reference is a
@@ -347,7 +350,8 @@ Caveats:
 
 - Staged JSON must be newline-delimited: a pretty-printed document is rejected rather
   than read as a set of NULL rows, and a malformed record fails the query instead of
-  becoming NULL.
+  becoming NULL. A single-line array document is one record; `COPY INTO ... FROM
+  (SELECT ...) FILE_FORMAT = (TYPE = JSON, STRIP_OUTER_ARRAY = TRUE)` explodes it instead.
 - A location whose files differ in width (`a.csv` with 2 fields, `b.csv` with 3) widens
   into the union, filling the missing fields with NULL.
 - `FILE_FORMAT` options the emulator does not translate are rejected (`TRIM_SPACE = TRUE`),
