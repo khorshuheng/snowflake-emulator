@@ -17,15 +17,59 @@ from snowflake_emulator.translator.constants import (
 from snowflake_emulator.translator.errors import TranslationError
 
 
-def preprocess_array_flatten(sql: str) -> str:
-    """Rename ``ARRAY_FLATTEN(x, depth)`` so sqlglot's one-argument limit accepts it.
+def _array_to_string_argument_count(tokens: list, index: int) -> int:
+    """Number of comma-separated arguments of the call whose ``(`` is at `index`.
 
-    sqlglot's ``ArrayFlatten`` node takes a single argument, so the documented
-    two-argument Snowflake form fails to parse before any rewrite can run. Only the call's
-    name is renamed, located by token position so a literal that mentions it is untouched;
-    the translator then rewrites the renamed call (``_rewrite_array_flatten``).
+    Counted from the tokens rather than the AST because sqlglot drops an extra
+    ``ARRAY_TO_STRING`` argument silently, so the parsed call cannot reveal it.
+    """
+    depth = 0
+    arguments = 1
+    for token in tokens[index:]:
+        if token.token_type == TokenType.L_PAREN:
+            depth += 1
+        elif token.token_type == TokenType.R_PAREN:
+            depth -= 1
+            if depth == 0:
+                return arguments
+        elif token.token_type == TokenType.COMMA and depth == 1:
+            arguments += 1
+    return arguments
+
+
+def _reject_extra_array_to_string_arguments(tokens: list) -> None:
+    """Reject a third ``ARRAY_TO_STRING`` argument instead of letting sqlglot drop it.
+
+    Snowflake documents ``ARRAY_TO_STRING(array, separator)``: a NULL element becomes an
+    empty string and there is no null-replacement parameter, so a third argument is not
+    Snowflake SQL. sqlglot parses it away, which would turn an error into a silently
+    different answer.
+    """
+    for index, token in enumerate(tokens[:-1]):
+        if token.text.upper() != "ARRAY_TO_STRING":
+            continue
+        if tokens[index + 1].token_type != TokenType.L_PAREN:
+            continue
+        if _array_to_string_argument_count(tokens, index + 1) > 2:
+            raise TranslationError(
+                "ARRAY_TO_STRING takes an array and a separator; Snowflake's documented "
+                "signature has no null-replacement argument (a NULL element already becomes "
+                "an empty string)."
+            )
+
+
+def preprocess_array_calls(sql: str) -> str:
+    """Prepare the Snowflake array calls sqlglot cannot round-trip, before parsing.
+
+    ``ARRAY_FLATTEN(x, depth)`` is renamed, because sqlglot's ``ArrayFlatten`` node takes a
+    single argument and the emulator's legacy two-argument form would otherwise fail to parse
+    before any rewrite can run. Only the call's name is renamed, located by token position so
+    a literal that mentions it is untouched; the translator then rewrites the renamed call
+    (``_rewrite_array_flatten``). An ``ARRAY_TO_STRING`` call with more than the documented two
+    arguments is rejected here for the same reason: sqlglot drops the extra argument silently.
     """
     tokens = sqlglot.Dialect.get_or_raise(READ_DIALECT).tokenize(sql)
+    _reject_extra_array_to_string_arguments(tokens)
     spans = [
         (token.start, token.end)
         for index, token in enumerate(tokens[:-1])
@@ -77,7 +121,7 @@ def split_statements(sql: str) -> list[exp.Expression]:
     print (e.g. `VARCHAR[]` collapsing to a bare `ARRAY`).
     """
     try:
-        expressions = sqlglot.parse(preprocess_array_flatten(sql), read=READ_DIALECT)
+        expressions = sqlglot.parse(preprocess_array_calls(sql), read=READ_DIALECT)
     except Exception as exc:  # noqa: BLE001 - surfaced to the caller as a translation error
         raise TranslationError(f"Failed to parse SQL: {_parse_error_message(sql, exc)}") from exc
 

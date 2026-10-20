@@ -38,7 +38,7 @@ from snowflake_emulator.translator.functions import (
     user_function_sub_macro_name,
 )
 from snowflake_emulator.translator.parsing import (
-    preprocess_array_flatten,
+    preprocess_array_calls,
     split_statements,
 )
 from snowflake_emulator.translator.transforms import _apply_transforms

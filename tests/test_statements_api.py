@@ -381,6 +381,57 @@ def test_array_flatten_requires_a_literal_depth(client):
     assert "ARRAY_FLATTEN(array)" in resp.json()["detail"]["message"]
 
 
+def test_array_to_string_null_and_argument_shapes(client):
+    """``ARRAY_TO_STRING`` over a JSON array: NULL separator, NULL element, nested values.
+
+    Snowflake documents two arguments, a NULL element becoming an empty string, and NULL for a
+    NULL argument. sqlglot drops a third argument silently, so it is rejected before parsing;
+    DuckDB treats a NULL separator as an empty one, so the separator is checked the way
+    sqlglot's own rendering checks it.
+    """
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post("CREATE TABLE ats (j VARIANT)").status_code == 200
+    assert (
+        post(
+            'INSERT INTO ats SELECT PARSE_JSON(\'{"plain":["a","b"],'
+            '"withnull":["a",null,"b"],'
+            '"nested":[["x","y"],{"a":1}],"nums":[1,-1.2e-3]}\')'
+
+        ).status_code
+        == 200
+    )
+
+    assert data("SELECT ARRAY_TO_STRING(j:plain, ',') FROM ats") == [["a,b"]]
+    assert data("SELECT ARRAY_TO_STRING(j:withnull, ',') FROM ats") == [["a,,b"]]
+    assert data("SELECT ARRAY_TO_STRING(j:nested, ' ') FROM ats") == [[
+        '["x","y"] {"a":1}'
+    ]]
+    assert data("SELECT ARRAY_TO_STRING(j:nums, ', ') FROM ats") == [["1, -0.0012"]]
+
+    # A NULL argument returns NULL, as Snowflake documents (DuckDB would use an empty one).
+    assert data("SELECT ARRAY_TO_STRING(j:plain, NULL) FROM ats") == [[None]]
+    # A NULL element is an empty string, not a skipped one.
+    assert data("SELECT ARRAY_TO_STRING(j:withnull, '|') FROM ats") == [["a||b"]]
+    # A separator expression that contains a comma is still one argument.
+    assert data("SELECT ARRAY_TO_STRING(j:plain, IFF(1=1, ',', ';')) FROM ats") == [["a,b"]]
+
+    # A third argument is not Snowflake SQL; say so instead of dropping it.
+    for statement in (
+        "SELECT ARRAY_TO_STRING(j:withnull, ',', 'X') FROM ats",
+        "SELECT ARRAY_TO_STRING(j:withnull, ',', 'X', 'Y') FROM ats",
+    ):
+        resp = post(statement)
+        assert resp.status_code == 422, (statement, resp.json())
+        assert "ARRAY_TO_STRING takes an array and a separator" in resp.json()["detail"]["message"]
+
+
 def test_array_flatten_one_argument_form(client):
     """Snowflake's documented ``ARRAY_FLATTEN(array)``: one level, strict about elements.
 

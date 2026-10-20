@@ -207,6 +207,10 @@ and `TRANSFORM(j:nums, x -> x * 2)` does arithmetic on the element. `TO_JSON` re
 (JSON text) in Snowflake, so `x -> x = TO_JSON('a')` compares against `'"a"'` and matches
 nothing — use the plain literal.
 
+`ARRAY_TO_STRING(array, separator)` is the documented two-argument form: a NULL element becomes
+an empty string, a NULL separator returns NULL, and a third argument is rejected (sqlglot would
+drop it silently) rather than answered differently.
+
 Verified against Snowflake's documentation, and covered by
 `test_documented_array_semantics`: `ARRAY_INTERSECTION` and `ARRAY_EXCEPT` use multi-set
 ("bag") semantics rather than set semantics — a value keeps `min(N, M)` copies after an

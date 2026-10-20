@@ -657,22 +657,37 @@ def _rewrite_array_flatten(node: exp.Expression) -> exp.Expression:
 
 
 def _rewrite_array_to_string(node: exp.Expression) -> exp.Expression:
-    """sqlglot casts each element with ``CAST(x AS TEXT)``, keeping a JSON string's quotes."""
+    """``ARRAY_TO_STRING``: unquote JSON elements, and return NULL for a NULL separator.
+
+    sqlglot casts each element with ``CAST(x AS TEXT)``, which keeps a JSON string's quotes, so
+    a JSON array is rebuilt from ``e ->> '$'`` -- the value's text, which also renders a nested
+    array or object as its JSON text and a number as DuckDB formats it -- with a NULL element
+    coalesced to an empty string, as Snowflake documents. DuckDB treats a NULL separator as an
+    empty one where Snowflake returns NULL for a NULL argument, so the separator is checked the
+    way sqlglot's own rendering checks it.
+    """
     array = _array_list(_rewrite_json_array_functions(node.this))
     known = {"this", "expression", "null_is_empty", "null_delim_is_null"}
     if set(node.args) - known:
         return node
+    separator = _sql(node.args.get("expression"), chr(39) + ',' + chr(39))
     if _is_variant_array_value(array):
         # VARIANT elements are already the values themselves, so sqlglot's ``CAST(x AS
         # TEXT)`` rendering returns their text; only the array needs a list form.
         node.set("this", array)
+        rendered = f"ARRAY_TO_STRING({_sql(array)}, {separator})"
+    elif _is_json_array_value(array):
+        rendered = (
+            f"ARRAY_TO_STRING(LIST_TRANSFORM({_sql(_json_list(array))}, "
+            f"_sfemu_element -> COALESCE(_sfemu_element ->> '$', '')), {separator})"
+        )
+    else:
         return node
-    if not _is_json_array_value(array):
-        return node
+    # The separator is named twice, exactly as sqlglot's own rendering of this call does, so a
+    # NULL separator still returns NULL; a positional `?` separator is therefore unsupported
+    # for either path, while a literal, a column or a named bind works.
     return sqlglot.parse_one(
-        f"ARRAY_TO_STRING(LIST_TRANSFORM({_sql(_json_list(array))}, "
-        f"_sfemu_element -> COALESCE(_sfemu_element ->> '$', '')), "
-        f"{_sql(node.args.get('expression'), chr(39) + ',' + chr(39))})",
+        f"CASE WHEN {separator} IS NULL THEN NULL ELSE {rendered} END",
         read=WRITE_DIALECT,
     )
 

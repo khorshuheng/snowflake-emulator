@@ -14,7 +14,7 @@ from snowflake_emulator.translator.constants import (
     _SIMPLE_IDENTIFIER_RE,
 )
 from snowflake_emulator.translator.errors import TranslationError
-from snowflake_emulator.translator.parsing import preprocess_array_flatten
+from snowflake_emulator.translator.parsing import preprocess_array_calls
 from snowflake_emulator.translator.transforms import _apply_transforms
 from snowflake_emulator.type_mapping import duckdb_type_to_snowflake_sql_type
 
@@ -180,7 +180,7 @@ def translate_function_body(body: str) -> str:
     if not body.strip():
         raise TranslationError("CREATE FUNCTION requires a non-empty body.")
     try:
-        parsed = sqlglot.parse_one(preprocess_array_flatten(body), read=READ_DIALECT)
+        parsed = sqlglot.parse_one(preprocess_array_calls(body), read=READ_DIALECT)
     except Exception as exc:  # noqa: BLE001 - reported as a translation error
         raise TranslationError(
             f"Failed to parse the function body as SQL: {exc}"
