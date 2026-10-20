@@ -8,6 +8,7 @@ from typing import Any
 
 from sqlglot import exp
 
+from snowflake_emulator.catalog import column_type_resolver
 from snowflake_emulator.core.constants import INFORMATION_SCHEMA_SCHEMA
 from snowflake_emulator.core.errors import ExecutionError
 from snowflake_emulator.core.results import ColumnMeta, ExecutionResult
@@ -157,7 +158,9 @@ def _describe_sql(
     cursor = manager.cursor(session.token)
     cursor.execute(f'USE "{session.database}"."{session.schema}"')
     try:
-        duckdb_sql = transpile_to_duckdb(statement)
+        duckdb_sql = transpile_to_duckdb(
+            statement, column_types=column_type_resolver(cursor, session)
+        )
         cursor.execute(f"DESCRIBE {duckdb_sql}")
     except Exception:  # noqa: BLE001 - only described by running; fall back
         return None

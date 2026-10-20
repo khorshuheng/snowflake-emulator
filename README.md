@@ -183,6 +183,11 @@ Not translated, and left as a loud error rather than a guess:
   lexicographically. Write the array as an `ARRAY_CONSTRUCT` list instead. A `col:path`
   stays `JSON[]` and sorts lexicographically — right for strings, but wrong for numbers
   (`[10,2,33]` stays `[10,2,33]`);
+  a bare column is decided by its catalog type: a real list column (`CREATE TABLE t AS
+  SELECT ARRAY_CONSTRUCT(...) AS n` stores `VARCHAR[]`/`INTEGER[]`) orders correctly,
+  numbers included, and a `JSON` column sorts lexicographically like a `col:path`. Only a
+  VARIANT column — or one whose name the catalog cannot attribute to a single type — is
+  rejected;
 - a **mixed-type** comparison against a bare VARIANT column: DuckDB refuses to compare two
   VARIANT elements whose values have different types, so
   `ARRAY_INTERSECTION(nums, ARRAY_CONSTRUCT('2'))` raises `Can't compare values of type

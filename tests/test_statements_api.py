@@ -724,6 +724,63 @@ def test_array_ordering_over_a_variant_array_is_rejected(client):
     assert sorted_json.json()["data"] == [[['aa', 'ab', 'b']]]
 
 
+def test_array_ordering_over_a_native_list_column(client):
+    """A CTAS ``ARRAY_CONSTRUCT`` column is a real DuckDB list, so it orders natively.
+
+    The guard above has to reject a VARIANT-typed array without rejecting a bare column that
+    DuckDB already stores as ``VARCHAR[]``/``INTEGER[]``. The column type is resolved from the
+    catalog, so a native list keeps DuckDB's own order -- including the numeric order a JSON
+    or VARIANT array cannot give -- while a VARIANT column is still a loud error.
+    """
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert (
+        post(
+            "CREATE TABLE nlist AS SELECT ARRAY_CONSTRUCT('b','a') AS names, "
+            "ARRAY_CONSTRUCT(30,4,100) AS nums"
+        ).status_code
+        == 200
+    )
+    assert data("SELECT DISTINCT typeof(names), typeof(nums) FROM nlist") == [
+        ['VARCHAR[]', 'INTEGER[]']
+    ]
+
+    assert data("SELECT ARRAY_SORT(names) FROM nlist") == [[['a', 'b']]]
+    assert data("SELECT ARRAY_SORT(nlist.names) FROM nlist") == [[['a', 'b']]]
+    assert data("SELECT ARRAY_MAX(names) FROM nlist") == [['b']]
+    assert data("SELECT ARRAY_MIN(names) FROM nlist") == [['a']]
+    # Numeric order: a JSON/VARIANT array would sort these as text (100, 30, 4).
+    assert data("SELECT ARRAY_SORT(nums) FROM nlist") == [[[4, 30, 100]]]
+    assert data("SELECT ARRAY_MAX(nums) FROM nlist") == [[100]]
+
+    # The rest of the array family reads the same native column, encoded against its own
+    # element type rather than through a VARIANT round-trip.
+    assert data("SELECT ARRAY_CONTAINS('a', names) FROM nlist") == [[True]]
+    assert data("SELECT ARRAY_SIZE(names) FROM nlist") == [[2]]
+    assert data("SELECT ARRAY_POSITION('b', names) FROM nlist") == [[0]]
+    assert data("SELECT ARRAY_EXCEPT(names, ARRAY_CONSTRUCT('a')) FROM nlist") == [[['b']]]
+    assert data("SELECT ARRAY_INTERSECTION(nums, ARRAY_CONSTRUCT(4)) FROM nlist") == [[[4]]]
+
+    # A JSON-typed column keeps the JSON path's semantics.
+    assert post("CREATE TABLE jcol AS SELECT PARSE_JSON('[\"aa\",\"ab\"]') AS j").status_code == 200
+    assert data("SELECT ARRAY_SORT(j) FROM jcol") == [[['aa', 'ab']]]
+    assert data("SELECT ARRAY_SIZE(j) FROM jcol") == [[2]]
+
+    # A VARIANT column is still rejected, named or not.
+    assert post("CREATE TABLE vcol (v VARIANT)").status_code == 200
+    assert post("INSERT INTO vcol SELECT PARSE_JSON('[3,1,2]')").status_code == 200
+    for statement in ("SELECT ARRAY_SORT(v) FROM vcol", "SELECT ARRAY_MIN(vcol.v) FROM vcol"):
+        resp = post(statement)
+        assert resp.status_code == 422, (statement, resp.json())
+        assert "VARIANT" in resp.json()["detail"]["message"]
+
+
 def test_array_functions_over_staged_json(client, tmp_path):
     """The same fix covers a staged file's `$1:path` array."""
     json_path = tmp_path / "names.json"

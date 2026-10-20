@@ -11,6 +11,7 @@ from sqlglot import exp
 from snowflake_emulator import sqlglot_patch  # noqa: F401  (global parser settings)
 from snowflake_emulator.core.ast import drop_target_table  # re-exported for compatibility
 from snowflake_emulator.core.constants import INFORMATION_SCHEMA_SCHEMA
+from snowflake_emulator.translator.arrays import ColumnTypeResolver
 from snowflake_emulator.translator.ast_helpers import _quoted_identifier
 from snowflake_emulator.translator.constants import (
     EMULATED_SNOWFLAKE_VERSION,
@@ -402,17 +403,20 @@ def _reject_unsupported_ddl(statement: exp.Expression) -> None:
 def transpile_to_duckdb(
     statement: exp.Expression,
     user_functions: UserFunctionResolver | None = None,
+    column_types: ColumnTypeResolver | None = None,
 ) -> str:
     """Transpile a single parsed Snowflake statement into its DuckDB equivalent.
 
     `user_functions` resolves calls to user-defined functions (``CREATE FUNCTION``) to
     the DuckDB macro backing them; pass ``None`` when no functions can be in scope.
+    `column_types` resolves a bare column's DuckDB type, which an array rewrite needs to tell
+    a real DuckDB LIST from a VARIANT/JSON array; pass ``None`` when no catalog is in scope.
     """
     try:
         _reject_unsupported_function(statement)
         _reject_unsupported_ddl(statement)
         statement = _rewrite_clone(statement)
-        statement = _apply_transforms(statement)
+        statement = _apply_transforms(statement, column_types)
         if user_functions is not None:
             statement = _rewrite_user_function_calls(statement, user_functions)
 

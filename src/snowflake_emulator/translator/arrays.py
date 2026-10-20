@@ -2,11 +2,23 @@
 
 from __future__ import annotations
 
+from contextvars import ContextVar
+from typing import Callable
+
 import sqlglot
 from sqlglot import exp
 
 from snowflake_emulator.translator.constants import WRITE_DIALECT, _FLATTEN_MARKER
 from snowflake_emulator.translator.errors import TranslationError
+
+# ``(table_name_or_None, column_name) -> DuckDB type name``, supplied by the caller that has a
+# catalog (see ``snowflake_emulator.catalog``). A bare column has no type in the AST, and an
+# array function needs one to tell a real DuckDB LIST from a VARIANT/JSON array.
+ColumnTypeResolver = Callable[[str | None, str], str | None]
+
+_column_types: ContextVar[ColumnTypeResolver | None] = ContextVar(
+    "_column_types", default=None
+)
 
 # Each level of ARRAY_FLATTEN is a separate DuckDB call, so a deep flatten is bounded.
 _ARRAY_FLATTEN_MAX_DEPTH = 10
@@ -129,16 +141,42 @@ def _json_list(node: exp.Expression | None) -> exp.Expression | None:
     return exp.cast(node, exp.DataType.build("JSON[]"), dialect=WRITE_DIALECT)
 
 
+def _declared_column_type(node: exp.Expression | None) -> str | None:
+    """The DuckDB type of a bare column, when the caller supplied a catalog lookup."""
+    resolver = _column_types.get()
+    if resolver is None or not isinstance(node, exp.Column):
+        return None
+    return resolver(node.table or None, node.name)
+
+
+def _is_list_type(declared: str) -> bool:
+    """True for a DuckDB type that is already a LIST, e.g. ``VARCHAR[]`` or ``LIST(INTEGER)``."""
+    return declared.strip().upper().endswith("[]") or declared.upper().startswith("LIST(")
+
+
+def _is_variant_list_type(declared: str) -> bool:
+    """True for a DuckDB type whose elements are VARIANT, which DuckDB mis-orders."""
+    return declared.strip().upper().startswith("VARIANT")
+
+
+def _is_json_list_type(declared: str) -> bool:
+    """True for a DuckDB type whose elements are JSON (a ``col:path`` column, or ``JSON[]``)."""
+    return declared.strip().upper().startswith("JSON")
+
+
 def _array_list(node: exp.Expression | None) -> exp.Expression | None:
     """Present a Snowflake array to DuckDB as a LIST.
 
     A JSON array becomes ``JSON[]`` and a VARIANT array becomes ``VARIANT[]``: both are
     real DuckDB lists, so they bind the list functions, and their elements compare as
     VARIANT values the way Snowflake compares them. An operand whose type is only known at
-    run time -- a bare column -- is cast through VARIANT to ``VARIANT[]``: Snowflake keeps
-    an ARRAY as DuckDB JSON and a VARIANT as VARIANT, and a native list reaches it too. An
-    operand already in one of those list forms, a native DuckDB list, or a call whose
-    result is already a list, is left alone.
+    run time -- a bare column -- is resolved from the catalog when the caller supplied one:
+    a real DuckDB list keeps its own element type (so a CTAS native-list column orders and
+    compares natively), a JSON column is cast to ``JSON[]``, and a VARIANT one is cast
+    through VARIANT to ``VARIANT[]``. With no catalog (or no match) the blind VARIANT
+    round-trip is kept, which is how a bare VARIANT column -- the usual case -- reaches a
+    list. An operand already in one of those list forms, a native DuckDB list, or a call
+    whose result is already a list, is left alone.
     """
     if node is None or _is_json_list(node) or _is_variant_list(node):
         return node
@@ -146,6 +184,14 @@ def _array_list(node: exp.Expression | None) -> exp.Expression | None:
         return _json_list(node)
     if isinstance(node, exp.Array):
         return node
+    declared = _declared_column_type(node)
+    if declared is not None:
+        if _is_json_list_type(declared):
+            return exp.cast(
+                node, exp.DataType.build("JSON[]"), dialect=WRITE_DIALECT
+            )
+        if _is_list_type(declared) and not _is_variant_list_type(declared):
+            return node
     variant = exp.DataType.build("VARIANT", dialect=WRITE_DIALECT)
     if _is_variant_value(node):
         return exp.cast(node, exp.DataType.build("VARIANT[]"), dialect=WRITE_DIALECT)
@@ -215,12 +261,25 @@ def _rewrite_ordering_function(node: exp.Expression) -> exp.Expression:
     -- and DuckDB raises or crashes outright for a bare VARIANT. A JSON array (``col:path``,
     ``PARSE_JSON('[...]')``) sorts lexicographically -- right for strings, wrong for numbers,
     which come back in text order (``[10,2,33]`` stays ``[10,2,33]``) -- and a native list
-    keeps DuckDB's own order, so only a VARIANT or run-time-typed operand is rejected.
+    keeps DuckDB's own order. A bare column is decided by its declared type when the caller
+    supplied a catalog: a real DuckDB list column is left alone, a JSON one is cast, and only
+    a VARIANT-typed (or unresolvable) one -- which DuckDB mis-orders -- is rejected.
     """
     array = _rewrite_json_array_functions(node.this)
     if _is_json_array_value(array):
         node.set("this", _json_list(array))
         return node
+    declared = _declared_column_type(array)
+    if declared is not None:
+        if _is_json_list_type(declared):
+            # A JSON column sorts lexicographically, like a ``col:path`` operand.
+            node.set("this", exp.cast(array, exp.DataType.build("JSON[]"), dialect=WRITE_DIALECT))
+            return node
+        if _is_list_type(declared) and not _is_variant_list_type(declared):
+            # A real DuckDB list -- typically a CTAS ``ARRAY_CONSTRUCT`` column -- keeps its
+            # own element type, so DuckDB's order is the one Snowflake gives as well.
+            node.set("this", array)
+            return node
     if (
         isinstance(array, (exp.Column, exp.Placeholder, exp.Parameter))
         or _is_variant_array_value(array)
@@ -689,7 +748,9 @@ def _rewrite_json_array_function(node: exp.Expression) -> exp.Expression:
     return node
 
 
-def _rewrite_json_array_functions(statement: exp.Expression) -> exp.Expression:
+def _rewrite_json_array_functions(
+    statement: exp.Expression, column_types: ColumnTypeResolver | None = None
+) -> exp.Expression:
     """Apply ``_rewrite_json_array_function`` to every array call in `statement`.
 
     A separate pass over a snapshot, because ``transform`` visits a parent before its
@@ -697,6 +758,11 @@ def _rewrite_json_array_functions(statement: exp.Expression) -> exp.Expression:
     been rewritten first, so an operand that is itself a rewritten call is handled
     recursively (``_rewrite_json_array_function``). A node detached by an ancestor's
     replacement is skipped.
+
+    `column_types` answers a bare column's DuckDB type for the call sites that turn on one --
+    ``ARRAY_SORT``/``ARRAY_MAX``/``ARRAY_MIN`` and the list form an operand is cast to. It is
+    published for the duration of the pass (the rewrites are otherwise pure AST transforms)
+    and restored afterwards, so a nested call from a rebuild reuses the same resolver.
     """
     # Snowflake documents SLICE as an alias of ARRAY_SLICE, but sqlglot leaves it as an
     # uninterpreted call that DuckDB rejects. Nested calls are converted by the loop too:
@@ -707,17 +773,21 @@ def _rewrite_json_array_functions(statement: exp.Expression) -> exp.Expression:
             alias.replace(exp.ArraySlice(this=array, start=start, end=end, zero_based=True))
 
     root = statement
-    for node in list(statement.find_all(*_JSON_ARRAY_FUNCTIONS, exp.Anonymous)):
-        if node.parent is None and node is not root:
-            continue  # already replaced as part of an enclosing call
-        replacement = _rewrite_json_array_function(node)
-        if replacement is node:
-            continue
-        if node is not root:
-            node.replace(replacement)
-        elif root.parent is not None:
-            node.replace(replacement)  # keep the enclosing node's operand consistent
-            root = replacement
-        else:
-            root = replacement
+    token = _column_types.set(column_types)
+    try:
+        for node in list(statement.find_all(*_JSON_ARRAY_FUNCTIONS, exp.Anonymous)):
+            if node.parent is None and node is not root:
+                continue  # already replaced as part of an enclosing call
+            replacement = _rewrite_json_array_function(node)
+            if replacement is node:
+                continue
+            if node is not root:
+                node.replace(replacement)
+            elif root.parent is not None:
+                node.replace(replacement)  # keep the enclosing node's operand consistent
+                root = replacement
+            else:
+                root = replacement
+    finally:
+        _column_types.reset(token)
     return root

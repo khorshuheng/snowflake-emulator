@@ -16,6 +16,7 @@ from snowflake_emulator.core.results import (
     ExecutionResult,
     FileTransfer,  # re-exported for compatibility
 )
+from snowflake_emulator.catalog import column_type_resolver
 from snowflake_emulator.database import DuckDBManager
 from snowflake_emulator.engine.errors import as_execution_error
 from snowflake_emulator.engine.handlers.common import convert_describe_types
@@ -297,7 +298,11 @@ def _execute_sql(
                 raise ExecutionError(str(exc)) from exc
 
         try:
-            duckdb_sql = transpile_to_duckdb(statement, user_functions)
+            duckdb_sql = transpile_to_duckdb(
+                statement,
+                user_functions,
+                column_types=column_type_resolver(cursor, session),
+            )
         except TranslationError as exc:
             raise as_execution_error(exc) from exc
 
