@@ -245,6 +245,32 @@ def _encoded_element(
     return value
 
 
+def _is_variant_typed(node: exp.Expression | None) -> bool:
+    """True when `node` evaluates to a VARIANT value: a VARIANT column, cast or array."""
+    if node is None:
+        return False
+    if _is_variant_value(node) or _is_variant_array_value(node):
+        return True
+    declared = _declared_column_type(node)
+    return declared is not None and _is_variant_list_type(declared)
+
+
+def _aggregates_to_variant_list(node: exp.Expression) -> bool:
+    """True when `node` is an aggregate that builds a list of VARIANT elements.
+
+    ``ARRAY_AGG`` assembles the list at run time, so it carries no ``VARIANT[]`` cast for
+    ``_has_variant_list`` to find -- and an ordering call over an aggregate of a VARIANT column
+    therefore slipped through the guard, where DuckDB orders by length. A JSON or native
+    argument is still allowed: those lists order the way Snowflake orders them.
+    """
+    if not isinstance(node, exp.ArrayAgg):
+        return False
+    argument = node.this
+    if isinstance(argument, exp.Distinct):
+        argument = argument.this
+    return _is_variant_typed(argument)
+
+
 def _has_variant_list(node: exp.Expression) -> bool:
     """True when `node` holds a ``VARIANT[]`` cast -- the array functions' mark for one."""
     return _is_variant_list(node) or any(
@@ -284,6 +310,7 @@ def _rewrite_ordering_function(node: exp.Expression) -> exp.Expression:
         isinstance(array, (exp.Column, exp.Placeholder, exp.Parameter))
         or _is_variant_array_value(array)
         or _has_variant_list(array)
+        or _aggregates_to_variant_list(array)
     ):
         name = type(node).__name__
         name = {

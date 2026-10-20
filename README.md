@@ -177,7 +177,7 @@ column, a `col:path` or JSON.
 Not translated, and left as a loud error rather than a guess:
 
 - **ordering a VARIANT array** (`ARRAY_SORT`, `ARRAY_MAX`, `ARRAY_MIN` over `v`,
-  `v::VARIANT`, or `PARSE_JSON('[...]')::VARIANT`): DuckDB's `list_sort`/`list_max`/
+  `v::VARIANT`, `PARSE_JSON('[...]')::VARIANT`, or `ARRAY_AGG(v)` of a VARIANT column): DuckDB's `list_sort`/`list_max`/
   `list_min` do not order `VARIANT[]` the way their own `<` operator does — for strings it
   goes by length, so `['aa','ab','b']` comes back `['b','aa','ab']` where Snowflake sorts it
   lexicographically. Write the array as an `ARRAY_CONSTRUCT` list instead. A `col:path`

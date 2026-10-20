@@ -929,6 +929,33 @@ def test_array_ordering_over_a_variant_array_is_rejected(client):
         assert resp.status_code == 422, (statement, resp.json())
         assert "VARIANT" in resp.json()["detail"]["message"]
 
+    # An aggregate of a VARIANT column builds its list at run time, so it carries no VARIANT[]
+    # cast for the guard to find; it is rejected the same way, which DuckDB would otherwise
+    # order by length (['b','aa','ab'] staying ['b','aa','ab']).
+    assert post("CREATE TABLE aggs (g INT, names VARIANT, n INTEGER)").status_code == 200
+    assert (
+        post(
+            "INSERT INTO aggs VALUES (1, PARSE_JSON('\"b\"'), 30), "
+            "(1, PARSE_JSON('\"aa\"'), 4), (1, PARSE_JSON('\"ab\"'), 100)"
+        ).status_code
+        == 200
+    )
+    for statement in (
+        "SELECT ARRAY_SORT(ARRAY_AGG(names)) FROM aggs GROUP BY g",
+        "SELECT ARRAY_MAX(ARRAY_AGG(names)) FROM aggs GROUP BY g",
+        "SELECT ARRAY_MIN(ARRAY_AGG(names)) FROM aggs GROUP BY g",
+    ):
+        resp = post(statement)
+        assert resp.status_code == 422, (statement, resp.json())
+        assert "VARIANT" in resp.json()["detail"]["message"]
+    # An aggregate of a native column, or of a VARIANT cast to VARCHAR, still orders.
+    assert post("SELECT ARRAY_SORT(ARRAY_AGG(n)) FROM aggs GROUP BY g").json()["data"] == [
+        [[4, 30, 100]]
+    ]
+    assert post(
+        "SELECT ARRAY_SORT(ARRAY_AGG(CAST(names AS VARCHAR))) FROM aggs GROUP BY g"
+    ).json()["data"] == [[['aa', 'ab', 'b']]]
+
     # The JSON path (stored as JSON[], which DuckDB sorts lexicographically) still works.
     sorted_json = post("SELECT ARRAY_SORT(j:names) FROM ord")
     assert sorted_json.status_code == 200, sorted_json.json()
