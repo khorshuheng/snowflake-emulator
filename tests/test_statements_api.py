@@ -337,9 +337,13 @@ def test_other_array_functions_over_variant_arrays(client):
         ("SELECT ARRAY_INSERT(j:n, 0, 'z') FROM arr_t", [[['z', 'a', 'b', 'a']]]),
         ("SELECT ARRAY_AGG(j:n) FROM arr_t", [[[['a', 'b', 'a']]]]),
         ("SELECT ARRAY_SIZE(ARRAY_CAT(j:n, j:n)) FROM arr_t", [[6]]),
-        # A lambda compares against a VARIANT element, so the literal is encoded.
-        ("SELECT FILTER(j:n, x -> x = TO_JSON('a')) FROM arr_t", [[['a', 'a']]]),
+        # A lambda over a semi-structured array receives a VARIANT element, so a plain literal
+        # compares the way Snowflake compares it. ``TO_JSON`` returns VARCHAR (JSON text), so
+        # comparing against ``TO_JSON('a')`` is comparing against '"a"' and matches nothing.
+        ("SELECT FILTER(j:n, x -> x = 'a') FROM arr_t", [[['a', 'a']]]),
+        ("SELECT FILTER(j:n, x -> x = TO_JSON('a')) FROM arr_t", [[[]]]),
         ("SELECT ARRAY_SIZE(TRANSFORM(j:n, x -> TO_VARCHAR(x))) FROM arr_t", [[3]]),
+        ("SELECT FILTER(j:nums, x -> x > 1) FROM arr_t", [[[3, 2]]]),
         (
             "SELECT REDUCE(j:nums, 0, (acc, x) -> CAST(acc AS INT) + CAST(x AS INT)) "
             "FROM arr_t",
@@ -532,6 +536,57 @@ def test_array_functions_over_a_bare_variant_array(client):
         resp = post(statement)
         assert resp.status_code == 200, (statement, resp.json())
         assert resp.json()["data"] == expected, statement
+
+
+def test_lambda_bodies_over_a_json_array(client):
+    """A lambda over a semi-structured array receives a VARIANT element, as in Snowflake.
+
+    The array is presented as ``VARIANT[]`` so a body may compare the element with a plain
+    literal (``x -> x = 'a'``) or do arithmetic on it, which DuckDB coerces the way Snowflake
+    does. A ``JSON`` element would instead try to parse the literal as JSON and raise
+    ``Malformed JSON at byte 0``. A native list keeps its own element type.
+    """
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post("CREATE TABLE lam (j VARIANT)").status_code == 200
+    assert (
+        post(
+            "INSERT INTO lam SELECT PARSE_JSON('{\"n\":[\"a\",\"b\",\"a\"],"
+            "\"nums\":[3,1,2]}')"
+        ).status_code
+        == 200
+    )
+    assert post("CREATE TABLE lam_bare (names VARIANT)").status_code == 200
+    assert (
+        post("INSERT INTO lam_bare SELECT PARSE_JSON('[\"ada\",\"bob\"]')").status_code
+        == 200
+    )
+
+    # A string literal compares against the element without an encoding helper.
+    assert data("SELECT FILTER(j:n, x -> x = 'a') FROM lam") == [[['a', 'a']]]
+    assert data("SELECT FILTER(j:n, x -> x IN ('a')) FROM lam") == [[['a', 'a']]]
+    assert data("SELECT ARRAY_SIZE(FILTER(j:n, x -> x = 'a')) FROM lam") == [[2]]
+    assert data("SELECT FILTER(names, x -> x = 'ada') FROM lam_bare") == [[['ada']]]
+
+    # A number compares and computes the same way, and a nested lambda sees VARIANT[] again.
+    assert data("SELECT FILTER(j:nums, x -> x > 1) FROM lam") == [[[3, 2]]]
+    assert data("SELECT FILTER(j:nums, x -> x = 2) FROM lam") == [[[2]]]
+    assert data("SELECT TRANSFORM(j:nums, x -> x * 2) FROM lam") == [[[6, 2, 4]]]
+    assert data("SELECT FILTER(FILTER(j:n, x -> x = 'a'), y -> y = 'a') FROM lam") == [
+        [['a', 'a']]
+    ]
+    assert data("SELECT REDUCE(j:nums, 0, (acc, x) -> acc + CAST(x AS INT)) FROM lam") == [[6]]
+
+    # A native list keeps its own element type.
+    assert data("SELECT FILTER(ARRAY_CONSTRUCT('a','b'), x -> x = 'a')") == [[['a']]]
+    assert data("SELECT TRANSFORM(ARRAY_CONSTRUCT(1,2), x -> x + 1)") == [[[2, 3]]]
+    assert data("SELECT REDUCE(ARRAY_CONSTRUCT(1,2,3), 0, (a, x) -> a + x)") == [[6]]
 
 
 def test_documented_array_semantics(client):

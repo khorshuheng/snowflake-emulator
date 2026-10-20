@@ -660,6 +660,24 @@ def _coerce_array_operands(node: exp.Expression) -> exp.Expression:
     return node
 
 
+def _rewrite_lambda_call(node: exp.Expression) -> exp.Expression:
+    """``FILTER``/``TRANSFORM``/``REDUCE``: hand the lambda VARIANT elements, as Snowflake does.
+
+    A Snowflake lambda over a semi-structured array receives a VARIANT element, so a body may
+    compare it with a plain literal (``FILTER(j:n, x -> x = 'a')``) and Snowflake coerces the
+    literal. A DuckDB ``JSON[]`` element is JSON instead, and comparing it with a ``VARCHAR``
+    tries to parse the text as JSON, so the call raised ``Malformed JSON at byte 0``. Presenting
+    the array as ``VARIANT[]`` of normalized elements makes DuckDB coerce the literal the way
+    Snowflake does. A native list keeps its own element type, which is what Snowflake gives a
+    structured-array lambda too.
+    """
+    array = _array_list(_rewrite_json_array_functions(node.this))
+    if _is_json_array_value(array):
+        array = _encoded_array_elements(array, "variant")
+    node.set("this", array)
+    return node
+
+
 def _cast_array_operands(node: exp.Expression) -> exp.Expression:
     """Cast the array operand(s) of a call sqlglot otherwise renders faithfully.
 
@@ -669,6 +687,8 @@ def _cast_array_operands(node: exp.Expression) -> exp.Expression:
     also has its operands coerced onto one element kind, so a native list can be combined with
     a JSON or VARIANT one.
     """
+    if isinstance(node, (exp.ArrayFilter, exp.Transform, exp.Reduce)):
+        return _rewrite_lambda_call(node)
     if isinstance(node, (exp.ArrayConcat, exp.ArrayIntersect)):
         return _coerce_array_operands(node)
     if isinstance(node, exp.ArrayAgg):

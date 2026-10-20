@@ -195,9 +195,13 @@ Not translated, and left as a loud error rather than a guess:
   path (`j:path`, compared as `JSON[]`) when the two sides can hold different types;
 - an `ARRAY_SLICE` index given as a `?` bind — the 0-based adjustment has to name the index
   twice, so it would consume two values; a literal, a column or a JSON value all work;
-- a lambda *body* that compares or extracts without encoding (`FILTER(j:n, x -> x = 'a')`):
-  the element is a VARIANT, so compare against `TO_JSON('a')` or cast with `TO_VARCHAR(x)`;
 - `ARRAY_FLATTEN`, which needs a constant depth between 1 and 10.
+
+A `FILTER`/`TRANSFORM`/`REDUCE` lambda over a JSON or VARIANT array receives a VARIANT
+element, as in Snowflake, so `FILTER(j:n, x -> x = 'a')` filters without an encoding helper
+and `TRANSFORM(j:nums, x -> x * 2)` does arithmetic on the element. `TO_JSON` returns VARCHAR
+(JSON text) in Snowflake, so `x -> x = TO_JSON('a')` compares against `'"a"'` and matches
+nothing — use the plain literal.
 
 Verified against Snowflake's documentation, and covered by
 `test_documented_array_semantics`: `ARRAY_INTERSECTION` and `ARRAY_EXCEPT` use multi-set
