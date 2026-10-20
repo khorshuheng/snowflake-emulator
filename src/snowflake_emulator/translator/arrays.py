@@ -320,7 +320,10 @@ def _duckdb_slice_bound(bound: exp.Expression) -> exp.Expression:
     Snowflake's bounds are 0-based and inclusive, DuckDB's are 1-based and inclusive, and
     both count a negative bound from the end -- so only a non-negative bound moves, by one.
     DuckDB clamps an out-of-range bound and returns an empty list when the start is past
-    the end, which is what Snowflake does too.
+    the end, which is what Snowflake does too. A bound is named at least twice by the
+    adjustment, which is fine for a literal, a column or a named bind, but not for a
+    positional ``?`` -- only one value is sent per placeholder -- so that case goes through a
+    one-element list whose lambda parameter is what gets repeated.
     """
     if _is_json_value(bound) or _is_variant_value(bound):
         # Snowflake casts a boundary to an integer for us; DuckDB will not add a JSON value.
@@ -333,11 +336,13 @@ def _duckdb_slice_bound(bound: exp.Expression) -> exp.Expression:
         else:
             return exp.Literal.number(value + 1 if value >= 0 else value)
     if isinstance(bound, exp.Placeholder) and bound.this is None:
-        # The sign adjustment has to name the bound twice, so a positional `?` would need
-        # two values for one placeholder. Say so instead of failing on a parameter count.
-        raise TranslationError(
-            "ARRAY_SLICE with a '?' index is not supported by the emulator; pass a literal "
-            "or a column."
+        # A positional `?` may only appear once in the statement, and the adjustment names the
+        # bound twice, so the value is named through a one-element list: the placeholder is
+        # written once and the lambda parameter carries the repeated uses.
+        return sqlglot.parse_one(
+            f"LIST_TRANSFORM([{_sql(bound)}], _sfemu_bound -> "
+            f"_sfemu_bound + CAST(_sfemu_bound >= 0 AS INTEGER))[1]",
+            read=WRITE_DIALECT,
         )
     # A bound only known at run time needs the same adjustment. This names the bound twice,
     # which a bound column tolerates (sqlglot's own rendering of a start bound names it

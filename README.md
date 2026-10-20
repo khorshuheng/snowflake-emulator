@@ -193,8 +193,10 @@ Not translated, and left as a loud error rather than a guess:
   `ARRAY_INTERSECTION(nums, ARRAY_CONSTRUCT('2'))` raises `Can't compare values of type
   VARCHAR (2) and type UBIGINT (3)` when `nums` holds numbers. Read the array through a JSON
   path (`j:path`, compared as `JSON[]`) when the two sides can hold different types;
-- an `ARRAY_SLICE` index given as a `?` bind — the 0-based adjustment has to name the index
-  twice, so it would consume two values; a literal, a column or a JSON value all work;
+- a **bound array operand**: a positional `?` that holds the array (or the searched value) is
+  named in more than one sub-expression by the rebuilt call, so it would need several values;
+  bind it as a named parameter (`:arr`) or pass a column. An index bind is fine
+  (`ARRAY_SLICE(arr, ?, ?)` names each index once);
 - `ARRAY_FLATTEN`, which needs a constant depth between 1 and 10.
 
 A `FILTER`/`TRANSFORM`/`REDUCE` lambda over a JSON or VARIANT array receives a VARIANT

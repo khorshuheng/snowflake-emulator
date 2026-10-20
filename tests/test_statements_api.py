@@ -215,8 +215,8 @@ def test_array_slice_over_variant_arrays(client):
         assert resp.json()["data"] == expected, statement
 
 
-def test_array_slice_rejects_a_bound_index(client):
-    """A `?` index cannot work (the sign adjustment names it twice); say so clearly."""
+def test_array_slice_accepts_a_bound_index(client):
+    """A `?` index is adjusted through a one-element list, so it consumes a single value."""
     resp = client.post(
         "/api/v2/statements",
         json={
@@ -224,8 +224,8 @@ def test_array_slice_rejects_a_bound_index(client):
             "bindings": {"1": {"type": "FIXED", "value": "1"}},
         },
     )
-    assert resp.status_code == 422
-    assert "ARRAY_SLICE with a '?' index" in resp.json()["detail"]["message"]
+    assert resp.status_code == 200, resp.json()
+    assert resp.json()["data"] == [[["b", "c"]]]
 
 
 def test_slice_alias_matches_array_slice(client, tmp_path):
@@ -536,6 +536,57 @@ def test_array_functions_over_a_bare_variant_array(client):
         resp = post(statement)
         assert resp.status_code == 200, (statement, resp.json())
         assert resp.json()["data"] == expected, statement
+
+
+def test_array_slice_accepts_a_bound_index(client):
+    """A ``?``/``:name`` slice index works: the value is named once and adjusted through it.
+
+    The 0-based to 1-based adjustment has to name the bound twice, which a positional ``?``
+    cannot do (one value per placeholder), so the bound is written once inside a one-element
+    list and the repeated reference is the lambda parameter.
+    """
+    def post(statement, bindings=None):
+        body = {"statement": statement}
+        if bindings:
+            body["bindings"] = bindings
+        return client.post("/api/v2/statements", json=body)
+
+    def data(statement, bindings=None):
+        resp = post(statement, bindings)
+        assert resp.status_code == 200, (statement, bindings, resp.json())
+        return resp.json()["data"]
+
+    def fixed(value):
+        return {"type": "FIXED", "value": str(value)}
+
+    assert post("CREATE TABLE sl (arr VARIANT)").status_code == 200
+    assert post("INSERT INTO sl SELECT PARSE_JSON('[10,20,30,40]')").status_code == 200
+
+    # Both bounds positional, over a native list and over a JSON path alike.
+    assert data(
+        "SELECT ARRAY_SLICE(ARRAY_CONSTRUCT(1,2,3), ?, ?)", {"1": fixed(0), "2": fixed(1)}
+    ) == [[[1, 2]]]
+    assert data(
+        "SELECT ARRAY_SLICE(ARRAY_CONSTRUCT(1,2,3), ?, ?)", {"1": fixed(-2), "2": fixed(-1)}
+    ) == [[[2, 3]]]
+    assert data(
+        "SELECT ARRAY_SLICE(arr, ?, ?) FROM sl", {"1": fixed(1), "2": fixed(2)}
+    ) == [[[20, 30]]]
+    assert data("SELECT ARRAY_SLICE(j, ?, ?) FROM (SELECT PARSE_JSON('[1,2,3]') AS j)", {
+        "1": fixed(0),
+        "2": fixed(0),
+    }) == [[[1]]]
+
+    # A literal on one side and a bind on the other.
+    assert data("SELECT ARRAY_SLICE(arr, ?, 2) FROM sl", {"1": fixed(1)}) == [[[20, 30]]]
+    assert data("SELECT ARRAY_SLICE(arr, 0, ?) FROM sl", {"1": fixed(1)}) == [[[10, 20]]]
+
+    # A named bind repeats safely, and a literal out-of-range bound still clamps.
+    assert data(
+        "SELECT ARRAY_SLICE(ARRAY_CONSTRUCT(1,2,3), :lo, :hi)",
+        {"lo": fixed(1), "hi": fixed(2)},
+    ) == [[[2, 3]]]
+    assert data("SELECT ARRAY_SLICE(ARRAY_CONSTRUCT(1,2,3), 5, 9)") == [[[]]]
 
 
 def test_lambda_bodies_over_a_json_array(client):
