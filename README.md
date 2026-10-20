@@ -166,6 +166,10 @@ Snowflake's array functions work over a native array, one the emulator stores as
 is cast to DuckDB's `JSON[]`, a VARIANT array to `VARIANT[]`, and a searched value is
 encoded as a VARIANT so both sides compare the way Snowflake compares them (the string
 `'1'` is not the number `1`).
+A pair that mixes the two (`ARRAY_EXCEPT(j:n, ARRAY_CONSTRUCT('a'))`,
+`ARRAY_CAT(nums, ARRAY_CONSTRUCT(4))`) is coerced element-wise onto one kind, as Snowflake
+coerces the two arrays, so a native `ARRAY_CONSTRUCT` list combines with a JSON or VARIANT
+one.
 `WHERE ARRAY_CONTAINS('admin', payload:tags)` therefore filters VARIANT rows and staged
 records alike, and `LATERAL FLATTEN(input => ...)` / `TABLE(FLATTEN(...))` read a VARIANT
 column, a `col:path` or JSON.
@@ -179,9 +183,11 @@ Not translated, and left as a loud error rather than a guess:
   lexicographically. Write the array as an `ARRAY_CONSTRUCT` list instead. A `col:path`
   stays `JSON[]` and sorts lexicographically — right for strings, but wrong for numbers
   (`[10,2,33]` stays `[10,2,33]`);
-- a **mixed pair** where one operand is a JSON/VARIANT array and the other a native list
-  (`ARRAY_EXCEPT(j:n, ARRAY_CONSTRUCT('a'))`, `ARRAYS_OVERLAP(v, ARRAY_CONSTRUCT(2))`):
-  DuckDB has no common element type for them, so the comparison would be silently unequal;
+- a **mixed-type** comparison against a bare VARIANT column: DuckDB refuses to compare two
+  VARIANT elements whose values have different types, so
+  `ARRAY_INTERSECTION(nums, ARRAY_CONSTRUCT('2'))` raises `Can't compare values of type
+  VARCHAR (2) and type UBIGINT (3)` when `nums` holds numbers. Read the array through a JSON
+  path (`j:path`, compared as `JSON[]`) when the two sides can hold different types;
 - an `ARRAY_SLICE` index given as a `?` bind — the 0-based adjustment has to name the index
   twice, so it would consume two values; a literal, a column or a JSON value all work;
 - a lambda *body* that compares or extracts without encoding (`FILTER(j:n, x -> x = 'a')`):

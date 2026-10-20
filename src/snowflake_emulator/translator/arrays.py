@@ -381,6 +381,51 @@ def _list_kind(node: exp.Expression | None) -> str:
     return "native"
 
 
+def _encoded_array_elements(node: exp.Expression, kind: str) -> exp.Expression:
+    """Present a list's elements as `kind`'s list holds them, element by element.
+
+    A native list holds plain values, a ``JSON[]`` holds JSON values and a ``VARIANT[]``
+    holds VARIANT values, and DuckDB does not unify them: joining a ``VARCHAR[]`` against a
+    ``JSON[]`` casts the text to JSON first, so ``ARRAY_CAT(j:n, ARRAY_CONSTRUCT('z'))``
+    raised ``Malformed JSON at byte 0`` instead of appending ``z``. Snowflake coerces the two
+    arrays, so one side is re-encoded element-wise here -- ``TO_JSON`` lands a native value
+    on the representation a JSON array holds (and leaves a JSON or VARIANT element as its JSON
+    form), while ``_variant_element`` lands it on a normalized VARIANT.
+    """
+    if kind == "json":
+        return sqlglot.parse_one(
+            f"LIST_TRANSFORM({_sql(node)}, _sfemu_element -> "
+            f"TO_JSON(_sfemu_element))",
+            read=WRITE_DIALECT,
+        )
+    element = _variant_element(exp.column("_sfemu_element"))
+    return sqlglot.parse_one(
+        f"CAST(LIST_TRANSFORM({_sql(node)}, _sfemu_element -> {_sql(element)}) "
+        f"AS VARIANT[])",
+        read=WRITE_DIALECT,
+    )
+
+
+def _coerced_array_pair(
+    left: exp.Expression | None, right: exp.Expression | None
+) -> tuple[exp.Expression | None, exp.Expression | None]:
+    """Force two array operands onto one element kind so DuckDB can compare them.
+
+    A pair of the same kind is left alone -- including two native lists, which keep
+    sqlglot's own rendering. A JSON kind wins over a VARIANT one, so a pair that mixes them
+    lands on JSON; a native list follows whichever kind the other side has.
+    """
+    left_kind, right_kind = _list_kind(left), _list_kind(right)
+    if left_kind == right_kind:
+        return left, right
+    target = "json" if "json" in (left_kind, right_kind) else "variant"
+    if left_kind != target and left is not None:
+        left = _encoded_array_elements(left, target)
+    if right_kind != target and right is not None:
+        right = _encoded_array_elements(right, target)
+    return left, right
+
+
 def _multiset_except_sql(left: str, right: str) -> str:
     """``ARRAY_EXCEPT`` as Snowflake's multiset subtract: a value keeps ``N - M`` copies.
 
@@ -422,21 +467,16 @@ def _rewrite_array_set_operation(node: exp.Expression) -> exp.Expression:
     A native pair keeps sqlglot's rendering (and with it the multiset semantics it models);
     a JSON or VARIANT pair is rebuilt, where DuckDB has no equivalent for the ``&&`` operator
     or the zip-based except -- ``_multiset_except_sql`` reproduces the multiset subtract. A
-    *mixed* pair -- one JSON/VARIANT operand and one native list -- has no common element
-    type (DuckDB compares a JSON or VARIANT element against an ``INT`` or ``VARCHAR`` element
-    as unequal), so it is rejected rather than answered wrong.
+    *mixed* pair -- one JSON/VARIANT operand and one native list -- is coerced element-wise
+    onto one kind first (see ``_coerced_array_pair``), because DuckDB compares a JSON or
+    VARIANT element against an ``INT`` or ``VARCHAR`` element as unequal.
     """
     left = _array_list(_rewrite_json_array_functions(node.this))
     right = _array_list(_rewrite_json_array_functions(node.args.get("expression")))
     left_kind, right_kind = _list_kind(left), _list_kind(right)
     if left_kind == right_kind == "native":
         return node
-    if left_kind != right_kind:
-        name = "ARRAYS_OVERLAP" if isinstance(node, exp.ArrayOverlaps) else "ARRAY_EXCEPT"
-        raise TranslationError(
-            f"{name} needs both operands the same kind: a JSON/VARIANT array and a native "
-            "list have no common element type, so the comparison would be silently unequal."
-        )
+    left, right = _coerced_array_pair(left, right)
     if isinstance(node, exp.ArrayOverlaps):
         return exp.func("list_has_any", left, right)
     return sqlglot.parse_one(
@@ -532,13 +572,46 @@ def _rewrite_array_to_string(node: exp.Expression) -> exp.Expression:
     )
 
 
+def _coerce_array_operands(node: exp.Expression) -> exp.Expression:
+    """Coerce a two-array call's operands onto one element kind.
+
+    ``ARRAY_CAT`` nests its operands as ``this`` plus ``expressions`` while
+    ``ARRAY_INTERSECTION`` keeps both in ``expressions``; each further operand is coerced
+    against the first so a chain of mixed operands settles on one kind.
+    """
+    if isinstance(node, exp.ArrayConcat):
+        operands = [node.this, *(node.args.get("expressions") or [])]
+    else:
+        operands = list(node.args.get("expressions") or [])
+    converted = [
+        _array_list(_rewrite_json_array_functions(operand))
+        if isinstance(operand, exp.Expression)
+        else operand
+        for operand in operands
+    ]
+    for index in range(1, len(converted)):
+        converted[0], converted[index] = _coerced_array_pair(
+            converted[0], converted[index]
+        )
+    if isinstance(node, exp.ArrayConcat):
+        node.set("this", converted[0])
+        node.set("expressions", converted[1:])
+    else:
+        node.set("expressions", converted)
+    return node
+
+
 def _cast_array_operands(node: exp.Expression) -> exp.Expression:
     """Cast the array operand(s) of a call sqlglot otherwise renders faithfully.
 
     A searched value is encoded with ``TO_JSON``/``CAST(... AS VARIANT)`` when the array it
     is compared against is JSON/VARIANT, so the comparison happens between VARIANT values,
-    as Snowflake does.
+    as Snowflake does. A call that takes two arrays (``ARRAY_CAT``, ``ARRAY_INTERSECTION``)
+    also has its operands coerced onto one element kind, so a native list can be combined with
+    a JSON or VARIANT one.
     """
+    if isinstance(node, (exp.ArrayConcat, exp.ArrayIntersect)):
+        return _coerce_array_operands(node)
     if isinstance(node, exp.ArrayAgg):
         # The argument is a value to aggregate, not an array to index into: only a JSON
         # value is cast, so it aggregates as one element the way Snowflake does.

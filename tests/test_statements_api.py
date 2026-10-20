@@ -619,35 +619,67 @@ def test_documented_array_semantics(client):
     assert data("SELECT ARRAY_AGG(x) FROM null_arr") == [[[1, 2]]]
 
 
-def test_array_set_operation_rejects_a_mixed_pair(client):
-    """A JSON/VARIANT operand and a native list have no common element type.
+def test_array_functions_coerce_a_mixed_operand_pair(client):
+    """A native list and a JSON/VARIANT array are coerced element-wise, as Snowflake does.
 
-    DuckDB compares a JSON/VARIANT element against an ``INT``/``VARCHAR`` element as unequal,
-    so the pair is rejected instead of answered wrong (`ARRAYS_OVERLAP(v, ARRAY_CONSTRUCT(2))`
-    used to return FALSE for a shared ``2``).
+    DuckDB does not unify the element types: joining a ``VARCHAR[]`` against a ``JSON[]``
+    casts the text to JSON (``Malformed JSON at byte 0``), and comparing a JSON element
+    against a plain value is silently unequal. Snowflake coerces the two arrays, so the
+    native side is re-encoded with ``TO_JSON``/``_variant_element`` per element, which keeps
+    a number distinct from the string that spells it.
     """
     def post(statement):
         return client.post("/api/v2/statements", json={"statement": statement})
 
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
     assert post("CREATE TABLE mix (nums VARIANT, j VARIANT)").status_code == 200
     assert (
         post(
-            "INSERT INTO mix SELECT PARSE_JSON('[3,1,2]'), PARSE_JSON('{\"n\":[3,1,2]}')"
+            "INSERT INTO mix SELECT PARSE_JSON('[3,1,2]'), "
+            "PARSE_JSON('{\"nums\":[3,1,2],\"s\":[\"1\",\"2\"],"
+            "\"nulls\":[\"a\",null,null],\"names\":[\"a\",\"b\",\"a\"]}')"
         ).status_code
         == 200
     )
 
-    for statement in (
-        "SELECT ARRAYS_OVERLAP(nums, ARRAY_CONSTRUCT(2)) FROM mix",
-        "SELECT ARRAY_EXCEPT(nums, ARRAY_CONSTRUCT(2)) FROM mix",
-        "SELECT ARRAY_EXCEPT(ARRAY_CONSTRUCT(2,3), nums) FROM mix",
-        "SELECT ARRAYS_OVERLAP(j:n, ARRAY_CONSTRUCT(2)) FROM mix",
-    ):
-        resp = post(statement)
-        assert resp.status_code == 422, (statement, resp.json())
-        assert "same kind" in resp.json()["detail"]["message"]
+    # A shared value is found, and a value in the array that the native list does not hold is
+    # left behind -- in either operand order.
+    assert data("SELECT ARRAYS_OVERLAP(nums, ARRAY_CONSTRUCT(2)) FROM mix") == [[True]]
+    assert data("SELECT ARRAYS_OVERLAP(nums, ARRAY_CONSTRUCT(9)) FROM mix") == [[False]]
+    assert data("SELECT ARRAY_INTERSECTION(nums, ARRAY_CONSTRUCT(2)) FROM mix") == [[[2]]]
+    assert data("SELECT ARRAY_INTERSECTION(j:nums, ARRAY_CONSTRUCT('2')) FROM mix") == [[[]]]
+    assert data("SELECT ARRAY_INTERSECTION(j:names, ARRAY_CONSTRUCT('a')) FROM mix") == [
+        [['a']]
+    ]
+    assert data("SELECT ARRAY_EXCEPT(j:names, ARRAY_CONSTRUCT('a')) FROM mix") == [
+        [['a', 'b']]
+    ]
+    assert data("SELECT ARRAY_EXCEPT(ARRAY_CONSTRUCT(2,3), nums) FROM mix") == [[[]]]
+    assert data("SELECT ARRAY_CAT(j:nums, ARRAY_CONSTRUCT(4)) FROM mix") == [[[3, 1, 2, 4]]]
+    assert data("SELECT ARRAY_CAT(ARRAY_CONSTRUCT(4), nums) FROM mix") == [[[4, 3, 1, 2]]]
 
-    # Both operands the same kind still work, native pairs included.
+    # The encoding keeps a number apart from the string that spells it. A bare VARIANT column
+    # is compared as a VARIANT array, where DuckDB cannot compare a string element against a
+    # number element at all, so the cross-type case is exercised on the JSON path.
+    assert data("SELECT ARRAY_INTERSECTION(j:nums, ARRAY_CONSTRUCT('2')) FROM mix") == [[[]]]
+    assert data("SELECT ARRAY_INTERSECTION(j:s, ARRAY_CONSTRUCT('2')) FROM mix") == [
+        [['2']]
+    ]
+    assert data("SELECT ARRAY_INTERSECTION(j:s, ARRAY_CONSTRUCT(2)) FROM mix") == [[[]]]
+
+    # A NULL in the native list matches the array's null element and is subtracted once.
+    assert data("SELECT ARRAY_EXCEPT(j:nulls, ARRAY_CONSTRUCT(NULL)) FROM mix") == [
+        [['a', None]]
+    ]
+    assert data("SELECT ARRAY_INTERSECTION(j:nulls, ARRAY_CONSTRUCT(NULL)) FROM mix") == [
+        [[None]]
+    ]
+
+    # Same-kind pairs are unaffected, native pairs included.
     assert post("SELECT ARRAYS_OVERLAP(nums, nums) FROM mix").json()["data"] == [[True]]
     assert post("SELECT ARRAY_EXCEPT(nums, nums) FROM mix").json()["data"] == [[[]]]
     assert post(
