@@ -278,6 +278,66 @@ def _has_variant_list(node: exp.Expression) -> bool:
     )
 
 
+# ``json_type`` names a JSON number by its storage type (UBIGINT, BIGINT, DOUBLE, ...), so a
+# number is recognised as "anything that is not one of the non-numeric kinds".
+_JSON_NON_NUMERIC_TYPES = "('VARCHAR', 'BOOLEAN', 'ARRAY', 'OBJECT', 'NULL')"
+_JSON_NUMBER = (
+    f"COALESCE(json_type(_sfemu_element) NOT IN {_JSON_NON_NUMERIC_TYPES}, FALSE)"
+)
+
+_ORDERING_KEY = (
+    "{{'t': CASE WHEN _sfemu_element IS NULL THEN {null_rank} "
+    f"WHEN {_JSON_NUMBER} THEN 1 ELSE 2 END, "
+    f"'n': CASE WHEN {_JSON_NUMBER} "
+    "THEN CAST(_sfemu_element AS DOUBLE) ELSE 0 END, "
+    "'s': CASE WHEN _sfemu_element IS NULL THEN '' "
+    "ELSE CAST(_sfemu_element AS VARCHAR) END, "
+    "'v': _sfemu_element}}"
+)
+
+_ORDERING_NAMES = {
+    exp.ArrayMax: "ARRAY_MAX",
+    exp.ArrayMin: "ARRAY_MIN",
+    exp.SortArray: "ARRAY_SORT",
+}
+
+
+def _rewrite_json_ordering(node: exp.Expression, array: exp.Expression) -> exp.Expression:
+    """Order a ``JSON[]`` by a type-aware key, so numbers compare numerically.
+
+    DuckDB compares JSON values as text, so a JSON number array came back in text order
+    (``[10,2,33]`` stayed ``[10,2,33]``, and ``ARRAY_MAX([9,100])`` was ``9``). Snowflake orders
+    an array the way ``ORDER BY`` orders its flattened elements, so each element carries a key:
+    a null rank, then a numeric field for a JSON number, then the element's text. Numbers
+    therefore compare numerically, strings lexicographically, and compound values by their
+    text. The null rank puts NULL elements last for an ascending sort and first for a
+    descending one, which is Snowflake's default, and honours an explicit ``nulls_first``.
+    """
+    ascending = node.args.get("asc")
+    ascending = True if ascending is None else bool(ascending.this)
+    nulls_first = node.args.get("nulls_first")
+    nulls_first = (not ascending) if nulls_first is None else bool(nulls_first.this)
+    # Rank 0 sorts first and 3 last in ascending order, so the rank that puts NULLs first
+    # depends on the direction the sort is applied in.
+    null_rank = (0 if nulls_first else 3) if ascending else (3 if nulls_first else 0)
+    keyed = (
+        f"LIST_TRANSFORM({_sql(array)}, _sfemu_element -> "
+        f"{_ORDERING_KEY.format(null_rank=null_rank)})"
+    )
+    if isinstance(node, exp.SortArray):
+        direction = "'ASC'" if ascending else "'DESC'"
+        return sqlglot.parse_one(
+            f"LIST_TRANSFORM(LIST_SORT({keyed}, {direction}), "
+            f"_sfemu_sorted -> _sfemu_sorted.v)",
+            read=WRITE_DIALECT,
+        )
+    aggregate = "LIST_MAX" if isinstance(node, exp.ArrayMax) else "LIST_MIN"
+    return sqlglot.parse_one(
+        f"LIST_TRANSFORM([{aggregate}({keyed})], _sfemu_pick -> _sfemu_pick.v)[1]",
+        read=WRITE_DIALECT,
+    )
+
+
 def _rewrite_ordering_function(node: exp.Expression) -> exp.Expression:
     """``ARRAY_SORT``/``ARRAY_MAX``/``ARRAY_MIN`` over a JSON or native list only.
 
@@ -285,22 +345,21 @@ def _rewrite_ordering_function(node: exp.Expression) -> exp.Expression:
     own ``<`` operator does -- for strings it goes by length, so DuckDB returns
     ``['apple','other','datafile']`` where Snowflake returns ``['apple','datafile','other']``
     -- and DuckDB raises or crashes outright for a bare VARIANT. A JSON array (``col:path``,
-    ``PARSE_JSON('[...]')``) sorts lexicographically -- right for strings, wrong for numbers,
-    which come back in text order (``[10,2,33]`` stays ``[10,2,33]``) -- and a native list
-    keeps DuckDB's own order. A bare column is decided by its declared type when the caller
-    supplied a catalog: a real DuckDB list column is left alone, a JSON one is cast, and only
-    a VARIANT-typed (or unresolvable) one -- which DuckDB mis-orders -- is rejected.
+    ``PARSE_JSON('[...]')``) is ordered by a type-aware key so a number compares numerically
+    (see ``_rewrite_json_ordering``), and a native list keeps DuckDB's own order. A bare column
+    is decided by its declared type when the caller supplied a catalog: a real DuckDB list
+    column is left alone, a JSON one takes the JSON path, and only a VARIANT-typed (or
+    unresolvable) one -- which DuckDB mis-orders -- is rejected.
     """
     array = _rewrite_json_array_functions(node.this)
     if _is_json_array_value(array):
-        node.set("this", _json_list(array))
-        return node
+        return _rewrite_json_ordering(node, _json_list(array) or array)
     declared = _declared_column_type(array)
     if declared is not None:
         if _is_json_list_type(declared):
-            # A JSON column sorts lexicographically, like a ``col:path`` operand.
-            node.set("this", exp.cast(array, exp.DataType.build("JSON[]"), dialect=WRITE_DIALECT))
-            return node
+            return _rewrite_json_ordering(
+                node, exp.cast(array, exp.DataType.build("JSON[]"), dialect=WRITE_DIALECT)
+            )
         if _is_list_type(declared) and not _is_variant_list_type(declared):
             # A real DuckDB list -- typically a CTAS ``ARRAY_CONSTRUCT`` column -- keeps its
             # own element type, so DuckDB's order is the one Snowflake gives as well.
@@ -312,17 +371,12 @@ def _rewrite_ordering_function(node: exp.Expression) -> exp.Expression:
         or _has_variant_list(array)
         or _aggregates_to_variant_list(array)
     ):
-        name = type(node).__name__
-        name = {
-            exp.ArrayMax: "ARRAY_MAX",
-            exp.ArrayMin: "ARRAY_MIN",
-            exp.SortArray: "ARRAY_SORT",
-        }.get(type(node), name)
+        name = _ORDERING_NAMES.get(type(node), type(node).__name__)
         raise TranslationError(
             f"{name} over a VARIANT-typed array is not supported by the emulator: DuckDB "
             "orders VARIANT values differently from Snowflake. Write the array as an "
-            "ARRAY_CONSTRUCT list (a col:path JSON array sorts lexicographically, which is "
-            "wrong for numbers)."
+            "ARRAY_CONSTRUCT list or read it through a JSON path (j:path), where a number "
+            "array compares numerically."
         )
     node.set("this", array)
     return node

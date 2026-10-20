@@ -381,6 +381,50 @@ def test_array_flatten_requires_a_literal_depth(client):
     assert "ARRAY_FLATTEN(array)" in resp.json()["detail"]["message"]
 
 
+def test_array_ordering_compares_json_numbers_numerically(client):
+    """A JSON number array orders numerically, as Snowflake orders it by value.
+
+    DuckDB compares JSON values as text, so ``[10,2,33]`` stayed in that order and
+    ``ARRAY_MAX([9,100])`` was ``9``. The JSON path orders by a type-aware key instead: numbers
+    numerically, strings lexicographically, and NULL elements last by default (first with an
+    explicit ``nulls_first``, or with a descending sort).
+    """
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post("CREATE TABLE ordj (v VARIANT)").status_code == 200
+    assert (
+        post(
+            'INSERT INTO ordj SELECT PARSE_JSON(\'{"nums":[10,2,33],"big":[9,100],'
+            '"strs":["b","aa","ab"],"withnull":[3,null,1],"bools":[true,false]}\')'
+        ).status_code
+        == 200
+    )
+
+    assert data("SELECT ARRAY_SORT(v:nums) FROM ordj") == [[[2, 10, 33]]]
+    assert data("SELECT ARRAY_MAX(v:big) FROM ordj") == [[100]]
+    assert data("SELECT ARRAY_MIN(v:big) FROM ordj") == [[9]]
+    # A string array keeps lexicographic order, and booleans order false before true.
+    assert data("SELECT ARRAY_SORT(v:strs) FROM ordj") == [[['aa', 'ab', 'b']]]
+    assert data("SELECT ARRAY_SORT(v:bools) FROM ordj") == [[[False, True]]]
+    # A literal JSON array takes the same path.
+    assert data("SELECT ARRAY_SORT(PARSE_JSON('[10,2,33]'))") == [[[2, 10, 33]]]
+
+    # Direction and NULL placement: last by default when ascending.
+    assert data("SELECT ARRAY_SORT(v:nums, FALSE) FROM ordj") == [[[33, 10, 2]]]
+    assert data("SELECT ARRAY_SORT(v:withnull) FROM ordj") == [[[1, 3, None]]]
+    assert data("SELECT ARRAY_SORT(v:withnull, TRUE, TRUE) FROM ordj") == [[[None, 1, 3]]]
+
+    # A native list keeps DuckDB's own order.
+    assert data("SELECT ARRAY_SORT(ARRAY_CONSTRUCT(10,2,33))") == [[[2, 10, 33]]]
+    assert data("SELECT ARRAY_SORT(ARRAY_CONSTRUCT(10,2,33), FALSE)") == [[[33, 10, 2]]]
+
+
 def test_array_to_string_null_and_argument_shapes(client):
     """``ARRAY_TO_STRING`` over a JSON array: NULL separator, NULL element, nested values.
 

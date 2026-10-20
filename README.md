@@ -177,15 +177,17 @@ column, a `col:path` or JSON.
 Not translated, and left as a loud error rather than a guess:
 
 - **ordering a VARIANT array** (`ARRAY_SORT`, `ARRAY_MAX`, `ARRAY_MIN` over `v`,
-  `v::VARIANT`, `PARSE_JSON('[...]')::VARIANT`, or `ARRAY_AGG(v)` of a VARIANT column): DuckDB's `list_sort`/`list_max`/
-  `list_min` do not order `VARIANT[]` the way their own `<` operator does — for strings it
-  goes by length, so `['aa','ab','b']` comes back `['b','aa','ab']` where Snowflake sorts it
-  lexicographically. Write the array as an `ARRAY_CONSTRUCT` list instead. A `col:path`
-  stays `JSON[]` and sorts lexicographically — right for strings, but wrong for numbers
-  (`[10,2,33]` stays `[10,2,33]`);
-  a bare column is decided by its catalog type: a real list column (`CREATE TABLE t AS
-  SELECT ARRAY_CONSTRUCT(...) AS n` stores `VARCHAR[]`/`INTEGER[]`) orders correctly,
-  numbers included, and a `JSON` column sorts lexicographically like a `col:path`. Only a
+  `v::VARIANT`, `PARSE_JSON('[...]')::VARIANT`, or `ARRAY_AGG(v)` of a VARIANT column):
+  DuckDB's `list_sort`/`list_max`/`list_min` do not order `VARIANT[]` the way their own `<`
+  operator does — for strings it goes by length, so `['aa','ab','b']` comes back
+  `['b','aa','ab']` where Snowflake sorts it lexicographically. Write the array as an
+  `ARRAY_CONSTRUCT` list, or read it through a JSON path (`j:path`) or a `JSON` column, which
+  order by a type-aware key: numbers numerically (`[10,2,33]` → `[2,10,33]`,
+  `ARRAY_MAX([9,100])` → `100`), strings lexicographically, compound values by their text,
+  and NULL elements last for an ascending sort (first with `nulls_first`, or with
+  `ARRAY_SORT(arr, FALSE)`; its `sort_ascending` argument is honoured on that path). A bare
+  column is decided by its catalog type: a real list column (`CREATE TABLE t AS SELECT
+  ARRAY_CONSTRUCT(...) AS n` stores `VARCHAR[]`/`INTEGER[]`) orders correctly too. Only a
   VARIANT column — or one whose name the catalog cannot attribute to a single type — is
   rejected;
 - a **mixed-type** comparison against a bare VARIANT column: DuckDB refuses to compare two
