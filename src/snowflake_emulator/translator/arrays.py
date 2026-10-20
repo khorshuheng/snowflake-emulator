@@ -392,18 +392,25 @@ def _multiset_except_sql(left: str, right: str) -> str:
     ``LIST_FILTER`` over ``ARRAY_SLICE`` measures. Each operand is therefore named several
     times, which a bound ``?`` operand does not survive -- the same limitation the other
     rebuilt calls have.
+
+    The comparison is ``IS NOT DISTINCT FROM``, not ``=``, because the function is NULL-safe
+    and a JSON null element of a ``JSON[]`` *is* an SQL NULL to DuckDB: with ``=`` every
+    comparison against it is NULL, so the copy was never counted on either side and the
+    multiset arithmetic was wrong for a repeated null (``['a',null,null]`` except ``[null]``
+    kept none of them, where Snowflake keeps one).
     """
     rank = (
-        f"LIST_COUNT(LIST_FILTER(ARRAY_SLICE({left}, 1, _sfemu_index), "
-        f"_sfemu_seen -> _sfemu_seen = {left}[_sfemu_index]))"
+        f"LENGTH(LIST_FILTER(ARRAY_SLICE({left}, 1, _sfemu_index), "
+        f"_sfemu_seen -> _sfemu_seen IS NOT DISTINCT FROM {left}[_sfemu_index]))"
     )
     budget = (
-        f"LIST_COUNT(LIST_FILTER({left}, _sfemu_all -> _sfemu_all = {left}[_sfemu_index])) "
-        f"- LIST_COUNT(LIST_FILTER({right}, _sfemu_excluded -> "
-        f"_sfemu_excluded = {left}[_sfemu_index]))"
+        f"LENGTH(LIST_FILTER({left}, _sfemu_all -> "
+        f"_sfemu_all IS NOT DISTINCT FROM {left}[_sfemu_index])) "
+        f"- LENGTH(LIST_FILTER({right}, _sfemu_excluded -> "
+        f"_sfemu_excluded IS NOT DISTINCT FROM {left}[_sfemu_index]))"
     )
     return (
-        f"LIST_TRANSFORM(LIST_FILTER(RANGE(1, LIST_COUNT({left}) + 1), "
+        f"LIST_TRANSFORM(LIST_FILTER(RANGE(1, LENGTH({left}) + 1), "
         f"_sfemu_index -> {rank} <= {budget}), "
         f"_sfemu_index -> {left}[_sfemu_index])"
     )

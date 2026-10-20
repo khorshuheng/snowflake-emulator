@@ -593,6 +593,20 @@ def test_documented_array_semantics(client):
     ]
     assert data("SELECT ARRAY_EXCEPT(n, n) FROM variant_arr") == [[[]]]
 
+    # The multiset arithmetic is NULL-safe: a JSON null is an SQL NULL to DuckDB, so the
+    # `=` comparison counted no copy of it on either side and a repeated null was dropped
+    # entirely. Two nulls minus one null keeps one.
+    assert data(
+        "SELECT ARRAY_EXCEPT(PARSE_JSON('[\"a\",null,null]'), PARSE_JSON('[null]'))"
+    ) == [[['a', None]]]
+    assert data(
+        "SELECT ARRAY_EXCEPT(TO_VARIANT(ARRAY_CONSTRUCT('a', NULL)), "
+        "TO_VARIANT(ARRAY_CONSTRUCT(NULL)))"
+    ) == [[['a']]]
+    assert data(
+        "SELECT ARRAY_INTERSECTION(PARSE_JSON('[\"a\",null]'), PARSE_JSON('[null]'))"
+    ) == [[[None]]]
+
     # ARRAY_POSITION answers NULL, not 0, for a value the array does not hold...
     assert data("SELECT ARRAY_POSITION('zz', j:n) FROM json_arr") == [[None]]
     assert data("SELECT ARRAY_POSITION('zz', ARRAY_CONSTRUCT('a'))") == [[None]]
