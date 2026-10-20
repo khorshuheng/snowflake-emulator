@@ -185,7 +185,8 @@ Not translated, and left as a loud error rather than a guess:
   order by a type-aware key: numbers numerically (`[10,2,33]` → `[2,10,33]`,
   `ARRAY_MAX([9,100])` → `100`), strings lexicographically, compound values by their text,
   and NULL elements last for an ascending sort (first with `nulls_first`, or with
-  `ARRAY_SORT(arr, FALSE)`; its `sort_ascending` argument is honoured on that path). A bare
+  `ARRAY_SORT(arr, FALSE)`; both direction arguments must be literal TRUE/FALSE, and a NULL
+  argument makes the call NULL, as Snowflake documents). A bare
   column is decided by its catalog type: a real list column (`CREATE TABLE t AS SELECT
   ARRAY_CONSTRUCT(...) AS n` stores `VARCHAR[]`/`INTEGER[]`) orders correctly too. Only a
   VARIANT column — or one whose name the catalog cannot attribute to a single type — is
@@ -211,7 +212,9 @@ nothing — use the plain literal.
 
 `ARRAY_TO_STRING(array, separator)` is the documented two-argument form: a NULL element becomes
 an empty string, a NULL separator returns NULL, and a third argument is rejected (sqlglot would
-drop it silently) rather than answered differently.
+drop it silently) rather than answered differently. A `?` separator is supported too; because
+the placeholder may appear only once, a NULL value bound to it joins with an empty separator
+instead of returning NULL.
 
 Verified against Snowflake's documentation, and covered by
 `test_documented_array_semantics`: `ARRAY_INTERSECTION` and `ARRAY_EXCEPT` use multi-set

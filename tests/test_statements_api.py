@@ -466,6 +466,18 @@ def test_array_to_string_null_and_argument_shapes(client):
     # A separator expression that contains a comma is still one argument.
     assert data("SELECT ARRAY_TO_STRING(j:plain, IFF(1=1, ',', ';')) FROM ats") == [["a,b"]]
 
+    # A positional separator keeps working: the NULL check is dropped rather than repeating
+    # the placeholder, so one bind value is still enough.
+    resp = client.post(
+        "/api/v2/statements",
+        json={
+            "statement": "SELECT ARRAY_TO_STRING(j:plain, ?) FROM ats",
+            "bindings": {"1": {"type": "TEXT", "value": ","}},
+        },
+    )
+    assert resp.status_code == 200, resp.json()
+    assert resp.json()["data"] == [["a,b"]]
+
     # A third argument is not Snowflake SQL; say so instead of dropping it.
     for statement in (
         "SELECT ARRAY_TO_STRING(j:withnull, ',', 'X') FROM ats",
@@ -910,8 +922,10 @@ def test_array_functions_coerce_a_mixed_operand_pair(client):
     assert data("SELECT ARRAY_INTERSECTION(j:names, ARRAY_CONSTRUCT('a')) FROM mix") == [
         [['a']]
     ]
-    assert data("SELECT ARRAY_EXCEPT(j:names, ARRAY_CONSTRUCT('a')) FROM mix") == [
-        [['a', 'b']]
+    # Snowflake leaves the order of ARRAY_EXCEPT's result unspecified, so compare as a
+    # multiset rather than pinning one.
+    assert sorted(data("SELECT ARRAY_EXCEPT(j:names, ARRAY_CONSTRUCT('a')) FROM mix")[0][0]) == [
+        'a', 'b'
     ]
     assert data("SELECT ARRAY_EXCEPT(ARRAY_CONSTRUCT(2,3), nums) FROM mix") == [[[]]]
     assert data("SELECT ARRAY_CAT(j:nums, ARRAY_CONSTRUCT(4)) FROM mix") == [[[3, 1, 2, 4]]]
@@ -940,6 +954,222 @@ def test_array_functions_coerce_a_mixed_operand_pair(client):
     assert post(
         "SELECT ARRAY_EXCEPT(ARRAY_CONSTRUCT('a','b'), ARRAY_CONSTRUCT('b'))"
     ).json()["data"] == [[['a']]]
+
+
+def test_array_flatten_deep_depth_is_cheap(client):
+    """A depth of 10 must not expand into an exponential expression.
+
+    The guarded form used to name the previous level three times per level, so the SQL text
+    tripled with each one: depth 10 produced 108 MB of SQL and took over five minutes to
+    translate. ``LIST_REDUCE`` keeps the text one size regardless of depth.
+    """
+    from snowflake_emulator.translator import transpile_to_duckdb
+    from snowflake_emulator.translator.constants import READ_DIALECT
+    from snowflake_emulator.translator.parsing import preprocess_array_calls
+
+    sizes = []
+    for depth in (1, 10):
+        duckdb_sql = transpile_to_duckdb(
+            sqlparse_one(preprocess_array_calls(f"SELECT ARRAY_FLATTEN(j:deep, {depth})"))
+        )
+        sizes.append(len(duckdb_sql))
+    assert max(sizes) < 2000, sizes
+
+    assert client.post(
+        "/api/v2/statements", json={"statement": "CREATE TABLE deep_t (j VARIANT)"}
+    ).status_code == 200
+    assert client.post(
+        "/api/v2/statements",
+        json={
+            "statement": 'INSERT INTO deep_t SELECT PARSE_JSON(\'{"deep":[[1,2],[3]]}\')'
+        },
+    ).status_code == 200
+    resp = client.post(
+        "/api/v2/statements", json={"statement": "SELECT ARRAY_FLATTEN(j:deep, 10) FROM deep_t"}
+    )
+    assert resp.status_code == 200, resp.json()
+    assert resp.json()["data"] == [[[1, 2, 3]]]
+
+
+def sqlparse_one(sql):
+    """Parse Snowflake SQL the way the service does (preprocessing included)."""
+    import sqlglot
+    from snowflake_emulator.translator.constants import READ_DIALECT
+
+    return sqlglot.parse_one(sql, read=READ_DIALECT)
+
+
+def test_array_ordering_rejects_a_non_literal_direction(client):
+    """``ARRAY_SORT``'s direction arguments are literals; anything else is not guessed.
+
+    Reading the AST's first child made ``ARRAY_SORT(arr, 1 = 2)`` sort ascending (wrong) and
+    ``ARRAY_SORT(arr, NULL)`` sort descending where Snowflake returns NULL.
+    """
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    assert post("CREATE TABLE dir (v VARIANT)").status_code == 200
+    assert post(
+        'INSERT INTO dir SELECT PARSE_JSON(\'{"nums":[10,2,33]}\')'
+    ).status_code == 200
+
+    for statement in (
+        "SELECT ARRAY_SORT(v:nums, 1 = 2) FROM dir",
+        "SELECT ARRAY_SORT(v:nums, TRUE = FALSE) FROM dir",
+        "SELECT ARRAY_SORT(v:nums, TRUE, 1 = 2) FROM dir",
+    ):
+        resp = post(statement)
+        assert resp.status_code == 422, (statement, resp.json())
+        assert "literal TRUE or FALSE" in resp.json()["detail"]["message"]
+
+    # A NULL argument makes the call NULL, as Snowflake documents.
+    assert post("SELECT ARRAY_SORT(v:nums, NULL) FROM dir").json()["data"] == [[None]]
+    # Literals keep working.
+    assert post("SELECT ARRAY_SORT(v:nums, FALSE) FROM dir").json()["data"] == [[[33, 10, 2]]]
+
+
+def test_array_column_type_resolution_is_schema_aware(client):
+    """A qualified column resolves within its own schema, and only when the type is unique.
+
+    The resolver matched on the table name alone and skipped the type-disagreement check for a
+    qualified name, so ``SELECT ARRAY_SORT(arr.n) FROM s_variant.arr`` picked the other
+    schema's ``VARCHAR[]`` and reached DuckDB's VARIANT ``list_sort`` -- an out-of-memory
+    error. A name the query itself defines (an alias) is not looked up either.
+    """
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    assert post("CREATE SCHEMA s_native").status_code == 200
+    assert post(
+        "CREATE TABLE s_native.arr AS SELECT ARRAY_CONSTRUCT('b','a') AS n"
+    ).status_code == 200
+    assert post("CREATE SCHEMA s_variant").status_code == 200
+    assert post("CREATE TABLE s_variant.arr (n VARIANT)").status_code == 200
+    assert post(
+        'INSERT INTO s_variant.arr SELECT PARSE_JSON(\'["b","aa","ab"]\')'
+    ).status_code == 200
+
+    assert post("SELECT ARRAY_SORT(s_native.arr.n) FROM s_native.arr").json()["data"] == [
+        [['a', 'b']]
+    ]
+    for statement in (
+        "SELECT ARRAY_SORT(s_variant.arr.n) FROM s_variant.arr",
+        "SELECT ARRAY_SORT(arr.n) FROM s_variant.arr",
+        "SELECT ARRAY_SORT(s_variant.arr.n) FROM s_native.arr",
+    ):
+        resp = post(statement)
+        assert resp.status_code == 422, (statement, resp.json())
+        assert "VARIANT-typed array" in resp.json()["detail"]["message"]
+
+    # A query-scoped alias that happens to match a catalog column name is not resolved either.
+    assert post("CREATE TABLE nums_tbl AS SELECT ARRAY_CONSTRUCT(1) AS nums").status_code == 200
+    resp = post(
+        'SELECT ARRAY_SORT(nums) FROM (SELECT PARSE_JSON(\'[9,100]\') AS nums) x'
+    )
+    assert resp.status_code == 422, resp.json()
+    assert "VARIANT-typed array" in resp.json()["detail"]["message"]
+
+
+def test_array_rewrites_keep_the_resolver_through_nesting(client):
+    """A nested array call must not lose the bare column's type.
+
+    Re-entering the rewrite pass on an operand used to reset the resolver to None, so every
+    wrapping call treated a real ``VARCHAR[]``/``INTEGER[]`` column as an unknown VARIANT and
+    ``ARRAY_SORT(ARRAY_UNIQUE(n))`` was rejected while ``ARRAY_SORT(n)`` worked.
+    """
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    assert post(
+        "CREATE TABLE nested (n VARCHAR[], nums INTEGER[])"
+    ).status_code == 200
+    assert post(
+        "INSERT INTO nested SELECT ARRAY_CONSTRUCT('b','a'), ARRAY_CONSTRUCT(30,4,100)"
+    ).status_code == 200
+
+    for statement, expected in (
+        ("SELECT ARRAY_SORT(ARRAY_UNIQUE(n)) FROM nested", [[['a', 'b']]]),
+        ("SELECT ARRAY_SORT(ARRAY_DISTINCT(n)) FROM nested", [[['a', 'b']]]),
+        ("SELECT ARRAY_MAX(ARRAY_SLICE(nums, 0, 1)) FROM nested", [[30]]),
+        ("SELECT ARRAY_SORT(ARRAY_CAT(n, ARRAY_CONSTRUCT('z'))) FROM nested", [[['a', 'b', 'z']]]),
+        ("SELECT ARRAY_SORT(ARRAY_APPEND(n, 'z')) FROM nested", [[['a', 'b', 'z']]]),
+    ):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        assert resp.json()["data"] == expected, statement
+
+
+def test_array_except_scales(client):
+    """``ARRAY_EXCEPT`` over 1000 elements finishes promptly.
+
+    The hand-built rank-based rewrite recomputed a prefix count per element (quadratic, ~240x
+    slower than sqlglot's own multiset rendering at 500 elements), which made a single row of
+    a large array take seconds.
+    """
+    import json as json_module
+    import time
+
+    payload = json_module.dumps({"a": list(range(1000)), "b": [0]})
+    assert client.post(
+        "/api/v2/statements", json={"statement": "CREATE TABLE big_arr (v VARIANT)"}
+    ).status_code == 200
+    assert client.post(
+        "/api/v2/statements",
+        json={"statement": "INSERT INTO big_arr SELECT PARSE_JSON(\'" + payload + "\')"},
+    ).status_code == 200
+    started = time.time()
+    resp = client.post(
+        "/api/v2/statements",
+        json={"statement": "SELECT ARRAY_SIZE(ARRAY_EXCEPT(v:a, v:b)) FROM big_arr"},
+    )
+    elapsed = time.time() - started
+    assert resp.status_code == 200, resp.json()
+    assert resp.json()["data"] == [[999]]
+    assert elapsed < 5, elapsed
+
+
+def test_create_function_named_like_a_builtin(client):
+    """A UDF may shadow a built-in name; its signature is not a call.
+
+    The argument-count guard counted commas in the token stream, so the three-parameter
+    signature of ``CREATE FUNCTION array_to_string`` was rejected as a bad built-in call.
+    """
+    resp = client.post(
+        "/api/v2/statements",
+        json={
+            "statement": "CREATE FUNCTION array_to_string(a VARCHAR, b VARCHAR, c VARCHAR) "
+            "RETURNS VARCHAR AS 'a || b || c'"
+        },
+    )
+    assert resp.status_code == 200, resp.json()
+
+
+def test_malformed_call_reports_the_parse_error(client):
+    """An unterminated argument list must not be reported as a bad ARRAY_TO_STRING call."""
+    resp = client.post(
+        "/api/v2/statements",
+        json={"statement": "SELECT ARRAY_TO_STRING(v:n, ',', 'X'"},
+    )
+    assert resp.status_code == 422
+    message = resp.json()["detail"]["message"]
+    assert "null-replacement" not in message
+    assert "parse" in message.lower() or "expect" in message.lower()
+
+
+def test_array_except_with_an_empty_native_list(client):
+    """An empty ``ARRAY_CONSTRUCT()`` is a typed empty list, not an unbindable one."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    resp = post('SELECT ARRAY_EXCEPT(PARSE_JSON(\'["a","b"]\'), ARRAY_CONSTRUCT())')
+    assert resp.status_code == 200, resp.json()
+    assert resp.json()["data"] == [[['a', 'b']]]
+    assert post(
+        'SELECT ARRAYS_OVERLAP(PARSE_JSON(\'["a"]\'), ARRAY_CONSTRUCT())'
+    ).json()["data"] == [[False]]
+    assert post('SELECT ARRAY_CAT(PARSE_JSON(\'[1]\'), ARRAY_CONSTRUCT())').json()["data"] == [
+        [[1]]
+    ]
 
 
 def test_array_ordering_over_a_variant_array_is_rejected(client):

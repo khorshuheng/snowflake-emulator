@@ -17,11 +17,13 @@ from snowflake_emulator.translator.constants import (
 from snowflake_emulator.translator.errors import TranslationError
 
 
-def _array_to_string_argument_count(tokens: list, index: int) -> int:
+def _array_to_string_argument_count(tokens: list, index: int) -> int | None:
     """Number of comma-separated arguments of the call whose ``(`` is at `index`.
 
     Counted from the tokens rather than the AST because sqlglot drops an extra
-    ``ARRAY_TO_STRING`` argument silently, so the parsed call cannot reveal it.
+    ``ARRAY_TO_STRING`` argument silently, so the parsed call cannot reveal it. None when the
+    parentheses never close: the statement is malformed, and the parser's own error is the
+    useful one.
     """
     depth = 0
     arguments = 1
@@ -34,10 +36,22 @@ def _array_to_string_argument_count(tokens: list, index: int) -> int:
                 return arguments
         elif token.token_type == TokenType.COMMA and depth == 1:
             arguments += 1
-    return arguments
+    return None
 
 
-def _reject_extra_array_to_string_arguments(tokens: list) -> None:
+_CREATE_FUNCTION_RE = re.compile(
+    r"(?is)^\s*CREATE\s+(OR\s+REPLACE\s+)?(GLOBAL\s+|LOCAL\s+|TEMPORARY\s+|SECURE\s+)*"
+    r"FUNCTION\b"
+)
+
+
+def _in_create_function_header(sql: str, position: int) -> bool:
+    """True when `position` falls inside a ``CREATE [OR REPLACE] [SECURE] FUNCTION`` header."""
+    statement_start = sql.rfind(";", 0, position) + 1
+    return bool(_CREATE_FUNCTION_RE.match(sql[statement_start:position]))
+
+
+def _reject_extra_array_to_string_arguments(tokens: list, sql: str) -> None:
     """Reject a third ``ARRAY_TO_STRING`` argument instead of letting sqlglot drop it.
 
     Snowflake documents ``ARRAY_TO_STRING(array, separator)``: a NULL element becomes an
@@ -50,7 +64,12 @@ def _reject_extra_array_to_string_arguments(tokens: list) -> None:
             continue
         if tokens[index + 1].token_type != TokenType.L_PAREN:
             continue
-        if _array_to_string_argument_count(tokens, index + 1) > 2:
+        if _in_create_function_header(sql, token.start):
+            # A ``CREATE FUNCTION array_to_string(a, b, c)`` signature is not a call: Snowflake
+            # lets a user-defined function shadow a built-in name.
+            continue
+        arguments = _array_to_string_argument_count(tokens, index + 1)
+        if arguments is not None and arguments > 2:
             raise TranslationError(
                 "ARRAY_TO_STRING takes an array and a separator; Snowflake's documented "
                 "signature has no null-replacement argument (a NULL element already becomes "
@@ -69,7 +88,7 @@ def preprocess_array_calls(sql: str) -> str:
     arguments is rejected here for the same reason: sqlglot drops the extra argument silently.
     """
     tokens = sqlglot.Dialect.get_or_raise(READ_DIALECT).tokenize(sql)
-    _reject_extra_array_to_string_arguments(tokens)
+    _reject_extra_array_to_string_arguments(tokens, sql)
     spans = [
         (token.start, token.end)
         for index, token in enumerate(tokens[:-1])

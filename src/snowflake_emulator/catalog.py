@@ -11,10 +11,11 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-# ``(table_name_or_None, column_name) -> DuckDB type name`` (e.g. ``"VARCHAR[]"``), or None
-# when the column cannot be found. Matched case-insensitively, because the translator works on
-# upper-cased unquoted identifiers while DuckDB keeps the name the table was created with.
-ColumnTypeResolver = Callable[[str | None, str], str | None]
+# ``(catalog_or_None, schema_or_None, table_or_None, column) -> DuckDB type name`` (e.g.
+# ``"VARCHAR[]"``), or None when the column cannot be attributed. Matched case-insensitively,
+# because the translator works on upper-cased unquoted identifiers while DuckDB keeps the name
+# the table was created with.
+ColumnTypeResolver = Callable[[str | None, str | None, str | None, str], str | None]
 
 
 def column_type_resolver(cursor: Any, session: Any) -> ColumnTypeResolver:
@@ -40,29 +41,31 @@ def column_type_resolver(cursor: Any, session: Any) -> ColumnTypeResolver:
 
     def rank(row: tuple[str, str, str, str, str]) -> tuple[int, int, int]:
         """Sort key: a temporary table first, then the session's schema, then its database."""
-        database, schema, table, _, _ = row
+        database, schema, _, _, _ = row
         return (
             0 if database.lower() == "temp" else 1,
             0 if schema.lower() == str(session.schema).lower() else 1,
             0 if database.lower() == str(session.database).lower() else 1,
         )
 
-    def resolve(table: str | None, column: str) -> str | None:
+    def resolve(
+        catalog: str | None, schema: str | None, table: str | None, column: str
+    ) -> str | None:
         wanted_column = column.upper()
-        wanted_table = table.upper() if table else None
-        candidates = [
-            row
-            for row in load()
-            if row[3].upper() == wanted_column
-            and (wanted_table is None or row[2].upper() == wanted_table)
-        ]
+        candidates = [row for row in load() if row[3].upper() == wanted_column]
+        for index, wanted in ((0, catalog), (1, schema), (2, table)):
+            if wanted:
+                candidates = [
+                    row for row in candidates if row[index].upper() == wanted.upper()
+                ]
         if not candidates:
             return None
-        if wanted_table is None and len({row[4].upper() for row in candidates}) > 1:
-            # The same column name in two differently-typed tables. An unqualified column
-            # cannot be attributed to one of them without reading the statement's FROM clause,
-            # and guessing a type would silently change which rewrite applies, so leave it
-            # unresolved and let the caller keep its conservative behaviour.
+        if len({row[4].upper() for row in candidates}) > 1:
+            # The name resolves to more than one type -- the same column in two tables of
+            # different type, or the same table name in two schemas when the reference did not
+            # name the schema. Guessing would change which rewrite applies (a VARIANT column
+            # read as a native list reaches DuckDB's VARIANT ``list_sort``, which fails with an
+            # out-of-memory error), so leave it unresolved and let the caller stay conservative.
             return None
         return sorted(candidates, key=rank)[0][4]
 

@@ -20,6 +20,11 @@ _column_types: ContextVar[ColumnTypeResolver | None] = ContextVar(
     "_column_types", default=None
 )
 
+# Column and table names the *statement itself* defines (select aliases, CTE names, derived
+# table aliases). A bare column with one of these names belongs to the query, not to a catalog
+# table that happens to share it, so it must not inherit that table's type.
+_scoped_names: ContextVar[frozenset[str]] = ContextVar("_scoped_names", default=frozenset())
+
 # Each level of ARRAY_FLATTEN is a separate DuckDB call, so a deep flatten is bounded.
 _ARRAY_FLATTEN_MAX_DEPTH = 10
 
@@ -142,11 +147,22 @@ def _json_list(node: exp.Expression | None) -> exp.Expression | None:
 
 
 def _declared_column_type(node: exp.Expression | None) -> str | None:
-    """The DuckDB type of a bare column, when the caller supplied a catalog lookup."""
+    """The DuckDB type of a bare column, when the caller supplied a catalog lookup.
+
+    A name the statement defines itself -- a select alias, a CTE, a derived table alias -- is
+    not looked up: an unrelated table with the same column name would otherwise decide how the
+    column is rewritten, which mis-orders a query-scoped VARIANT value or fails it with a raw
+    DuckDB binder error.
+    """
     resolver = _column_types.get()
     if resolver is None or not isinstance(node, exp.Column):
         return None
-    return resolver(node.table or None, node.name)
+    scoped = _scoped_names.get()
+    if node.name.upper() in scoped or (node.table and node.table.upper() in scoped):
+        return None
+    return resolver(
+        node.catalog or None, node.db or None, node.table or None, node.name
+    )
 
 
 def _is_list_type(declared: str) -> bool:
@@ -302,6 +318,24 @@ _ORDERING_NAMES = {
 }
 
 
+def _ordering_flag(node: exp.Expression, name: str) -> bool | None:
+    """One of ``ARRAY_SORT``'s boolean arguments, or None when the call did not pass it.
+
+    Only a literal is accepted. Reading ``bool(node.this)`` from an arbitrary expression made
+    ``ARRAY_SORT(arr, 1 = 2)`` sort ascending (the left operand is a non-empty node), which
+    silently returns the wrong order, and ``ARRAY_SORT(arr, NULL)`` sort descending where
+    Snowflake returns NULL for a NULL argument.
+    """
+    value = node.args.get(name)
+    if value is None:
+        return None
+    if isinstance(value, exp.Boolean):
+        return bool(value.this)
+    raise TranslationError(
+        f"ARRAY_SORT's {name} argument must be a literal TRUE or FALSE in the emulator."
+    )
+
+
 def _rewrite_json_ordering(node: exp.Expression, array: exp.Expression) -> exp.Expression:
     """Order a ``JSON[]`` by a type-aware key, so numbers compare numerically.
 
@@ -313,10 +347,10 @@ def _rewrite_json_ordering(node: exp.Expression, array: exp.Expression) -> exp.E
     text. The null rank puts NULL elements last for an ascending sort and first for a
     descending one, which is Snowflake's default, and honours an explicit ``nulls_first``.
     """
-    ascending = node.args.get("asc")
-    ascending = True if ascending is None else bool(ascending.this)
-    nulls_first = node.args.get("nulls_first")
-    nulls_first = (not ascending) if nulls_first is None else bool(nulls_first.this)
+    ascending = _ordering_flag(node, "asc")
+    ascending = True if ascending is None else ascending
+    nulls_first = _ordering_flag(node, "nulls_first")
+    nulls_first = (not ascending) if nulls_first is None else nulls_first
     # Rank 0 sorts first and 3 last in ascending order, so the rank that puts NULLs first
     # depends on the direction the sort is applied in.
     null_rank = (0 if nulls_first else 3) if ascending else (3 if nulls_first else 0)
@@ -351,7 +385,10 @@ def _rewrite_ordering_function(node: exp.Expression) -> exp.Expression:
     column is left alone, a JSON one takes the JSON path, and only a VARIANT-typed (or
     unresolvable) one -- which DuckDB mis-orders -- is rejected.
     """
-    array = _rewrite_json_array_functions(node.this)
+    if any(isinstance(node.args.get(name), exp.Null) for name in ("asc", "nulls_first")):
+        # "If any of the input arguments is NULL, the function returns NULL."
+        return exp.Null()
+    array = _rewrite_operand(node.this)
     if _is_json_array_value(array):
         return _rewrite_json_ordering(node, _json_list(array) or array)
     declared = _declared_column_type(array)
@@ -447,7 +484,7 @@ def _rewrite_array_slice(node: exp.Expression) -> exp.Expression:
     if start is None or end is None:
         # Snowflake requires both bounds; without one, DuckDB would return NULL instead.
         raise TranslationError("ARRAY_SLICE requires both a start and an end index.")
-    operand = _array_list(_rewrite_json_array_functions(node.this))
+    operand = _array_list(_rewrite_operand(node.this))
     return exp.func(
         "array_slice",
         operand,
@@ -464,8 +501,8 @@ def _rewrite_array_contains(node: exp.Expression) -> exp.Expression:
     form below is equivalent (checked against that CASE for a found/absent value, a NULL
     value, and an array holding NULL) while naming the value once.
     """
-    array = _array_list(_rewrite_json_array_functions(node.this))
-    value = _rewrite_json_array_functions(node.args.get("expression"))
+    array = _array_list(_rewrite_operand(node.this))
+    value = _rewrite_operand(node.args.get("expression"))
     # A VARIANT/JSON element is encoded so both sides compare as VARIANT values; against a
     # native list the value keeps its type.
     value = _encoded_element(value, array)
@@ -479,7 +516,7 @@ def _rewrite_array_contains(node: exp.Expression) -> exp.Expression:
 
 def _rewrite_array_size(node: exp.Expression) -> exp.Expression:
     """``ARRAY_SIZE(col:path)``: DuckDB needs a LIST, not the JSON the array is stored as."""
-    node.set("this", _array_list(_rewrite_json_array_functions(node.this)))
+    node.set("this", _array_list(_rewrite_operand(node.this)))
     return node
 
 
@@ -490,9 +527,9 @@ def _rewrite_array_position(node: exp.Expression) -> exp.Expression:
     of the first NULL for a NULL value, which is what DuckDB's ``array_position`` already
     returns -- for a ``JSON[]`` list, where a JSON null element is the match.
     """
-    array = _array_list(_rewrite_json_array_functions(node.this))
+    array = _array_list(_rewrite_operand(node.this))
     value = _encoded_element(
-        _rewrite_json_array_functions(node.args.get("expression")), array
+        _rewrite_operand(node.args.get("expression")), array
     )
     return sqlglot.parse_one(
         f"ARRAY_POSITION({_sql(array)}, {_sql(value)}) - 1",
@@ -502,8 +539,8 @@ def _rewrite_array_position(node: exp.Expression) -> exp.Expression:
 
 def _rewrite_array_prepend(node: exp.Expression) -> exp.Expression:
     """sqlglot's ``LIST_PREPEND`` does not bind in DuckDB; build it from ``LIST_CONCAT``."""
-    array = _array_list(_rewrite_json_array_functions(node.args.get("expression")))
-    value = _encoded_element(_rewrite_json_array_functions(node.this), array)
+    array = _array_list(_rewrite_operand(node.args.get("expression")))
+    value = _encoded_element(_rewrite_operand(node.this), array)
     return sqlglot.parse_one(
         f"LIST_CONCAT([{_sql(value)}], {_sql(array)})", read=WRITE_DIALECT
     )
@@ -513,7 +550,7 @@ def _rewrite_array_unique(node: exp.Expression) -> exp.Expression:
     """DuckDB's ``array_unique`` returns a *count*; Snowflake's returns the distinct array."""
     if len(node.expressions) != 1:
         raise TranslationError("ARRAY_UNIQUE takes a single array argument.")
-    array = _array_list(_rewrite_json_array_functions(node.expressions[0]))
+    array = _array_list(_rewrite_operand(node.expressions[0]))
     return exp.func("list_distinct", array)
 
 
@@ -537,6 +574,13 @@ def _encoded_array_elements(node: exp.Expression, kind: str) -> exp.Expression:
     on the representation a JSON array holds (and leaves a JSON or VARIANT element as its JSON
     form), while ``_variant_element`` lands it on a normalized VARIANT.
     """
+    if isinstance(node, exp.Array) and not node.expressions:
+        # An empty native list carries no element type, so a lambda over it cannot bind
+        # (``Invalid LIST argument during lambda function binding``). Nothing needs encoding.
+        return sqlglot.parse_one(
+            f"CAST([] AS {'JSON[]' if kind == 'json' else 'VARIANT[]'})",
+            read=WRITE_DIALECT,
+        )
     if kind == "json":
         return sqlglot.parse_one(
             f"LIST_TRANSFORM({_sql(node)}, _sfemu_element -> "
@@ -571,69 +615,34 @@ def _coerced_array_pair(
     return left, right
 
 
-def _multiset_except_sql(left: str, right: str) -> str:
-    """``ARRAY_EXCEPT`` as Snowflake's multiset subtract: a value keeps ``N - M`` copies.
-
-    Snowflake removes as many copies of a value as the excluded array holds, not every copy
-    (``['a','b','b','b','c']`` except ``['b']`` keeps two ``b``s), so a plain
-    ``LIST_FILTER(... NOT LIST_CONTAINS(...))`` is wrong. A copy is kept when its occurrence
-    index (its rank among the equal elements of the source, counted from the front) is at
-    most ``N - M``; the rank is the length of the same-valued prefix, which is what the inner
-    ``LIST_FILTER`` over ``ARRAY_SLICE`` measures. Each operand is therefore named several
-    times, which a bound ``?`` operand does not survive -- the same limitation the other
-    rebuilt calls have.
-
-    The comparison is ``IS NOT DISTINCT FROM``, not ``=``, because the function is NULL-safe
-    and a JSON null element of a ``JSON[]`` *is* an SQL NULL to DuckDB: with ``=`` every
-    comparison against it is NULL, so the copy was never counted on either side and the
-    multiset arithmetic was wrong for a repeated null (``['a',null,null]`` except ``[null]``
-    kept none of them, where Snowflake keeps one).
-    """
-    rank = (
-        f"LENGTH(LIST_FILTER(ARRAY_SLICE({left}, 1, _sfemu_index), "
-        f"_sfemu_seen -> _sfemu_seen IS NOT DISTINCT FROM {left}[_sfemu_index]))"
-    )
-    budget = (
-        f"LENGTH(LIST_FILTER({left}, _sfemu_all -> "
-        f"_sfemu_all IS NOT DISTINCT FROM {left}[_sfemu_index])) "
-        f"- LENGTH(LIST_FILTER({right}, _sfemu_excluded -> "
-        f"_sfemu_excluded IS NOT DISTINCT FROM {left}[_sfemu_index]))"
-    )
-    return (
-        f"LIST_TRANSFORM(LIST_FILTER(RANGE(1, LENGTH({left}) + 1), "
-        f"_sfemu_index -> {rank} <= {budget}), "
-        f"_sfemu_index -> {left}[_sfemu_index])"
-    )
-
-
 def _rewrite_array_set_operation(node: exp.Expression) -> exp.Expression:
-    """``ARRAY_EXCEPT``/``ARRAYS_OVERLAP``: sqlglot's rendering does not bind a JSON[]/VARIANT[].
+    """``ARRAY_EXCEPT``/``ARRAYS_OVERLAP`` over a coerced operand pair.
 
-    A native pair keeps sqlglot's rendering (and with it the multiset semantics it models);
-    a JSON or VARIANT pair is rebuilt, where DuckDB has no equivalent for the ``&&`` operator
-    or the zip-based except -- ``_multiset_except_sql`` reproduces the multiset subtract. A
-    *mixed* pair -- one JSON/VARIANT operand and one native list -- is coerced element-wise
-    onto one kind first (see ``_coerced_array_pair``), because DuckDB compares a JSON or
-    VARIANT element against an ``INT`` or ``VARCHAR`` element as unequal.
+    A native pair keeps sqlglot's rendering, and with it the multiset semantics it models. A
+    JSON or VARIANT pair is first coerced onto one element kind (a native list is re-encoded
+    element-wise) and then rendered by sqlglot too: its zip-based multiset subtract binds a
+    ``JSON[]`` and a ``VARIANT[]`` -- checked for a repeated null, an empty operand and both
+    operands equal -- and gives the same answer as the rank-based form this used to build by
+    hand, which was correct but about 240x slower on a 500-element array. ``ARRAYS_OVERLAP``
+    uses DuckDB's own ``list_has_any``.
     """
-    left = _array_list(_rewrite_json_array_functions(node.this))
-    right = _array_list(_rewrite_json_array_functions(node.args.get("expression")))
-    left_kind, right_kind = _list_kind(left), _list_kind(right)
-    if left_kind == right_kind == "native":
+    left = _array_list(_rewrite_operand(node.this))
+    right = _array_list(_rewrite_operand(node.args.get("expression")))
+    if _list_kind(left) == "native" and _list_kind(right) == "native":
         return node
     left, right = _coerced_array_pair(left, right)
     if isinstance(node, exp.ArrayOverlaps):
         return exp.func("list_has_any", left, right)
-    return sqlglot.parse_one(
-        _multiset_except_sql(_sql(left), _sql(right)), read=WRITE_DIALECT
-    )
+    node.set("this", left)
+    node.set("expression", right)
+    return node
 
 
 def _rewrite_array_repeat(node: exp.Expression) -> exp.Expression:
     """``ARRAY_REPEAT`` has no DuckDB function; build it from ``RANGE`` and a transform."""
     if len(node.expressions) != 2:
         raise TranslationError("ARRAY_REPEAT takes a value and a count.")
-    value, count = (_rewrite_json_array_functions(argument) for argument in node.expressions)
+    value, count = (_rewrite_operand(argument) for argument in node.expressions)
     if _is_json_value(count) or _is_variant_value(count):
         # A count read out of a VARIANT (``j:count``) needs to be a number for RANGE.
         count = exp.cast(count, exp.DataType.build("INTEGER"), dialect=WRITE_DIALECT)
@@ -691,6 +700,39 @@ def _flatten_one_level(previous: str, kind: str, *, guarded: bool) -> str:
     return f"CASE WHEN {all_arrays} THEN {flattened} ELSE {previous} END"
 
 
+def _flatten_guarded_reduce(previous: str, kind: str, levels: int) -> str:
+    """Flatten up to `levels` levels of a JSON/VARIANT list with one ``LIST_REDUCE``.
+
+    Each level needs a guard ("is every element still an array?"), which names the list three
+    times. Applying that per level nested the previous level inside all three, so the SQL text
+    *tripled* per level: a depth of 10 produced 108 MB of SQL and took over five minutes to
+    translate, which one request could turn into a worker hang. Here the list is named twice --
+    as the reduce's initial value and once inside the list of one-per-step copies -- and the
+    per-level work is written against the reduce's accumulator, so the text grows by the reduce
+    skeleton only and the depth costs one ``FLATTEN`` per step at run time.
+    """
+    if kind == "variant":
+        element_type = "VARIANT[]"
+        predicate = "variant_typeof(_sfemu_outer) LIKE 'ARRAY%'"
+    else:
+        element_type = "JSON[]"
+        predicate = "json_type(_sfemu_outer) = 'ARRAY'"
+    # ``LENGTH`` rather than ``LIST_COUNT``: the latter skips NULL elements, so a list holding
+    # a null compared equal on both sides and was flattened anyway.
+    all_arrays = (
+        f"LENGTH(LIST_FILTER(acc, _sfemu_outer -> {predicate})) = LENGTH(acc)"
+    )
+    flattened = (
+        f"FLATTEN(LIST_TRANSFORM(acc, _sfemu_inner -> "
+        f"CAST(_sfemu_inner AS {element_type})))"
+    )
+    return (
+        f"LIST_REDUCE(LIST_TRANSFORM(RANGE(1, {levels} + 1), _sfemu_step -> {previous}), "
+        f"(acc, _sfemu_step) -> CASE WHEN {all_arrays} THEN {flattened} ELSE acc END, "
+        f"{previous})"
+    )
+
+
 def _rewrite_array_flatten(node: exp.Expression) -> exp.Expression:
     """``ARRAY_FLATTEN``: the documented one-argument form, plus the legacy constant depth.
 
@@ -699,13 +741,10 @@ def _rewrite_array_flatten(node: exp.Expression) -> exp.Expression:
     holds a NULL element. The emulator also accepts the older ``ARRAY_FLATTEN(array, depth)``
     form, which removes up to `depth` levels and stops when the elements are no longer arrays.
 
-    A computed depth is rejected. The documented signature has no depth argument, so there is no
-    behaviour to be faithful to, and DuckDB offers no recursive list flatten: the depth would
-    have to become one ``CASE`` branch per level, and a list-valued intermediate cannot be named
-    once inside a lambda (DuckDB cannot bind a nested lambda over ``lvl[1]``), so every branch
-    would repeat the whole previous expression.
+    A computed depth is rejected: the documented signature has no depth argument, so there is no
+    behaviour to be faithful to, and DuckDB has no recursive list flatten to lower it to.
     """
-    array = _array_list(_rewrite_json_array_functions(node.expressions[0]))
+    array = _array_list(_rewrite_operand(node.expressions[0]))
     kind, sql = _array_kind(array), _sql(array)
     if len(node.expressions) == 1:
         # The documented form: one level, an error for a non-ARRAY element, NULL for a NULL
@@ -732,9 +771,11 @@ def _rewrite_array_flatten(node: exp.Expression) -> exp.Expression:
         raise TranslationError(
             f"ARRAY_FLATTEN depth must be between 1 and {_ARRAY_FLATTEN_MAX_DEPTH}."
         )
-    for _ in range(levels):
-        sql = _flatten_one_level(sql, kind, guarded=True)
-    return sqlglot.parse_one(sql, read=WRITE_DIALECT)
+    if kind == "native":
+        for _ in range(levels):
+            sql = _flatten_one_level(sql, kind, guarded=True)
+        return sqlglot.parse_one(sql, read=WRITE_DIALECT)
+    return sqlglot.parse_one(_flatten_guarded_reduce(sql, kind, levels), read=WRITE_DIALECT)
 
 
 def _rewrite_array_to_string(node: exp.Expression) -> exp.Expression:
@@ -747,11 +788,13 @@ def _rewrite_array_to_string(node: exp.Expression) -> exp.Expression:
     empty one where Snowflake returns NULL for a NULL argument, so the separator is checked the
     way sqlglot's own rendering checks it.
     """
-    array = _array_list(_rewrite_json_array_functions(node.this))
+    array = _array_list(_rewrite_operand(node.this))
     known = {"this", "expression", "null_is_empty", "null_delim_is_null"}
     if set(node.args) - known:
         return node
-    separator = _sql(node.args.get("expression"), chr(39) + ',' + chr(39))
+    separator_node = node.args.get("expression")
+    positional = isinstance(separator_node, exp.Placeholder) and separator_node.this is None
+    separator = _sql(separator_node, chr(39) + ',' + chr(39))
     if _is_variant_array_value(array):
         # VARIANT elements are already the values themselves, so sqlglot's ``CAST(x AS
         # TEXT)`` rendering returns their text; only the array needs a list form.
@@ -764,9 +807,14 @@ def _rewrite_array_to_string(node: exp.Expression) -> exp.Expression:
         )
     else:
         return node
+    if positional:
+        # A positional `?` may appear once, so the NULL check is dropped rather than repeating
+        # it: a NULL separator is then treated as an empty one, where Snowflake returns NULL.
+        # Repeating the placeholder instead would make one bind need two values, which broke
+        # `ARRAY_TO_STRING(j:n, ?)` that used to work.
+        return sqlglot.parse_one(rendered, read=WRITE_DIALECT)
     # The separator is named twice, exactly as sqlglot's own rendering of this call does, so a
-    # NULL separator still returns NULL; a positional `?` separator is therefore unsupported
-    # for either path, while a literal, a column or a named bind works.
+    # NULL separator still returns NULL; a literal, a column or a named bind works.
     return sqlglot.parse_one(
         f"CASE WHEN {separator} IS NULL THEN NULL ELSE {rendered} END",
         read=WRITE_DIALECT,
@@ -785,7 +833,7 @@ def _coerce_array_operands(node: exp.Expression) -> exp.Expression:
     else:
         operands = list(node.args.get("expressions") or [])
     converted = [
-        _array_list(_rewrite_json_array_functions(operand))
+        _array_list(_rewrite_operand(operand))
         if isinstance(operand, exp.Expression)
         else operand
         for operand in operands
@@ -813,7 +861,7 @@ def _rewrite_lambda_call(node: exp.Expression) -> exp.Expression:
     Snowflake does. A native list keeps its own element type, which is what Snowflake gives a
     structured-array lambda too.
     """
-    array = _array_list(_rewrite_json_array_functions(node.this))
+    array = _array_list(_rewrite_operand(node.this))
     if _is_json_array_value(array):
         array = _encoded_array_elements(array, "variant")
     node.set("this", array)
@@ -836,24 +884,24 @@ def _cast_array_operands(node: exp.Expression) -> exp.Expression:
     if isinstance(node, exp.ArrayAgg):
         # The argument is a value to aggregate, not an array to index into: only a JSON
         # value is cast, so it aggregates as one element the way Snowflake does.
-        node.set("this", _json_list(_rewrite_json_array_functions(node.this)))
+        node.set("this", _json_list(_rewrite_operand(node.this)))
         return node
     array = None
     if isinstance(node.this, exp.Expression):
-        array = _array_list(_rewrite_json_array_functions(node.this))
+        array = _array_list(_rewrite_operand(node.this))
         node.set("this", array)
     if isinstance(node, _ARRAY_VALUE_FUNCTIONS):
         value = node.args.get("expression")
         if isinstance(value, exp.Expression):
             node.set(
                 "expression",
-                _encoded_element(_rewrite_json_array_functions(value), array),
+                _encoded_element(_rewrite_operand(value), array),
             )
     if node.args.get("expressions"):
         node.set(
             "expressions",
             [
-                _array_list(_rewrite_json_array_functions(e))
+                _array_list(_rewrite_operand(e))
                 if isinstance(e, exp.Expression)
                 else e
                 for e in node.args["expressions"]
@@ -910,6 +958,19 @@ def _rewrite_json_array_function(node: exp.Expression) -> exp.Expression:
     return node
 
 
+def _rewrite_operand(node: exp.Expression | None) -> exp.Expression | None:
+    """Rewrite an operand with the resolver still in scope.
+
+    A rebuild needs its operands in their final form before it serializes them, so it re-enters
+    the pass on that subtree. The re-entry must carry the column-type resolver: entering with
+    the default ``None`` made a nested call treat a bare native-list column as an unknown
+    VARIANT, so ``ARRAY_SORT(ARRAY_UNIQUE(n))`` was rejected while ``ARRAY_SORT(n)`` worked.
+    """
+    if node is None:
+        return None
+    return _rewrite_json_array_functions(node, _column_types.get())
+
+
 def _rewrite_json_array_functions(
     statement: exp.Expression, column_types: ColumnTypeResolver | None = None
 ) -> exp.Expression:
@@ -935,7 +996,21 @@ def _rewrite_json_array_functions(
             alias.replace(exp.ArraySlice(this=array, start=start, end=end, zero_based=True))
 
     root = statement
+    scoped = _scoped_names.get() | {
+        name.upper()
+        for name in (
+            *[alias.alias for alias in statement.find_all(exp.Alias) if alias.alias],
+            *[cte.alias for cte in statement.find_all(exp.CTE) if cte.alias],
+            *[
+                table.alias
+                for table in statement.find_all(exp.Table)
+                if table.alias
+            ],
+        )
+        if name
+    }
     token = _column_types.set(column_types)
+    scoped_token = _scoped_names.set(frozenset(scoped))
     try:
         for node in list(statement.find_all(*_JSON_ARRAY_FUNCTIONS, exp.Anonymous)):
             if node.parent is None and node is not root:
@@ -951,5 +1026,6 @@ def _rewrite_json_array_functions(
             else:
                 root = replacement
     finally:
+        _scoped_names.reset(scoped_token)
         _column_types.reset(token)
     return root
