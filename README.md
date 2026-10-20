@@ -162,7 +162,7 @@ Snowflake's array functions work over a native array, one the emulator stores as
 `ARRAY_COMPACT`, `ARRAY_DISTINCT`, `ARRAY_EXCEPT`, `ARRAY_INSERT`, `ARRAY_INTERSECTION`,
 `ARRAY_POSITION`, `ARRAY_PREPEND`, `ARRAY_REMOVE`, `ARRAY_REMOVE_AT`, `ARRAY_REPEAT`,
 `ARRAY_TO_STRING`, `ARRAY_UNIQUE`, `ARRAYS_OVERLAP`, `ARRAY_AGG`,
-`ARRAY_FLATTEN(arr, depth)` and the `FILTER`/`TRANSFORM`/`REDUCE` lambdas — a JSON array
+`ARRAY_FLATTEN(arr)` and the `FILTER`/`TRANSFORM`/`REDUCE` lambdas — a JSON array
 is cast to DuckDB's `JSON[]`, a VARIANT array to `VARIANT[]`, and a searched value is
 encoded as a VARIANT so both sides compare the way Snowflake compares them (the string
 `'1'` is not the number `1`).
@@ -197,7 +197,9 @@ Not translated, and left as a loud error rather than a guess:
   named in more than one sub-expression by the rebuilt call, so it would need several values;
   bind it as a named parameter (`:arr`) or pass a column. An index bind is fine
   (`ARRAY_SLICE(arr, ?, ?)` names each index once);
-- `ARRAY_FLATTEN`, which needs a constant depth between 1 and 10.
+- `ARRAY_FLATTEN(arr, depth)` — the emulator's legacy depth form, where Snowflake's
+  documented signature is `ARRAY_FLATTEN(arr)` (one level). The depth must be a constant
+  between 1 and 10; a computed depth is rejected.
 
 A `FILTER`/`TRANSFORM`/`REDUCE` lambda over a JSON or VARIANT array receives a VARIANT
 element, as in Snowflake, so `FILTER(j:n, x -> x = 'a')` filters without an encoding helper

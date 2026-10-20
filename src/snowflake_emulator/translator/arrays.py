@@ -562,56 +562,97 @@ def _rewrite_array_repeat(node: exp.Expression) -> exp.Expression:
     )
 
 
-def _rewrite_array_flatten(node: exp.Expression) -> exp.Expression:
-    """``ARRAY_FLATTEN(arr, depth)`` -> one DuckDB ``FLATTEN`` per level.
+def _array_kind(node: exp.Expression | None) -> str:
+    """The element kind of a rewritten array operand: ``json``, ``variant`` or ``native``.
 
-    DuckDB cannot flatten a ``JSON[]`` whose elements are JSON arrays, so each level casts
-    the elements back to a list. A level whose elements are no longer arrays is left alone
-    for a JSON array (DuckDB's ``FLATTEN`` would raise, where Snowflake stops flattening);
-    a native list keeps DuckDB's own behaviour.
+    Unlike ``_list_kind`` this also recognises a rebuilt call -- an ``ARRAY_SLICE`` over a
+    VARIANT array, which is an ``array_slice`` expression rather than a ``CAST``.
     """
+    if _is_variant_array_value(node):
+        return "variant"
+    if _is_json_array_value(node):
+        return "json"
+    return "native"
+
+
+def _flatten_one_level(previous: str, kind: str, *, guarded: bool) -> str:
+    """One ``FLATTEN`` level of `previous`, a SQL expression of list kind `kind`.
+
+    DuckDB cannot flatten a ``JSON[]`` whose elements are JSON arrays, so a JSON or VARIANT
+    level casts the elements back to a list; a native list keeps DuckDB's own call.
+
+    `guarded` leaves a level alone when its elements are no longer arrays: casting a scalar
+    element to a list would raise, and the legacy depth form means "flatten at most this many
+    levels", so a depth past the nesting stops instead of raising. An unguarded level is the
+    documented one-argument form, where a non-ARRAY element is an error -- which is what
+    DuckDB's own ``FLATTEN`` raises anyway.
+    """
+    if kind == "variant":
+        # A VARIANT[] whose elements are VARIANT arrays -- including an ``ARRAY_SLICE`` over
+        # one, which is an ``array_slice`` call rather than a ``CAST``.
+        element_type, predicate = "VARIANT[]", "variant_typeof(_sfemu_outer) LIKE 'ARRAY%'"
+    elif kind == "json":
+        element_type, predicate = "JSON[]", "json_type(_sfemu_outer) = 'ARRAY'"
+    else:
+        return f"FLATTEN({previous})"
+    flattened = (
+        f"FLATTEN(LIST_TRANSFORM({previous}, _sfemu_inner -> "
+        f"CAST(_sfemu_inner AS {element_type})))"
+    )
+    if not guarded:
+        return flattened
+    # ``LENGTH`` rather than ``LIST_COUNT``: the latter skips NULL elements, so a list holding
+    # a null compared equal on both sides and was flattened anyway.
+    all_arrays = (
+        f"LENGTH(LIST_FILTER({previous}, _sfemu_outer -> {predicate})) "
+        f"= LENGTH({previous})"
+    )
+    return f"CASE WHEN {all_arrays} THEN {flattened} ELSE {previous} END"
+
+
+def _rewrite_array_flatten(node: exp.Expression) -> exp.Expression:
+    """``ARRAY_FLATTEN``: the documented one-argument form, plus the legacy constant depth.
+
+    Snowflake's current signature is ``ARRAY_FLATTEN(array)``: it removes one level of nesting,
+    reports an error when an element is not an ARRAY, and returns NULL when the array is NULL or
+    holds a NULL element. The emulator also accepts the older ``ARRAY_FLATTEN(array, depth)``
+    form, which removes up to `depth` levels and stops when the elements are no longer arrays.
+
+    A computed depth is rejected. The documented signature has no depth argument, so there is no
+    behaviour to be faithful to, and DuckDB offers no recursive list flatten: the depth would
+    have to become one ``CASE`` branch per level, and a list-valued intermediate cannot be named
+    once inside a lambda (DuckDB cannot bind a nested lambda over ``lvl[1]``), so every branch
+    would repeat the whole previous expression.
+    """
+    array = _array_list(_rewrite_json_array_functions(node.expressions[0]))
+    kind, sql = _array_kind(array), _sql(array)
+    if len(node.expressions) == 1:
+        # The documented form: one level, an error for a non-ARRAY element, NULL for a NULL
+        # array or a NULL element.
+        return sqlglot.parse_one(
+            f"CASE WHEN {sql} IS NULL OR LENGTH(LIST_FILTER({sql}, "
+            f"_sfemu_outer -> _sfemu_outer IS NULL)) > 0 THEN NULL "
+            f"ELSE {_flatten_one_level(sql, kind, guarded=False)} END",
+            read=WRITE_DIALECT,
+        )
     if len(node.expressions) != 2:
-        raise TranslationError("ARRAY_FLATTEN takes an array and a depth.")
-    array, depth = node.expressions
+        raise TranslationError(
+            "ARRAY_FLATTEN takes an array, and optionally a constant depth."
+        )
+    depth = node.expressions[1]
     if not (isinstance(depth, exp.Literal) and not depth.is_string and depth.name.isdigit()):
-        raise TranslationError("ARRAY_FLATTEN needs a constant depth.")
+        raise TranslationError(
+            "ARRAY_FLATTEN with a computed depth is not supported by the emulator; "
+            "Snowflake's documented form is ARRAY_FLATTEN(array), which removes one level of "
+            "nesting."
+        )
     levels = int(depth.name)
     if not 1 <= levels <= _ARRAY_FLATTEN_MAX_DEPTH:
         raise TranslationError(
             f"ARRAY_FLATTEN depth must be between 1 and {_ARRAY_FLATTEN_MAX_DEPTH}."
         )
-    array = _array_list(_rewrite_json_array_functions(array))
-    sql = _sql(array)
     for _ in range(levels):
-        if _is_variant_array_value(array):
-            # A VARIANT[] whose elements are VARIANT arrays -- including an ``ARRAY_SLICE``
-            # over one, which is an ``array_slice`` call rather than a ``CAST`` -- casts each
-            # element back to VARIANT[] a level at a time. A level whose elements are no
-            # longer arrays is left alone, where Snowflake simply stops flattening.
-            all_arrays = (
-                f"LIST_COUNT(LIST_FILTER({sql}, _sfemu_outer -> "
-                f"variant_typeof(_sfemu_outer) LIKE 'ARRAY%')) = LIST_COUNT({sql})"
-            )
-            flattened = (
-                f"FLATTEN(LIST_TRANSFORM({sql}, "
-                f"_sfemu_inner -> CAST(_sfemu_inner AS VARIANT[])))"
-            )
-            sql = f"CASE WHEN {all_arrays} THEN {flattened} ELSE {sql} END"
-            continue
-        if not _is_json_list(array):
-            sql = f"FLATTEN({sql})"
-            continue
-        # Only flatten a level whose elements are still arrays: casting a scalar element to
-        # a list would raise, where Snowflake simply stops flattening (the depth is past the
-        # nesting).
-        all_arrays = (
-            f"LIST_COUNT(LIST_FILTER({sql}, _sfemu_outer -> "
-            f"json_type(_sfemu_outer) = 'ARRAY')) = LIST_COUNT({sql})"
-        )
-        flattened = (
-            f"FLATTEN(LIST_TRANSFORM({sql}, _sfemu_inner -> CAST(_sfemu_inner AS JSON[])))"
-        )
-        sql = f"CASE WHEN {all_arrays} THEN {flattened} ELSE {sql} END"
+        sql = _flatten_one_level(sql, kind, guarded=True)
     return sqlglot.parse_one(sql, read=WRITE_DIALECT)
 
 

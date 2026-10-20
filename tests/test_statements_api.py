@@ -371,12 +371,66 @@ def test_other_array_functions_over_variant_arrays(client):
 
 
 def test_array_flatten_requires_a_literal_depth(client):
+    """The legacy two-argument form needs a constant depth; a computed one names the 1-arg form."""
     resp = client.post(
         "/api/v2/statements",
         json={"statement": "SELECT ARRAY_FLATTEN(ARRAY_CONSTRUCT(1), j) FROM arr_t"},
     )
     assert resp.status_code == 422
     assert "ARRAY_FLATTEN" in resp.json()["detail"]["message"]
+    assert "ARRAY_FLATTEN(array)" in resp.json()["detail"]["message"]
+
+
+def test_array_flatten_one_argument_form(client):
+    """Snowflake's documented ``ARRAY_FLATTEN(array)``: one level, strict about elements.
+
+    The docs give no depth argument: the function removes one level of nesting, reports an
+    error when an element is not an ARRAY, and returns NULL for a NULL array or a NULL element.
+    The two-argument form is the emulator's legacy extension and stops at the nesting instead.
+    """
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post("CREATE TABLE flat_src (j VARIANT, v VARIANT)").status_code == 200
+    assert (
+        post(
+            "INSERT INTO flat_src SELECT PARSE_JSON('{\"deep\":[[1,2],[3]],"
+            "\"deeper\":[[[1,2]],[[3]]],\"scalar\":[1,2,3],"
+            "\"withnull\":[[1],null]}'), "
+            "ARRAY_CONSTRUCT(ARRAY_CONSTRUCT(1,2), ARRAY_CONSTRUCT(3))"
+        ).status_code
+        == 200
+    )
+
+    # One level, over a native list, a JSON path and a VARIANT column.
+    assert data("SELECT ARRAY_FLATTEN([[1,2],[3]])") == [[[1, 2, 3]]]
+    assert data("SELECT ARRAY_FLATTEN(j:deep) FROM flat_src") == [[[1, 2, 3]]]
+    assert data("SELECT ARRAY_FLATTEN(j:deeper) FROM flat_src") == [[[[1, 2], [3]]]]
+    assert data("SELECT ARRAY_FLATTEN(v) FROM flat_src") == [[[1, 2, 3]]]
+
+    # The legacy depth form still stops at the nesting.
+    assert data("SELECT ARRAY_FLATTEN(j:deeper, 2) FROM flat_src") == [[[1, 2, 3]]]
+    assert data("SELECT ARRAY_FLATTEN(j:scalar, 2) FROM flat_src") == [[[1, 2, 3]]]
+
+    # A non-ARRAY element is an error, not a silent no-op.
+    resp = post("SELECT ARRAY_FLATTEN(j:scalar) FROM flat_src")
+    assert resp.status_code == 422, resp.json()
+    assert "ARRAY" in resp.json()["detail"]["message"]
+
+    # A NULL array, and an array holding a NULL element, return NULL.
+    assert data("SELECT ARRAY_FLATTEN(NULL)") == [[None]]
+    assert data("SELECT ARRAY_FLATTEN(j:withnull) FROM flat_src") == [[None]]
+
+    # A depth outside 1..10 stays a loud error.
+    for depth in (0, 11):
+        resp = post(f"SELECT ARRAY_FLATTEN(j:deep, {depth}) FROM flat_src")
+        assert resp.status_code == 422, resp.json()
+        assert "between 1 and 10" in resp.json()["detail"]["message"]
 
 
 def test_flatten_over_a_variant_column(client):
