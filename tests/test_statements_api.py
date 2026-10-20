@@ -1853,6 +1853,63 @@ def test_select_from_staged_json_strip_outer_array(client, tmp_path):
     assert selected["data"] == [[1], [2]]
 
 
+def test_hash_agg_and_ratio_to_report(client):
+    """``HASH_AGG`` keeps its documented contract and ``RATIO_TO_REPORT`` divides by the sum.
+
+    DuckDB has neither function. ``HASH_AGG`` is a ``SUM(HASH(...))`` folded into a signed
+    64-bit value: order-independent, duplicates count, NULLs count, never NULL, and empty
+    input hashes to 0. ``RATIO_TO_REPORT`` is the row's value over its partition's sum, with
+    an ORDER BY inside OVER ignored and a zero partition sum yielding NULL.
+    """
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post("CREATE TABLE hagg (g INT, x INT)").status_code == 200
+    assert post("INSERT INTO hagg VALUES (1, 10), (1, 20), (1, NULL)").status_code == 200
+
+    hashed = data("SELECT HASH_AGG(x) FROM hagg")[0][0]
+    assert isinstance(hashed, int)
+    # Deterministic and order-independent.
+    assert data("SELECT HASH_AGG(x) FROM (SELECT x FROM hagg ORDER BY x DESC)")[0][0] == hashed
+    # Empty input hashes to 0, never NULL; a NULL-only group still hashes.
+    assert data("SELECT HASH_AGG(x) FROM hagg WHERE FALSE") == [[0]]
+    assert data("SELECT HASH_AGG(x) FROM hagg WHERE x IS NULL")[0][0] != 0
+    # Duplicates and multiple arguments are part of the fingerprint.
+    assert data("SELECT HASH_AGG(g, x) FROM hagg")[0][0] != hashed
+    assert post("SELECT HASH_AGG(*) FROM hagg").status_code == 422
+    resp = post("SELECT HASH_AGG(x) OVER (PARTITION BY g) FROM hagg")
+    assert resp.status_code == 422
+    assert "window function" in resp.json()["detail"]["message"]
+
+    assert post("CREATE TABLE ratio (g INT, v INT)").status_code == 200
+    assert post("INSERT INTO ratio VALUES (1, 1), (1, 3), (2, 5), (2, 5)").status_code == 200
+    assert data(
+        "SELECT g, v, RATIO_TO_REPORT(v) OVER (PARTITION BY g) AS r "
+        "FROM ratio ORDER BY g, v"
+    ) == [[1, 1, 0.25], [1, 3, 0.75], [2, 5, 0.5], [2, 5, 0.5]]
+    # ORDER BY inside OVER does not change the calculation.
+    assert data(
+        "SELECT g, v, RATIO_TO_REPORT(v) OVER (PARTITION BY g ORDER BY v) AS r "
+        "FROM ratio ORDER BY g, v"
+    ) == [[1, 1, 0.25], [1, 3, 0.75], [2, 5, 0.5], [2, 5, 0.5]]
+    # Without PARTITION BY the sum spans the whole result.
+    whole = data("SELECT RATIO_TO_REPORT(v) OVER () FROM ratio ORDER BY v")
+    assert abs(whole[0][0] - 1 / 14) < 1e-12
+
+    # A partition that sums to zero yields NULL instead of a division error.
+    assert post("CREATE TABLE zero_sum (g INT, v INT)").status_code == 200
+    assert post("INSERT INTO zero_sum VALUES (1, 0), (1, 0)").status_code == 200
+    assert data("SELECT RATIO_TO_REPORT(v) OVER (PARTITION BY g) FROM zero_sum") == [
+        [None],
+        [None],
+    ]
+
+
 def test_copy_json_array_document_is_one_record_without_strip(client, tmp_path):
     """Both JSON readers agree: without STRIP_OUTER_ARRAY an array document is one record.
 

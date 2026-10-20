@@ -213,6 +213,12 @@ UBIGINT`), and a VARIANT *value* searched in a JSON array (`ARRAY_CONTAINS`, `AR
 `ARRAY_REMOVE` removes the value rather than every NULL element (a NULL element survives; a NULL
 value returns NULL, as documented).
 
+`HASH_AGG(...)` is a `SUM(HASH(...))` folded into a signed 64-bit value: order-independent,
+deterministic, influenced by NULLs and duplicates, `0` for an empty input, and never NULL. It is
+a `GROUP BY` aggregate here — the window form and `HASH_AGG(*)` are rejected rather than
+guessed. `RATIO_TO_REPORT(x) OVER (PARTITION BY ...)` is `x / SUM(x) OVER (...)`: an `ORDER BY`
+inside `OVER` is ignored as Snowflake documents, and a partition that sums to zero yields NULL.
+
 `ARRAY_TO_STRING(array, separator)` is the documented two-argument form: a NULL element becomes
 an empty string, a NULL separator returns NULL, and a third argument is rejected (sqlglot would
 drop it silently) rather than answered differently. A `?` separator is supported too; because

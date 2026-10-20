@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from sqlglot import exp
 
+from snowflake_emulator.translator.aggregates import _rewrite_aggregate_functions
 from snowflake_emulator.translator.arrays import (
     ColumnTypeResolver,
     _rewrite_json_array_functions,
@@ -29,6 +30,7 @@ def _apply_transforms(
     statement = statement.transform(_uppercase_unquoted_identifiers)
     statement = statement.transform(_rewrite_information_schema)
     statement = statement.transform(_rewrite_snowflake_specifics)
+    statement = statement.transform(_rewrite_aggregate_functions)
     # After the rewrites above: an array call is rebuilt from its operands' SQL, so
     # those operands must already be in their final DuckDB form.
     return _rewrite_json_array_functions(statement, column_types)
