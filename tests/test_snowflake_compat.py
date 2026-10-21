@@ -459,6 +459,42 @@ def test_regexp_substr_extract_and_null_semantics(client):
     assert rejected.status_code == 422
     assert "positive integer" in rejected.json()["detail"]["message"]
 
+    # A UDF body is translated through the same pipeline, and a body that is *only* the call
+    # is the transform's root node -- where replace() has no parent to rewrite, so the body
+    # silently kept group 0 until the root case was handled.
+    created = _post(
+        client,
+        "CREATE OR REPLACE FUNCTION first_group(s VARCHAR, p VARCHAR) RETURNS VARCHAR "
+        "AS $$REGEXP_SUBSTR(s, p, 1, 1, 'e')$$",
+    )
+    assert created.status_code == 200, created.json()
+    assert data("""SELECT first_group('k="v1"', '"([^"]*)"') AS r""") == [["v1"]]
+
+
+def test_the_regexp_rewrite_is_idempotent():
+    """Applying the transform twice must not wrap the call in another CASE.
+
+    The rebuilt expression contains a ``regexp_extract`` node, which is the same node type the
+    rewrite matches; without the marker each pass grew the SQL (256 -> 390 chars on a two-call
+    statement), so a retry or any future double application would inflate every statement.
+    """
+    import sqlglot
+
+    from snowflake_emulator.translator.constants import READ_DIALECT
+    from snowflake_emulator.translator.transforms import _apply_transforms
+
+    sql = (
+        """SELECT REGEXP_SUBSTR('k="v1"', '"([^"]*)"', 1, 1, 'e') AS a,"""
+        """ REGEXP_SUBSTR('abc', '(b)', 1, 2, 'e') AS b"""
+    )
+    once = _apply_transforms(sqlglot.parse_one(sql, read=READ_DIALECT)).sql(
+        dialect=READ_DIALECT
+    )
+    twice = _apply_transforms(
+        _apply_transforms(sqlglot.parse_one(sql, read=READ_DIALECT))
+    ).sql(dialect=READ_DIALECT)
+    assert once == twice
+
 
 def test_backslash_escapes_stay_literal_in_string_literals(client):
     """sqlglot >= 30.21 decodes backslash escapes inside Snowflake string literals.

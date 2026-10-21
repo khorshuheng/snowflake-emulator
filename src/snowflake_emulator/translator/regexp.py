@@ -9,6 +9,11 @@ Snowflake in three ways this module restores:
 * a pattern with no group under ``e`` "behaves as if e was not set" (the whole match), while
   DuckDB raises for a group that the pattern does not have;
 * no match is NULL, where DuckDB's ``regexp_extract`` answers an empty string.
+
+Known limits: a *non-literal* pattern under ``e`` is assumed to contain a group (the documented
+default), so a group-less runtime pattern answers an empty string for the first occurrence and
+DuckDB's "Pattern has 0 groups" error for a later one; and named groups (``(?<name>...)``) and
+lookarounds are PCRE constructs that DuckDB's RE2 engine rejects.
 """
 
 from __future__ import annotations
@@ -22,6 +27,11 @@ from snowflake_emulator.translator.errors import TranslationError
 # Constructs whose "(" does not open a capturing group. ``(?<name>`` is capturing, so the two
 # lookbehind forms are matched exactly rather than by the ``(?<`` prefix.
 _NON_CAPTURING = ("(?:", "(?=", "(?!", "(?<=", "(?<!", "(?i", "(?m", "(?s", "(?c")
+
+# Marks the ``regexp_extract`` nodes this module builds, so a second pass over the same tree
+# (a retry, or a caller that reapplies the transform) leaves them alone. Without it each pass
+# wrapped the previous result in another CASE and the SQL kept growing.
+_REWRITTEN = "sfemu_regexp_rewritten"
 
 
 def _has_capturing_group(pattern: str) -> bool:
@@ -69,6 +79,8 @@ def _positive(node: exp.Expression | None, name: str, default: str) -> str:
 
 def _rewrite_regexp_substr(node: exp.Expression) -> exp.Expression:
     """Rewrite one ``REGEXP_SUBSTR`` call into an explicit group- and NULL-aware form."""
+    if node.meta.get(_REWRITTEN):
+        return node
     subject, pattern = node.this, node.args.get("expression")
     if not isinstance(subject, exp.Expression) or not isinstance(pattern, exp.Expression):
         return node
@@ -125,7 +137,10 @@ def _rewrite_regexp_substr(node: exp.Expression) -> exp.Expression:
             f"CASE WHEN LENGTH({matches}) >= {occurrence} "
             f"THEN LIST_EXTRACT({matches}, {occurrence}) ELSE NULL END"
         )
-    return sqlglot.parse_one(rendered, read=WRITE_DIALECT)
+    rewritten = sqlglot.parse_one(rendered, read=WRITE_DIALECT)
+    for inner in rewritten.find_all(exp.RegexpExtract):
+        inner.meta[_REWRITTEN] = True
+    return rewritten
 
 
 def _rewrite_regexp_functions(statement: exp.Expression) -> exp.Expression:
@@ -134,9 +149,17 @@ def _rewrite_regexp_functions(statement: exp.Expression) -> exp.Expression:
     Innermost first: a rebuild serializes its subject and pattern, so a nested call has to be in
     its final form before the enclosing one reads it. Replacing in place keeps the parent's
     pointer current, and processing children first means no node is detached before its turn.
+    The expression itself can be the call -- a bare-expression UDF body, or a statement that is
+    just a function call -- and ``replace`` has no parent to rewrite there, so the root is
+    returned instead (``replace`` on a parentless node silently does nothing).
     """
+    root = statement
     for node in reversed(list(statement.find_all(exp.RegexpExtract))):
         replacement = _rewrite_regexp_substr(node)
-        if replacement is not node:
+        if replacement is node:
+            continue
+        if node is root:
+            root = replacement
+        else:
             node.replace(replacement)
-    return statement
+    return root
