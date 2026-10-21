@@ -184,13 +184,67 @@ def _duckdb_type_text(declared_type: str | None) -> str | None:
         return None
 
 
-_TEXT_TYPE_PREFIXES = ("VARCHAR", "CHAR", "TEXT", "STRING", "BPCHAR")
+_TEXT_TYPE_NAMES = frozenset(
+    {
+        exp.DataType.Type.CHAR,
+        exp.DataType.Type.NCHAR,
+        exp.DataType.Type.NVARCHAR,
+        exp.DataType.Type.TEXT,
+        exp.DataType.Type.VARCHAR,
+        exp.DataType.Type.BPCHAR,
+    }
+)
 
 
 def _is_text_type(duckdb_type: str | None) -> bool:
-    """True for a DuckDB type whose Snowflake parameter holds text."""
-    return duckdb_type is not None and duckdb_type.strip().upper().startswith(
-        _TEXT_TYPE_PREFIXES
+    """True for a scalar DuckDB text type (not ``VARCHAR[]`` or another list)."""
+    if duckdb_type is None:
+        return False
+    try:
+        kind = exp.DataType.build(duckdb_type, dialect=WRITE_DIALECT)
+    except Exception:  # noqa: BLE001 - an unusable spelling is not coerced
+        return False
+    return (
+        isinstance(kind, exp.DataType)
+        and kind.this in _TEXT_TYPE_NAMES
+        and not kind.expressions
+    )
+
+
+def _timestamp_text(value: exp.Expression, *, with_timezone: bool) -> exp.Expression:
+    """Render a timestamp with Snowflake's default ``FF3`` / ``TZHTZM`` text format."""
+    formatted = exp.Anonymous(
+        this="strftime",
+        expressions=[value, exp.Literal.string("%Y-%m-%d %H:%M:%S.%g")],
+    )
+    if not with_timezone:
+        return formatted
+    zone = exp.Anonymous(
+        this="strftime",
+        expressions=[value.copy(), exp.Literal.string("%z")],
+    )
+    # DuckDB omits the minutes for a whole-hour offset (``+08``); Snowflake always writes
+    # ``HHMM``. A non-whole-hour offset already carries its minutes (``+05:30``).
+    whole_hour = exp.EQ(
+        this=exp.Length(this=zone.copy()), expression=exp.Literal.number(3)
+    )
+    offset = exp.Case(
+        ifs=[
+            exp.If(
+                this=whole_hour,
+                true=exp.DPipe(
+                    this=zone.copy(), expression=exp.Literal.string("00")
+                ),
+            )
+        ],
+        default=exp.Anonymous(
+            this="replace",
+            expressions=[zone.copy(), exp.Literal.string(":"), exp.Literal.string("")],
+        ),
+    )
+    return exp.DPipe(
+        this=formatted,
+        expression=exp.DPipe(this=exp.Literal.string(" "), expression=offset),
     )
 
 
@@ -235,9 +289,30 @@ def _text_parameter_coercion(
             )
         return exp.cast(value, kind, dialect=WRITE_DIALECT)
 
+    def timestamp_cast(*, with_timezone: bool) -> exp.Expression:
+        value = exp.cast(
+            node.copy(),
+            exp.DataType.build(
+                "TIMESTAMPTZ" if with_timezone else "TIMESTAMP", dialect=WRITE_DIALECT
+            ),
+            dialect=WRITE_DIALECT,
+        )
+        return exp.cast(
+            _timestamp_text(value, with_timezone=with_timezone),
+            kind,
+            dialect=WRITE_DIALECT,
+        )
+
     return exp.Case(
         ifs=[
-            exp.If(this=any_type("TIMESTAMP%", exact=False), true=text_cast("TIMESTAMP")),
+            exp.If(
+                this=any_type("TIMESTAMP%TIME ZONE%", exact=False),
+                true=timestamp_cast(with_timezone=True),
+            ),
+            exp.If(
+                this=any_type("TIMESTAMP%", exact=False),
+                true=timestamp_cast(with_timezone=False),
+            ),
             exp.If(this=any_type("DATE", exact=True), true=text_cast("DATE")),
         ],
         default=text_cast(None),

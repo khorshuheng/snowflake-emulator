@@ -332,7 +332,33 @@ def test_udf_text_parameters_unify_the_call_temporal_types(client):
     assert _data(
         client,
         "SELECT date_args_text(DATE '2026-09-30', TIMESTAMP '2026-09-30 00:00:00')",
-    ) == [["2026-09-30 00:00:00|2026-09-30 00:00:00"]]
+    ) == [["2026-09-30 00:00:00.000|2026-09-30 00:00:00.000"]]
+    # The common timestamp follows Snowflake's default FF3 text format.
+    assert _data(
+        client,
+        "SELECT date_args_text(DATE '2026-09-30', "
+        "TIMESTAMP '2026-09-30 12:34:56.123456')",
+    ) == [["2026-09-30 00:00:00.000|2026-09-30 12:34:56.123"]]
+    # A timezone-aware sibling keeps its offset in Snowflake's TZHTZM form.
+    assert _data(
+        client,
+        "SELECT date_args_text(DATE '2026-09-30', "
+        "TIMESTAMP_TZ '2026-09-30 00:00:00 UTC')",
+    ) == [["2026-09-30 00:00:00.000 +0000|2026-09-30 00:00:00.000 +0000"]]
+
+
+def test_udf_array_parameter_is_not_treated_as_text(client):
+    """An array parameter beside a temporal argument keeps its array type."""
+    resp = _post(
+        client,
+        "CREATE OR REPLACE FUNCTION arr_date(a VARCHAR[], b VARCHAR) RETURNS NUMBER "
+        "AS $$ ARRAY_SIZE(a) + LENGTH(b) $$",
+    )
+    assert resp.status_code == 200, resp.json()
+    assert _data(
+        client, "SELECT arr_date(ARRAY_CONSTRUCT('x','y'), DATE '2026-09-30')"
+    ) == [[12]]
+    assert _data(client, "SELECT arr_date(ARRAY_CONSTRUCT('x','y'), 'abc')") == [[5]]
 
 
 def test_dropping_one_overload_leaves_the_other_callable(client):
