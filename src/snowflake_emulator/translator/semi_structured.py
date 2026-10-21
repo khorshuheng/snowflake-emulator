@@ -12,6 +12,7 @@ from snowflake_emulator.translator import column_types
 from snowflake_emulator.translator.constants import (
     EMULATED_SNOWFLAKE_VERSION,
     WRITE_DIALECT,
+    _SIMPLE_IDENTIFIER_RE,
 )
 from snowflake_emulator.translator.errors import TranslationError
 
@@ -215,10 +216,75 @@ _TEXT_ARGUMENTS: dict[type, tuple[str, ...]] = {
 }
 
 
+def _select_arms(relation: exp.Expression) -> list[exp.Select]:
+    """The SELECTs whose columns a derived relation exposes (both sides of a UNION)."""
+    if isinstance(relation, exp.Select):
+        return [relation]
+    if isinstance(relation, exp.Union):
+        arms: list[exp.Select] = []
+        pending: list[exp.Expression] = [relation]
+        while pending:
+            node = pending.pop()
+            if isinstance(node, exp.Union):
+                pending.extend((node.this, node.expression))
+            elif isinstance(node, exp.Select):
+                arms.append(node)
+        return arms
+    return []
+
+
+def _projection_item(select: exp.Select, name: str) -> exp.Expression | None:
+    for item in select.expressions:
+        if item.alias_or_name and item.alias_or_name.upper() == name.upper():
+            return item
+    return None
+
+
+def _normalize_derived_union(
+    node: exp.Column, seen: frozenset[tuple[int, str]] = frozenset()
+) -> None:
+    """Make a derived UNION's mixed arms comparable as JSON when its column is used as text.
+
+    A UNION of text and JSON is resolved by DuckDB to JSON, and DuckDB then parses the text
+    arm (``"abc"`` -> ``Malformed JSON``). Snowflake keeps the text as a value, so the non-JSON
+    arms are wrapped in ``TO_JSON``. This is applied only when the column is consumed as text,
+    and the cast marker makes it idempotent.
+    """
+    relation = column_types.derived_relation(node)
+    if relation is None:
+        return
+    key = (id(relation), node.name.upper())
+    if key in seen:
+        return
+    seen = seen | {key}
+    for select in _select_arms(relation):
+        item = _projection_item(select, node.name)
+        if item is None:
+            continue
+        value = item.this if isinstance(item, exp.Alias) else item
+        if isinstance(value, exp.Column) and column_types.derived_relation(value) is not None:
+            _normalize_derived_union(value, seen)
+            continue
+        if _is_semi_structured_value(value):
+            continue
+        wrapped = exp.cast(
+            exp.func("to_json", value), exp.DataType.build("JSON"), dialect=WRITE_DIALECT
+        )
+        if isinstance(item, exp.Alias):
+            item.set("this", wrapped)
+        else:
+            select.set(
+                "expressions",
+                [wrapped if expression is item else expression for expression in select.expressions],
+            )
+
+
 def _text_operand(node: exp.Expression | None) -> exp.Expression | None:
     """Present a semi-structured value as the JSON text Snowflake coerces it to."""
     if node is None:
         return node
+    if isinstance(node, exp.Column):
+        _normalize_derived_union(node)
     if column_types.is_variant_typed(node):
         # ``->>`` on a VARIANT casts to VARCHAR first (its struct repr), so reach real JSON.
         node = exp.cast(node, exp.DataType.build("JSON"), dialect=WRITE_DIALECT)
@@ -372,6 +438,46 @@ def _insert_target_columns(
     return None, []
 
 
+def _expand_derived_star(select: exp.Select, columns: list[str]) -> bool:
+    """Expand ``SELECT *`` over a single derived relation so each target column is addressable.
+
+    The raw staged relation exposes its record as ``$1`` (and CSV/Parquet positional ``$n``
+    columns); ``SELECT *`` hides that name from the write coercion. Expanding the projection
+    to the relation's own column names keeps the same rows while letting the target types drive
+    the coercion.
+    """
+    if len(select.expressions) != 1 or not isinstance(select.expressions[0], exp.Star):
+        return False
+    if select.args.get("joins"):
+        return False
+    from_ = select.args.get("from_")
+    source = from_.this if isinstance(from_, exp.From) else None
+    if not isinstance(source, exp.Subquery):
+        return False
+    relation = source.this
+    arms = _select_arms(relation)
+    if not arms:
+        return False
+    names = [item.alias_or_name for item in arms[0].expressions]
+    if not names or any(not name or name == "*" for name in names):
+        return False
+    if len(names) != len(columns):
+        return False
+    alias = source.alias or None
+    select.set(
+        "expressions",
+        [
+            exp.column(
+                name,
+                table=alias,
+                quoted=not _SIMPLE_IDENTIFIER_RE.match(name),
+            )
+            for name in names
+        ],
+    )
+    return True
+
+
 def _coerce_insert_select(
     select: exp.Expression | None, table: exp.Table, columns: list[str]
 ) -> None:
@@ -380,7 +486,10 @@ def _coerce_insert_select(
         _coerce_insert_select(select.this, table, columns)
         _coerce_insert_select(select.expression, table, columns)
         return
-    if not isinstance(select, exp.Select) or len(select.expressions) != len(columns):
+    if not isinstance(select, exp.Select):
+        return
+    _expand_derived_star(select, columns)
+    if len(select.expressions) != len(columns):
         return
     rewritten: list[exp.Expression] = []
     for target, item in zip(columns, select.expressions):

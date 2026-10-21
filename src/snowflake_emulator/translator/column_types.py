@@ -32,13 +32,19 @@ _scoped: ContextVar[frozenset[str]] = ContextVar("scoped_names", default=frozens
 # table name, so its output columns are described separately below.
 _aliases: ContextVar[dict[str, str]] = ContextVar("table_aliases", default={})
 
-# ``(derived_alias, column) -> DuckDB type`` for a derived table or CTE. A query-scoped
-# relation has no catalog columns, but its projection still decides what a column holds: a
-# ``$1:name`` projection is JSON, and a projected VARIANT column stays VARIANT. Without this,
-# an ``UPDATE ... FROM (SELECT $1:name AS name ...) s WHERE t.name = s.name`` compared a
-# VARCHAR with a bare name the resolver could not type, and DuckDB raised ``Malformed JSON``.
-_derived: ContextVar[dict[tuple[str, str], str]] = ContextVar(
-    "derived_column_types", default={}
+# ``(column) -> (handled, DuckDB type)`` for a column qualified by a derived table/CTE in its
+# own lexical scope. The lookup is a callable rather than a flat ``(alias, column)`` map: an
+# alias can be reused by unrelated relations, so resolving it globally would let one scope's
+# projection type decide another scope's column. A query-scoped relation has no catalog
+# columns, but its projection still says what a column holds: a ``$1:name`` projection is
+# JSON, and a projected VARIANT column stays VARIANT.
+DerivedTypeResolver = Callable[[exp.Column], tuple[bool, str | None]]
+DerivedRelationResolver = Callable[[exp.Column], "exp.Expression | None"]
+_derived_resolver: ContextVar[DerivedTypeResolver | None] = ContextVar(
+    "derived_type_resolver", default=None
+)
+_derived_relation_resolver: ContextVar[DerivedRelationResolver | None] = ContextVar(
+    "derived_relation_resolver", default=None
 )
 
 
@@ -111,14 +117,32 @@ def reset_table_aliases(token: Token) -> None:
     _aliases.reset(token)
 
 
-def set_derived_column_types(types: dict[tuple[str, str], str]) -> Token:
-    """Publish the output column types of derived tables and CTEs for this pass."""
-    return _derived.set(types)
+def set_derived_resolver(resolver: DerivedTypeResolver | None) -> Token:
+    """Publish the scope-aware derived-column lookup for this pass."""
+    return _derived_resolver.set(resolver)
 
 
-def reset_derived_column_types(token: Token) -> None:
-    """Restore the derived-column map that was in scope before the setter."""
-    _derived.reset(token)
+def reset_derived_resolver(token: Token) -> None:
+    """Restore the derived-column lookup that was in scope before the setter."""
+    _derived_resolver.reset(token)
+
+
+def set_derived_relation_resolver(resolver: DerivedRelationResolver | None) -> Token:
+    """Publish the lookup for the derived relation a column reads from."""
+    return _derived_relation_resolver.set(resolver)
+
+
+def reset_derived_relation_resolver(token: Token) -> None:
+    """Restore the derived-relation lookup that was in scope before the setter."""
+    _derived_relation_resolver.reset(token)
+
+
+def derived_relation(node: exp.Expression | None) -> exp.Expression | None:
+    """The derived relation `node` reads from, when it resolves to one in its own scope."""
+    resolver = _derived_relation_resolver.get()
+    if resolver is None or not isinstance(node, exp.Column):
+        return None
+    return resolver(node)
 
 
 def declared_column_type(node: exp.Expression | None) -> str | None:
@@ -134,20 +158,30 @@ def declared_column_type(node: exp.Expression | None) -> str | None:
     if not isinstance(node, exp.Column):
         return None
     table = node.table or None
-    if table:
-        derived = _derived.get().get((table.upper(), node.name.upper()))
-        if derived is not None:
+    derived_resolver = _derived_resolver.get()
+    if derived_resolver is not None:
+        handled, derived = derived_resolver(node)
+        if handled:
             return derived
+    return catalog_column_type(node)
+
+
+def catalog_column_type(node: exp.Expression | None) -> str | None:
+    """The catalog type of a column, ignoring derived relations (the non-recursive step).
+
+    Kept separate from ``declared_column_type`` so a derived projection that reads a real
+    table can be typed without re-entering the derived resolver.
+    """
+    if not isinstance(node, exp.Column):
+        return None
     resolver = _resolver.get()
     if resolver is None:
         return None
+    table = node.table or None
     scoped = _scoped.get()
     if not table and node.name.upper() in scoped:
         return None
     if table:
-        if table.upper() in scoped and (table.upper(), node.name.upper()) not in _derived.get():
-            # A derived/query-scoped name with no projected column of that name.
-            return None
         # A table alias names a real table; a stage reference has no entry and stays unresolved.
         table = _aliases.get().get(table.upper(), table)
     return resolver(node.catalog or None, node.db or None, table, node.name)

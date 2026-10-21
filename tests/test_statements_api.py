@@ -2500,6 +2500,88 @@ def test_correlated_subquery_limit_is_rejected(client):
         "SELECT id FROM ct WHERE id = (SELECT id FROM ct ORDER BY id DESC LIMIT 1)"
     ).json()["data"] == [[3]]
 
+    # An unqualified outer column is still a correlation; the local source does not hold it.
+    assert post("CREATE TABLE outr (id INT, g INT)").status_code == 200
+    assert post("CREATE TABLE innr (x INT)").status_code == 200
+    assert post("INSERT INTO outr VALUES (1, 10), (2, 20)").status_code == 200
+    assert post("INSERT INTO innr VALUES (10), (20)").status_code == 200
+    unqualified = post(
+        "SELECT id, (SELECT max(x) FROM innr WHERE x = g LIMIT 1) AS m "
+        "FROM outr ORDER BY id"
+    )
+    assert unqualified.status_code == 422, unqualified.json()
+    assert "correlated subquery" in unqualified.json()["detail"]["message"]
+
+
+def test_derived_alias_types_do_not_leak_across_scopes(client):
+    """A JSON projection under one alias must not type a text relation using the same alias."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    resp = post(
+        "SELECT s.v::VARCHAR AS x FROM (SELECT 'abc' AS v) s "
+        "UNION ALL "
+        "SELECT s.v::VARCHAR AS x FROM (SELECT PARSE_JSON('\"xyz\"') AS v) s"
+    )
+    assert resp.status_code == 200, resp.json()
+    assert resp.json()["data"] == [["abc"], ["xyz"]]
+
+    resp = post(
+        "SELECT s.v::VARCHAR AS x FROM (SELECT 'abc' AS v) s "
+        "WHERE EXISTS (SELECT 1 FROM (SELECT PARSE_JSON('\"x\"') AS v) s)"
+    )
+    assert resp.status_code == 200, resp.json()
+    assert resp.json()["data"] == [["abc"]]
+
+
+def test_derived_stage_writes_cover_nested_union_and_bare_positional(client, tmp_path):
+    """Derived JSON types survive wrappers, UNION arms, ``$1`` and ``SELECT *``."""
+    json_path = tmp_path / "nested.json"
+    json_path.write_text('{"id": 1, "name": "N300"}\n')
+    string_path = tmp_path / "string.json"
+    string_path.write_text('"N300"\n')
+    headers = _stage_headers(client)
+    _stage(client, headers, json_path, "@~/nested")
+    _stage(client, headers, string_path, "@~/scalar")
+
+    def run(statement):
+        resp = client.post(
+            "/api/v2/statements", json={"statement": statement}, headers=headers
+        )
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert run("CREATE TABLE nested_t (id INT, name VARCHAR)") == [
+        ["Statement executed successfully."]
+    ]
+    run(
+        "INSERT INTO nested_t SELECT s.id, s.name "
+        "FROM (SELECT q.id, q.name "
+        "FROM (SELECT $1:id AS id, $1:name AS name FROM @~/nested/nested.json) q) s"
+    )
+    assert run("SELECT id, name, LENGTH(name) FROM nested_t") == [[1, "N300", 4]]
+
+    # The raw staged relation's ``$1`` (and ``SELECT *`` over it) is JSON too.
+    for table, projection in (("bare_t", "$1"), ("star_t", "*")):
+        assert run(f"CREATE TABLE {table} (v VARCHAR)") == [
+            ["Statement executed successfully."]
+        ]
+        run(f"INSERT INTO {table} SELECT {projection} FROM @~/scalar/string.json")
+        assert run(f"SELECT v, LENGTH(v) FROM {table}") == [["N300", 4]]
+
+    # A UNION of text and JSON is coerced to JSON values, then to the target's text.
+    assert run("CREATE TABLE union_t (name VARCHAR)") == [
+        ["Statement executed successfully."]
+    ]
+    run(
+        "INSERT INTO union_t SELECT s.name FROM "
+        "(SELECT 'abc' AS name UNION ALL SELECT PARSE_JSON('\"xyz\"') AS name) s"
+    )
+    assert run("SELECT name, LENGTH(name) FROM union_t ORDER BY name") == [
+        ["abc", 3],
+        ["xyz", 3],
+    ]
+
 
 def test_insert_select_from_staged_file(client, tmp_path):
     json_path = tmp_path / "data.json"
