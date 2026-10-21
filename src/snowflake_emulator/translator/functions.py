@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlglot
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, Sequence
 
 from sqlglot import exp
 
@@ -77,6 +77,9 @@ class UserFunctionArgument:
 
     name: str
     declared_type: str | None
+    #: The same declared type in DuckDB's spelling, used to coerce a call's argument inside
+    #: the macro (Snowflake coerces every argument to the parameter's declared type).
+    duckdb_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -169,7 +172,65 @@ def normalize_function_signature(type_nodes: list[exp.Expression]) -> str:
     return "|".join(parts)
 
 
-def translate_function_body(body: str) -> str:
+def _duckdb_type_text(declared_type: str | None) -> str | None:
+    """A Snowflake type spelling rendered in DuckDB's (``NUMBER(38,0)`` -> ``DECIMAL(38,0)``)."""
+    if not declared_type:
+        return None
+    try:
+        return exp.DataType.build(declared_type, dialect=READ_DIALECT).sql(
+            dialect=WRITE_DIALECT
+        )
+    except Exception:  # noqa: BLE001 - an unparsable persisted type is simply not coerced
+        return None
+
+
+def _cast_parameters(
+    expression: exp.Expression, parameters: Sequence[tuple[str, str | None]]
+) -> exp.Expression:
+    """Coerce each parameter reference to its declared type, as Snowflake does on a call.
+
+    A DuckDB macro is untyped, so the argument keeps whatever type it was called with: a
+    ``VARCHAR`` parameter would see a DATE from ``shout(CURRENT_DATE())`` and ``UPPER`` then
+    failed with a binder error, where Snowflake has already coerced the DATE to VARCHAR.
+    """
+    types = {
+        name.upper(): duckdb_type
+        for name, duckdb_type in parameters
+        if duckdb_type
+    }
+    if not types:
+        return expression
+
+    def build(duckdb_type: str) -> exp.DataType | None:
+        # An unparameterised Snowflake ARRAY/OBJECT renders as ``[]`` in DuckDB's dialect,
+        # which is not a type: such a parameter keeps the caller's value instead of failing
+        # the whole CREATE FUNCTION.
+        try:
+            kind = exp.DataType.build(duckdb_type, dialect=WRITE_DIALECT)
+        except Exception:  # noqa: BLE001 - an unusable spelling simply means "do not coerce"
+            return None
+        return kind if isinstance(kind, exp.DataType) and kind.this is not None else None
+
+    def replace(node: exp.Expression) -> exp.Expression:
+        if not isinstance(node, exp.Column) or node.table:
+            return node
+        duckdb_type = types.get(node.name.upper())
+        if duckdb_type is None:
+            return node
+        parent = node.parent
+        if isinstance(parent, exp.Cast) and parent.to.sql(dialect=WRITE_DIALECT) == duckdb_type:
+            return node  # already coerced
+        kind = build(duckdb_type)
+        if kind is None:
+            return node
+        return exp.cast(node.copy(), kind, dialect=WRITE_DIALECT)
+
+    return expression.transform(replace)
+
+
+def translate_function_body(
+    body: str, parameters: Sequence[tuple[str, str | None]] = ()
+) -> str:
     """Translate a SQL UDF body into a DuckDB scalar expression.
 
     Snowflake allows the body to be either a bare expression (``AS $$ x + 1 $$``) or a
@@ -196,7 +257,9 @@ def translate_function_body(body: str) -> str:
         parsed = parsed.expressions[0]
         if isinstance(parsed, exp.Alias):
             parsed = parsed.this
-    return _apply_transforms(parsed).sql(dialect=WRITE_DIALECT)
+    return _cast_parameters(_apply_transforms(parsed), parameters).sql(
+        dialect=WRITE_DIALECT
+    )
 
 
 def translate_create_function(statement: exp.Expression) -> UserFunctionSpec:
@@ -245,7 +308,15 @@ def translate_create_function(statement: exp.Expression) -> UserFunctionSpec:
             if isinstance(kind, exp.DataType)
             else None
         )
-        arguments.append(UserFunctionArgument(name=name, declared_type=declared))
+        arguments.append(
+            UserFunctionArgument(
+                name=name,
+                declared_type=declared,
+                duckdb_type=kind.sql(dialect=WRITE_DIALECT)
+                if isinstance(kind, exp.DataType)
+                else None,
+            )
+        )
 
     catalog = table.args.get("catalog")
     db = table.args.get("db")
@@ -267,7 +338,9 @@ def translate_create_function(statement: exp.Expression) -> UserFunctionSpec:
         return_type_duckdb=returns.sql(dialect=WRITE_DIALECT),
         language=language,
         body=body,
-        body_sql=translate_function_body(body),
+        body_sql=translate_function_body(
+            body, [(argument.name, argument.duckdb_type) for argument in arguments]
+        ),
         database=_snowflake_name(catalog) if isinstance(catalog, exp.Identifier) else None,
         schema=_snowflake_name(db) if isinstance(db, exp.Identifier) else None,
         replace=bool(statement.args.get("replace")),

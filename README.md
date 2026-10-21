@@ -233,6 +233,13 @@ UBIGINT`), and a VARIANT *value* searched in a JSON array (`ARRAY_CONTAINS`, `AR
 `ARRAY_REMOVE` removes the value rather than every NULL element (a NULL element survives; a NULL
 value returns NULL, as documented).
 
+A SQL UDF coerces each call's argument to the parameter's **declared type**, as Snowflake does
+before the body runs: a `VARCHAR` parameter receives a DATE or a number as text, so
+`UPPER(x)` works and `f(CURRENT_DATE())` returns the date text; a `NUMBER` parameter keeps
+`NUMBER(38,0)` semantics (a fraction rounds). A declared type with no usable DuckDB spelling (a
+bare `ARRAY`) is left uncoerced rather than failing the `CREATE FUNCTION`. A `NUMBER` result is a
+JSON number in the rowset, as Snowflake sends it.
+
 A staged JSON value written into a **text column** is coerced to its text, as Snowflake's
 VARIANT coercion does: `INSERT INTO t (name) SELECT $1:name FROM @stage` and
 `UPDATE t SET name = s.$1:name FROM @stage s` store `ada`, not DuckDB's JSON serialization

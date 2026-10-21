@@ -246,6 +246,47 @@ def test_overloads_must_share_a_return_type(client):
     assert "BOOLEAN" in message and "NUMBER(38,0)" in message
 
 
+def test_udf_parameters_are_coerced_to_their_declared_type(client):
+    """A UDF call coerces each argument to the parameter's declared type, as Snowflake does.
+
+    A DuckDB macro is untyped, so the body used to see the caller's type: a ``VARCHAR``
+    parameter received a DATE from ``shout(CURRENT_DATE())`` and ``UPPER`` failed with a binder
+    error. The parameter reference is now cast inside the macro body, and a NUMBER cell comes
+    back as a JSON number rather than the string a Decimal serializes to.
+    """
+    import datetime
+
+    def created(statement):
+        resp = _post(client, statement)
+        assert resp.status_code == 200, resp.json()
+        return resp
+
+    created(
+        "CREATE OR REPLACE FUNCTION shout(x VARCHAR) RETURNS VARCHAR AS $$ UPPER(x) $$"
+    )
+    assert _data(client, "SELECT shout('ada')") == [["ADA"]]
+    assert _data(client, "SELECT shout(42)") == [["42"]]
+    assert _data(client, "SELECT shout(CURRENT_DATE())") == [
+        [datetime.date.today().isoformat()]
+    ]
+
+    # A NUMBER parameter keeps Snowflake's NUMBER(38,0) coercion (a fraction rounds), and the
+    # result is a JSON number.
+    created("CREATE OR REPLACE FUNCTION trunc_num(n NUMBER) RETURNS NUMBER AS $$ n $$")
+    truncated = _data(client, "SELECT trunc_num(3.7)")
+    assert truncated == [[4]]
+    assert isinstance(truncated[0][0], int)
+
+    created("CREATE OR REPLACE FUNCTION twice_num(n NUMBER) RETURNS NUMBER AS $$ n * 2 $$")
+    assert _data(client, "SELECT twice_num(3)") == [[6]]
+
+    # A type with no usable DuckDB spelling (a bare ARRAY) still creates: it is not coerced.
+    created(
+        "CREATE OR REPLACE FUNCTION arr_len(a ARRAY) RETURNS NUMBER AS $$ ARRAY_SIZE(a) $$"
+    )
+    assert _data(client, "SELECT arr_len(ARRAY_CONSTRUCT('a','b'))") == [[2]]
+
+
 def test_dropping_one_overload_leaves_the_other_callable(client):
     _post(client, CASE_INSENSITIVE_EQUAL)
     _post(client, CASE_INSENSITIVE_ARRAY_EQUAL)
@@ -254,11 +295,13 @@ def test_dropping_one_overload_leaves_the_other_callable(client):
     ).status_code == 200
     # The signature picked out exactly one overload: the STRING one still resolves...
     assert _data(client, "SELECT EQUAL_NULL_CASE_INSENSITIVE('aB', 'Ab')") == [[True]]
-    # ...and the dropped one is gone, so an array argument no longer has a body to reach.
-    assert _post(
+    # ...and the dropped ARRAY overload is gone, so an array argument now resolves to the
+    # remaining STRING overload by coercion (Snowflake casts an ARRAY to VARCHAR for a STRING
+    # parameter), rather than reaching the dropped ARRAY body.
+    assert _data(
         client,
         "SELECT EQUAL_NULL_CASE_INSENSITIVE(ARRAY_CONSTRUCT('a'), ARRAY_CONSTRUCT('A'))",
-    ).status_code == 422
+    ) == [[True]]
     assert len(_data(client, "SHOW FUNCTIONS")) == 1
 
 

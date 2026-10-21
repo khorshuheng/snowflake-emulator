@@ -75,6 +75,7 @@ from snowflake_emulator.translator import (
     render_create_macro,
     render_drop_macro,
     render_qualified_name,
+    _duckdb_type_text,
     translate_function_body,
     user_function_dispatch_name,
     user_function_macro_name,
@@ -223,7 +224,13 @@ class StoredFunction:
             return_type_duckdb=self.return_type_duckdb or self.return_type,
             language=self.language,
             body=self.body,
-            body_sql=translate_function_body(self.body),
+            body_sql=translate_function_body(
+                self.body,
+                [
+                    (name, _duckdb_type_text(declared))
+                    for name, declared in self.arguments
+                ],
+            ),
             database=self.database,
             schema=self.schema,
             replace=True,

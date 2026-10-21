@@ -32,6 +32,7 @@ from snowflake_emulator.translator.functions import (
     render_drop_macro,
     render_qualified_name,
     translate_create_function,
+    _duckdb_type_text,
     translate_function_body,
     user_function_dispatch_name,
     user_function_macro_name,

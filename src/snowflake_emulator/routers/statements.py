@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import decimal
 import json
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -171,6 +172,19 @@ def _is_json_column(col: ColumnMeta) -> bool:
     return (col.duckdb_type or "").upper() == "JSON"
 
 
+def _number_cell(value: Any) -> Any:
+    """A NUMBER cell as a JSON number, which is what Snowflake's rowset carries.
+
+    DuckDB hands a DECIMAL to Python as a ``Decimal``, and the response model would serialize
+    it as a string (``"6"`` instead of ``6``). Snowflake sends a JSON number, so an integral
+    value becomes an int and a scaled one a float, exactly as FastAPI's own decimal encoder
+    does.
+    """
+    if isinstance(value, decimal.Decimal):
+        return int(value) if value.as_tuple().exponent >= 0 else float(value)
+    return value
+
+
 def _json_cell(value: Any, col: ColumnMeta) -> Any:
     """Inline a semi-structured cell as a JSON value, as Snowflake's rowset does.
 
@@ -181,6 +195,7 @@ def _json_cell(value: Any, col: ColumnMeta) -> Any:
     """
     if value is None:
         return None
+    value = _number_cell(value)
     if _is_json_column(col) and isinstance(value, str):
         try:
             return json.loads(value)
