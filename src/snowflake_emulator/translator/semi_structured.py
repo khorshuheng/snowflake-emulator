@@ -208,6 +208,8 @@ _TEXT_ARGUMENTS: dict[type, tuple[str, ...]] = {
     exp.Contains: ("this",),
     exp.Pad: ("this",),
     exp.StrPosition: ("substr",),
+    exp.Like: ("this",),
+    exp.ILike: ("this",),
     exp.DPipe: ("this", "expression"),
     exp.Concat: ("expressions",),
 }
@@ -279,6 +281,31 @@ def _json_value_of_text(node: exp.Expression) -> exp.Expression:
     return exp.func("to_json", node)
 
 
+def _rewrite_semi_structured_membership(node: exp.Expression) -> exp.Expression:
+    """``<text column> IN (<semi-structured>, ...)``: make the text side a JSON string.
+
+    An ``IN`` list compares like ``=``, so the same coercion applies: the text side becomes a
+    JSON string and each semi-structured element compares as JSON.
+    """
+    values = node.expressions or []
+    if not any(_is_semi_structured_value(value) for value in values):
+        return node
+    # ``IN`` is equality-only, so every side compares as JSON: a text column, a string literal
+    # and a number all become JSON values, and a mixed list keeps working.
+    if not _is_semi_structured_value(node.this):
+        node.set("this", _json_value_of_text(node.this))
+    node.set(
+        "expressions",
+        [
+            value
+            if _is_semi_structured_value(value)
+            else _json_value_of_text(value)
+            for value in values
+        ],
+    )
+    return node
+
+
 def _rewrite_semi_structured_comparison(node: exp.Expression) -> exp.Expression:
     """``<text column> = <staged JSON value>``: make the text side a JSON string.
 
@@ -291,9 +318,13 @@ def _rewrite_semi_structured_comparison(node: exp.Expression) -> exp.Expression:
         # the target column's type, and the column itself must not be rewritten.
         return node
     left, right = node.this, node.args.get("expression")
-    if _is_semi_structured_value(left) and _is_text_expression(right):
+    # Equality compares JSON *values*, so wrapping the other side is safe whatever it holds --
+    # a text column, a string literal, or a text-valued expression such as ``UPPER(name)``.
+    # A range comparison keeps the narrow rule: wrapping a number would compare JSON text.
+    equality = isinstance(node, (exp.EQ, exp.NEQ))
+    if _is_semi_structured_value(left) and (equality or _is_text_expression(right)):
         node.set("expression", _json_value_of_text(right))
-    elif _is_semi_structured_value(right) and _is_text_expression(left):
+    elif _is_semi_structured_value(right) and (equality or _is_text_expression(left)):
         node.set("this", _json_value_of_text(left))
     return node
 
@@ -371,6 +402,8 @@ def _rewrite_snowflake_specifics(node: exp.Expression) -> exp.Expression:
         return _rewrite_variant_text_function(node)
     if isinstance(node, _COMPARISON_NODES):
         return _rewrite_semi_structured_comparison(node)
+    if isinstance(node, exp.In):
+        return _rewrite_semi_structured_membership(node)
 
     # Snowflake JSON path extraction (``col:path``, ``GET_PATH``) transpiles to
     # DuckDB's ``->``/``->>``, which parses its operand as JSON on the fly. A VALUE

@@ -69,6 +69,14 @@ def statement_scoped_names(statement: exp.Expression) -> frozenset[str]:
         for name in (
             *[alias.alias for alias in statement.find_all(exp.Alias) if alias.alias],
             *[cte.alias for cte in statement.find_all(exp.CTE) if cte.alias],
+            # A derived table's alias has no catalog meaning: if it shares a name with a real
+            # table, resolving to that table's column type is wrong (and reaches DuckDB with a
+            # type that does not match the value, e.g. LIST_SORT over a VARIANT -> OOM).
+            *[
+                subquery.alias
+                for subquery in statement.find_all(exp.Subquery)
+                if subquery.alias
+            ],
         )
         if name
     }
@@ -108,8 +116,10 @@ def declared_column_type(node: exp.Expression | None) -> str | None:
         return None
     table = node.table or None
     if table:
-        # A table alias names a real table (a stage reference or a derived table has no entry,
-        # and stays unresolved).
+        if table.upper() in scoped:
+            # A derived-table alias: it names a query result, not a catalog table.
+            return None
+        # A table alias names a real table; a stage reference has no entry and stays unresolved.
         table = _aliases.get().get(table.upper(), table)
     return resolver(node.catalog or None, node.db or None, table, node.name)
 

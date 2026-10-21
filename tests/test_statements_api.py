@@ -1133,6 +1133,20 @@ def test_array_column_type_resolution_is_schema_aware(client):
         assert resp.status_code == 422, (statement, resp.json())
         assert "VARIANT-typed array" in resp.json()["detail"]["message"]
 
+    # A derived table's alias has no catalog meaning: resolving it to a real table of the same
+    # name reached DuckDB with the wrong type (LIST_SORT over a VARIANT -> an OOM error).
+    assert post("CREATE TABLE nlist_src AS SELECT ARRAY_CONSTRUCT('x') AS n").status_code == 200
+    assert post("CREATE TABLE vlist_src (n VARIANT)").status_code == 200
+    assert post("INSERT INTO vlist_src SELECT PARSE_JSON('[\"b\",\"aa\"]')").status_code == 200
+    resp = post(
+        "SELECT ARRAY_SORT(nlist_src.n) FROM (SELECT n FROM vlist_src) AS nlist_src"
+    )
+    assert resp.status_code == 422, resp.json()
+    assert "VARIANT-typed array" in resp.json()["detail"]["message"]
+    assert post("SELECT ARRAY_SORT(nlist_src.n) FROM nlist_src").json()["data"] == [
+        [['x']]
+    ]
+
     # A query-scoped alias that happens to match a catalog column name is not resolved either.
     assert post("CREATE TABLE nums_tbl AS SELECT ARRAY_CONSTRUCT(1) AS nums").status_code == 200
     resp = post(
@@ -1967,6 +1981,51 @@ def test_staged_json_writes_coerce_to_the_target_columns(client, tmp_path):
     assert run("SELECT typeof(v), v::VARCHAR FROM stage_v ORDER BY 1 LIMIT 1") == [
         ["VARIANT", "ada"]
     ]
+
+
+def test_semi_structured_comparisons_coerce_the_text_side(client):
+    """Comparing text with a staged/JSON value coerces the text side, as Snowflake does.
+
+    Snowflake coerces the VARCHAR operand to a VARIANT, so a text column, a string literal and a
+    text-valued expression all compare as JSON values. DuckDB instead parses the text as JSON and
+    raises -- or, for ``LIKE``, silently answers no rows because it compares the serialization.
+    """
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post("CREATE TABLE cmp_t (name VARCHAR, num INT)").status_code == 200
+    assert post("INSERT INTO cmp_t VALUES ('ada', 9)").status_code == 200
+    staged = '''(SELECT PARSE_JSON('{"name":"ada","num":9}') AS j) s'''
+
+    for predicate in (
+        "cmp_t.name = s.j:name",
+        "s.j:name = cmp_t.name",
+        "'ada' = s.j:name",
+        "LOWER(cmp_t.name) = s.j:name",
+        "UPPER(cmp_t.name) = UPPER(s.j:name)",
+    ):
+        assert data(f"SELECT COUNT(*) FROM cmp_t, {staged} WHERE {predicate}") == [[1]], predicate
+
+    # Inequality, LIKE/ILIKE (which used to answer no rows) and IN with a mixed list.
+    assert data(f"SELECT COUNT(*) FROM cmp_t, {staged} WHERE cmp_t.name <> s.j:name") == [[0]]
+    assert data(f"SELECT COUNT(*) FROM cmp_t, {staged} WHERE s.j:name LIKE 'a%'") == [[1]]
+    assert data(f"SELECT COUNT(*) FROM cmp_t, {staged} WHERE s.j:name ILIKE 'A%'") == [[1]]
+    assert data(f"SELECT COUNT(*) FROM cmp_t, {staged} WHERE cmp_t.name IN (s.j:name)") == [[1]]
+    assert data(f"SELECT COUNT(*) FROM cmp_t, {staged} WHERE 'ada' IN (s.j:name, 'zzz')") == [
+        [1]
+    ]
+    assert data(f"SELECT COUNT(*) FROM cmp_t, {staged} WHERE cmp_t.num IN (s.j:num, 3)") == [[1]]
+    assert data(f"SELECT COUNT(*) FROM cmp_t, {staged} WHERE cmp_t.name IN ('zzz')") == [[0]]
+    # A number still compares as a number, and ordering keeps numeric semantics.
+    assert data(f"SELECT COUNT(*) FROM cmp_t, {staged} WHERE cmp_t.num = s.j:num") == [[1]]
+    assert data(f"SELECT COUNT(*) FROM cmp_t, {staged} WHERE cmp_t.num < s.j:num") == [[0]]
+    assert data(f"SELECT COUNT(*) FROM cmp_t, {staged} WHERE 8 < s.j:num") == [[1]]
+    assert data(f"SELECT COUNT(*) FROM cmp_t, {staged} WHERE 10 < s.j:num") == [[0]]
 
 
 def test_copy_json_array_document_is_one_record_without_strip(client, tmp_path):

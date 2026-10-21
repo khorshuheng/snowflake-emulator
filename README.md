@@ -236,8 +236,10 @@ value returns NULL, as documented).
 A staged JSON value written into a **text column** is coerced to its text, as Snowflake's
 VARIANT coercion does: `INSERT INTO t (name) SELECT $1:name FROM @stage` and
 `UPDATE t SET name = s.$1:name FROM @stage s` store `ada`, not DuckDB's JSON serialization
-`"ada"`. A comparison between a text column and a staged value (`t.name = s.$1:name`) makes the
-text side a JSON string, so it matches instead of raising `Malformed JSON`. A
+`"ada"`. A comparison between text and a staged/JSON value makes the text side a JSON string, so it
+matches instead of raising `Malformed JSON`: `=`, `<>` (with the text on either side, a literal, or
+an expression such as `LOWER(t.name)`), `LIKE`/`ILIKE` (which used to answer no rows), and `IN`
+with a mixed list. Ordering comparisons keep numeric semantics. A
 `COPY INTO ... FROM (SELECT ...)` projection goes through the same translator as a plain
 `SELECT`, so `$1:c::VARCHAR` loads the same value in both places.
 
