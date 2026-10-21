@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Header, HTTPException, Query, status
 from fastapi.responses import JSONResponse
@@ -13,6 +14,12 @@ from snowflake_emulator.core.results import ColumnMeta, ExecutionResult
 from snowflake_emulator.database import get_manager
 from snowflake_emulator.core.errors import error_code_pair
 from snowflake_emulator.executor import execute_sql
+from snowflake_emulator.output_formats import (
+    OutputFormatError,
+    OutputFormats,
+    format_cell,
+    output_formats_from_parameters,
+)
 from snowflake_emulator.schemas import (
     PartitionInfo,
     ResultSetMetaData,
@@ -50,6 +57,76 @@ def _apply_overrides(session: SessionContext, body: StatementRequest) -> None:
         session.warehouse = body.warehouse
     if body.role:
         session.role = body.role
+
+
+def _request_parameters(parameters: dict[str, Any] | None) -> tuple[int | None, str | None, OutputFormats]:
+    """Validate the request's ``parameters`` object.
+
+    Returns ``(multi_statement_count, timezone, output_formats)``. Only the parameters the
+    emulator honours are read; an invalid value is a request error, never a silent default.
+    """
+    if not parameters:
+        return None, None, OutputFormats()
+    upper = {str(key).upper(): value for key, value in parameters.items()}
+
+    count: int | None = None
+    if "MULTI_STATEMENT_COUNT" in upper:
+        raw = upper["MULTI_STATEMENT_COUNT"]
+        try:
+            count = int(raw)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={
+                    "message": f"MULTI_STATEMENT_COUNT must be an integer, got '{raw}'.",
+                    "sqlState": "42000",
+                    "code": "001003",
+                },
+            ) from None
+        if count < 0:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={
+                    "message": "MULTI_STATEMENT_COUNT must not be negative.",
+                    "sqlState": "42000",
+                    "code": "001003",
+                },
+            )
+
+    timezone = upper.get("TIMEZONE")
+    if timezone is not None:
+        timezone = str(timezone)
+        if not _is_valid_timezone(timezone):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={
+                    "message": f"Invalid TIMEZONE '{timezone}'.",
+                    "sqlState": "22023",
+                    "code": "100177",
+                },
+            )
+
+    try:
+        formats = output_formats_from_parameters(parameters)
+    except OutputFormatError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"message": str(exc), "sqlState": "22023", "code": "100177"},
+        ) from exc
+    return count, timezone, formats
+
+
+def _is_valid_timezone(name: str) -> bool:
+    """True for an IANA zone name, the only form DuckDB's ``SET TimeZone`` accepts.
+
+    A numeric offset (``+05:00``) is rejected here rather than passed on, because DuckDB
+    answers ``Unknown TimeZone`` and the request would fail with a confusing message.
+    """
+    try:
+        ZoneInfo(name)
+    except Exception:  # noqa: BLE001 - any failure means the name is unknown
+        return False
+    return True
 
 
 def _json_element(element: Any) -> Any:
@@ -98,6 +175,7 @@ def _json_cell(value: Any, col: ColumnMeta) -> Any:
 def _to_response(
     result: ExecutionResult, partition: int | None = None
 ) -> StatementResponse:
+    formats = result.output_formats or OutputFormats()
     # The emulator materializes the whole result as one partition. A request for a
     # later partition still gets the correct metadata, with an empty rowset.
     rows = result.rows if partition in (None, 0) else []
@@ -112,7 +190,10 @@ def _to_response(
             partitionInfo=[PartitionInfo(rowCount=len(result.rows))],
         ),
         data=[
-            [_json_cell(value, col) for value, col in zip(row, result.row_type)]
+            [
+                _json_cell(format_cell(value, col, formats), col)
+                for value, col in zip(row, result.row_type)
+            ]
             for row in rows
         ],
     )
@@ -129,6 +210,7 @@ def submit_statement(
     _apply_overrides(session, body)
 
     manager = get_manager(session)
+    count, timezone, formats = _request_parameters(body.parameters)
     try:
         decoded = decode_bindings(body.bindings)
         result = execute_sql(
@@ -137,6 +219,8 @@ def submit_statement(
             body.statement,
             bind_params=decoded.positional if decoded.positional is not None else decoded.named,
             bind_batch=decoded.batch,
+            multi_statement_count=1 if count is None else count,
+            timezone=timezone,
         )
     except Exception as exc:  # noqa: BLE001 - always answer in Snowflake's error shape
         raise HTTPException(
@@ -145,6 +229,7 @@ def submit_statement(
         ) from exc
 
     session.last_query_id = result.handle
+    result.output_formats = formats
     get_statement_store().put(result)
     if async_:
         # Execution is synchronous, but the SQL API contract is to return 202 and let

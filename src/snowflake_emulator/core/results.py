@@ -42,4 +42,6 @@ class ExecutionResult:
     message: str = "Statement executed successfully."
     file_transfer: FileTransfer | None = None
     statement_type_id: int = 0
+    # The output formats the request asked for, replayed when a later GET fetches the result.
+    output_formats: Any | None = None
     number_of_binds: int = 0

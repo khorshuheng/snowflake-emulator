@@ -7,6 +7,8 @@ no-ops, the per-catalog ``INFORMATION_SCHEMA``, and the ``seq.NEXTVAL`` /
 
 from __future__ import annotations
 
+import datetime
+
 
 def _auth_headers(client) -> dict:
     token = client.post("/session/token").json()["token"]
@@ -14,7 +16,16 @@ def _auth_headers(client) -> dict:
 
 
 def _post(client, statement, headers=None):
-    return client.post("/api/v2/statements", json={"statement": statement}, headers=headers)
+    """POST a statement, opting into the multi-statement capability for a chained body.
+
+    Snowflake's ``MULTI_STATEMENT_COUNT`` defaults to 1, so a request that chains statements
+    has to send it (0 means "any number"); the SQL API's default is covered by
+    ``test_request_parameters``.
+    """
+    body: dict[str, object] = {"statement": statement}
+    if len([part for part in statement.split(";") if part.strip()]) > 1:
+        body["parameters"] = {"MULTI_STATEMENT_COUNT": "0"}
+    return client.post("/api/v2/statements", json=body, headers=headers)
 
 
 def test_use_database_and_schema_identifier_fn(client):
@@ -323,7 +334,7 @@ def test_timestamp_precision_translation_and_metadata(client):
         headers,
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["data"][0][0] == "2020-01-01T12:00:00.123000"
+    assert resp.json()["data"][0][0] == "2020-01-01 12:00:00.123"
 
     # The connector wire metadata advertises the real granularity, not a fixed 6.
     wire = client.post(
@@ -585,4 +596,5 @@ def test_session_timezone_is_utc(client):
     assert resp.status_code == 200
     timezone, timestamp = resp.json()["data"][0]
     assert timezone == "UTC"
-    assert timestamp.endswith("Z")
+    # A SQL API timestamp cell is Snowflake's ``YYYY-MM-DD HH24:MI:SS.FF3`` text.
+    assert timestamp.startswith(datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:"))

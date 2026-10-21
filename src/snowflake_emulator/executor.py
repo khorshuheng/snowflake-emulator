@@ -101,6 +101,8 @@ def execute_sql(
     raw_sql: str,
     bind_params: list[Any] | dict[str, Any] | None = None,
     bind_batch: list[tuple[Any, ...]] | None = None,
+    multi_statement_count: int | None = None,
+    timezone: str | None = None,
 ) -> ExecutionResult:
     """Execute one or more (semicolon-separated) Snowflake statements.
 
@@ -108,14 +110,24 @@ def execute_sql(
     sent to DuckDB. Only the result of the final statement is returned, matching
     Snowflake's own multi-statement behaviour. `bind_params` (a positional list or a
     named mapping) and `bind_batch` (one tuple per row, for an array binding) are only
-    applied when `raw_sql` contains a single statement.
+    applied when `raw_sql` contains a single statement. `multi_statement_count` is the SQL
+    API's ``MULTI_STATEMENT_COUNT`` (0 = any number, N = exactly N); `timezone` is the
+    request's ``TIMEZONE``, which DuckDB's session timezone is set to for this statement.
 
     The statements of one session are serialized and run on that session's own DuckDB
     connection, so a ``CREATE TEMPORARY TABLE`` is visible to every later statement in
     the session and a session never sees another session's temporary tables.
     """
     with manager.session_scope(session.token):
-        return _execute_sql(manager, session, raw_sql, bind_params, bind_batch)
+        return _execute_sql(
+            manager,
+            session,
+            raw_sql,
+            bind_params,
+            bind_batch,
+            multi_statement_count,
+            timezone,
+        )
 
 
 def _execute_sql(
@@ -124,6 +136,8 @@ def _execute_sql(
     raw_sql: str,
     bind_params: list[Any] | dict[str, Any] | None = None,
     bind_batch: list[tuple[Any, ...]] | None = None,
+    multi_statement_count: int | None = None,
+    timezone: str | None = None,
 ) -> ExecutionResult:
     if _matches_noop(raw_sql):
         return ExecutionResult(
@@ -136,8 +150,9 @@ def _execute_sql(
     manager.ensure_namespace(session.database, session.schema)
     cursor = manager.cursor(session.token)
     cursor.execute(f'USE "{session.database}"."{session.schema}"')
-    # Snowflake's default/session timezone is UTC; DuckDB otherwise inherits the host.
-    cursor.execute("SET TimeZone='UTC'")
+    # Snowflake's default/session timezone is UTC; DuckDB otherwise inherits the host. A
+    # request's TIMEZONE parameter applies to this statement's execution.
+    cursor.execute("SET TimeZone = ?", [timezone or "UTC"])
 
     # Resolves user-defined function calls to the DuckDB macros backing them; loads
     # lazily so a session with no ``CREATE FUNCTION`` never touches the side table.
@@ -155,6 +170,7 @@ def _execute_sql(
         statements = split_statements(raw_sql)
     except TranslationError as exc:
         raise as_execution_error(exc) from exc
+    _check_multi_statement_count(len(statements), multi_statement_count)
 
     row_type: list[ColumnMeta] = []
     rows: list[list[Any]] = []
@@ -437,6 +453,30 @@ def _substitute_session_functions(
         return exp.Literal.string(value) if value is not None else node
 
     return statement.transform(replace)
+
+
+def _check_multi_statement_count(count: int, allowed: int | None) -> None:
+    """Enforce the SQL API's ``MULTI_STATEMENT_COUNT`` against the statements in the request.
+
+    Snowflake's default is 1, so a request that chains statements has to opt in with a count
+    of 0 (any number) or the exact number sent; a mismatch is an error rather than a silent
+    partial execution.
+    """
+    if allowed is None:
+        return
+    if allowed < 0:
+        raise ExecutionError(
+            "MULTI_STATEMENT_COUNT must not be negative.", errno="001003", sqlstate="42000"
+        )
+    if allowed == 0:
+        return
+    if count != allowed:
+        raise ExecutionError(
+            f"Multi-statement count {allowed} does not match the {count} statement(s) in the "
+            "request; use 0 for any number.",
+            errno="001003",
+            sqlstate="42000",
+        )
 
 
 def _matches_noop(sql: str) -> bool:

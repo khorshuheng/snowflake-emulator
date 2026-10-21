@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import datetime
+
 import gzip
 import json
 import os
@@ -60,7 +62,11 @@ def test_multi_statement_ddl_dml_query(client):
         "INSERT INTO t VALUES (1, 'x'), (2, 'y'); "
         "SELECT * FROM t ORDER BY a"
     )
-    resp = client.post("/api/v2/statements", json={"statement": stmt})
+    # Chaining statements requires opting in: Snowflake's MULTI_STATEMENT_COUNT defaults to 1.
+    resp = client.post(
+        "/api/v2/statements",
+        json={"statement": stmt, "parameters": {"MULTI_STATEMENT_COUNT": "0"}},
+    )
     assert resp.status_code == 200
     body = resp.json()
     assert body["data"] == [[1, "x"], [2, "y"]]
@@ -73,7 +79,10 @@ def test_snowflake_qualify_and_ilike(client):
         "SELECT name, grp, val FROM u WHERE name ILIKE '%oo%' "
         "QUALIFY ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val DESC) = 1"
     )
-    resp = client.post("/api/v2/statements", json={"statement": stmt})
+    resp = client.post(
+        "/api/v2/statements",
+        json={"statement": stmt, "parameters": {"MULTI_STATEMENT_COUNT": "0"}},
+    )
     assert resp.status_code == 200
     assert resp.json()["data"] == [["Foo", 1, 10]]
 
@@ -1430,7 +1439,10 @@ def test_session_token_persists_use_database(client):
 
     resp = client.post(
         "/api/v2/statements",
-        json={"statement": "CREATE TABLE t2 (a INT); INSERT INTO t2 VALUES (99); SELECT * FROM t2"},
+        json={
+            "statement": "CREATE TABLE t2 (a INT); INSERT INTO t2 VALUES (99); SELECT * FROM t2",
+            "parameters": {"MULTI_STATEMENT_COUNT": "0"},
+        },
         headers=headers,
     )
     assert resp.status_code == 200
@@ -2606,6 +2618,86 @@ def test_copy_into_rejects_options_it_cannot_honor(client, tmp_path):
     )
     assert strip.status_code == 422
     assert "STRIP_OUTER_ARRAY" in strip.json()["detail"]["message"]
+
+
+def test_request_parameters(client):
+    """The SQL API ``parameters`` object: multi-statement count, timezone, output formats.
+
+    Snowflake's ``MULTI_STATEMENT_COUNT`` defaults to 1, so a chained body needs 0 or the exact
+    count; ``TIMEZONE`` applies to the request; the four output formats decide the rowset's
+    text, and an unknown value is a request error rather than a silent default.
+    """
+    def post(statement, parameters=None):
+        body = {"statement": statement}
+        if parameters is not None:
+            body["parameters"] = parameters
+        return client.post("/api/v2/statements", json=body)
+
+    chained = "SELECT 1 AS a; SELECT 2 AS b"
+
+    # Default 1: two statements are rejected unless the request opts in.
+    rejected = post(chained)
+    assert rejected.status_code == 422, rejected.json()
+    assert "Multi-statement count 1" in rejected.json()["detail"]["message"]
+    assert post(chained, {"MULTI_STATEMENT_COUNT": "0"}).json()["data"] == [[2]]
+    assert post(chained, {"MULTI_STATEMENT_COUNT": "2"}).json()["data"] == [[2]]
+    assert post(chained, {"MULTI_STATEMENT_COUNT": 2}).json()["data"] == [[2]]
+    assert post(chained, {"MULTI_STATEMENT_COUNT": "1"}).status_code == 422
+    assert post(chained, {"MULTI_STATEMENT_COUNT": "3"}).status_code == 422
+    assert post("SELECT 1", {"MULTI_STATEMENT_COUNT": "1"}).json()["data"] == [[1]]
+    negative = post(chained, {"MULTI_STATEMENT_COUNT": "-1"})
+    assert negative.status_code == 422
+    assert "negative" in negative.json()["detail"]["message"]
+    assert post(chained, {"MULTI_STATEMENT_COUNT": "many"}).status_code == 422
+
+    # TIMEZONE applies to the request: a zone without DST shifts the timestamp by its offset.
+    utc = post("SELECT CURRENT_TIMESTAMP() AS ts", {"TIMEZONE": "UTC"}).json()["data"][0][0]
+    shifted = post(
+        "SELECT CURRENT_TIMESTAMP() AS ts", {"TIMEZONE": "Asia/Tokyo"}
+    ).json()["data"][0][0]
+    delta = datetime.datetime.fromisoformat(shifted) - datetime.datetime.fromisoformat(utc)
+    assert abs(delta - datetime.timedelta(hours=9)) < datetime.timedelta(minutes=1)
+    for unknown in ("Mars/Olympus", "+05:00"):
+        invalid_zone = post("SELECT 1", {"TIMEZONE": unknown})
+        assert invalid_zone.status_code == 422, unknown
+        assert "Invalid TIMEZONE" in invalid_zone.json()["detail"]["message"]
+
+    # Output formats decide the rowset text; the defaults are Snowflake's.
+    assert post(
+        "SELECT CAST('2024-03-04' AS DATE) AS d", {"DATE_OUTPUT_FORMAT": "DD.MM.YYYY"}
+    ).json()["data"] == [["04.03.2024"]]
+    assert post("SELECT CAST('2024-03-04' AS DATE) AS d").json()["data"] == [["2024-03-04"]]
+    assert post(
+        "SELECT CAST('2024-03-04 05:06:07.891234' AS TIMESTAMP_NTZ) AS ts",
+        {"TIMESTAMP_OUTPUT_FORMAT": "YYYY/MM/DD HH24:MI:SS.FF6"},
+    ).json()["data"] == [["2024/03/04 05:06:07.891234"]]
+    assert post(
+        "SELECT CAST('2024-03-04 05:06:07.891234' AS TIMESTAMP_NTZ) AS ts"
+    ).json()["data"] == [["2024-03-04 05:06:07.891"]]
+    assert post(
+        "SELECT CAST('13:05:06' AS TIME) AS t", {"TIME_OUTPUT_FORMAT": "HH12:MI AM"}
+    ).json()["data"] == [["01:05 PM"]]
+    assert post("SELECT CAST('13:05:06' AS TIME) AS t").json()["data"] == [["13:05:06"]]
+
+    # BINARY defaults to HEX and can be asked for BASE64.
+    assert post("SELECT 'abc'::BINARY AS b").json()["data"] == [["616263"]]
+    assert post(
+        "SELECT 'abc'::BINARY AS b", {"BINARY_OUTPUT_FORMAT": "BASE64"}
+    ).json()["data"] == [["YWJj"]]
+    for bad in (
+        {"DATE_OUTPUT_FORMAT": "YYYY-QQ"},
+        {"BINARY_OUTPUT_FORMAT": "OCTAL"},
+    ):
+        resp = post("SELECT CURRENT_DATE()", bad)
+        assert resp.status_code == 422, (bad, resp.json())
+
+    # The formats travel with the result, so a later GET renders it the same way.
+    submitted = post(
+        "SELECT CAST('2024-03-04' AS DATE) AS d", {"DATE_OUTPUT_FORMAT": "DD.MM.YYYY"}
+    )
+    handle = submitted.json()["statementHandle"]
+    fetched = client.get(f"/api/v2/statements/{handle}")
+    assert fetched.json()["data"] == [["04.03.2024"]]
 
 
 def test_async_statement_returns_202_and_is_pollable(client):

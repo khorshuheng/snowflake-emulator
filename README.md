@@ -117,13 +117,33 @@ curl -X POST http://localhost:8000/api/v2/statements \
   -d '{"statement": "SELECT 1 AS x"}'
 ```
 
-Multiple semicolon-separated statements are supported; only the final statement's
-result set is returned (matching Snowflake's own behavior):
+Multiple semicolon-separated statements are supported, and only the final statement's
+result set is returned (matching Snowflake's own behavior). Like Snowflake, the request has
+to opt in: `MULTI_STATEMENT_COUNT` defaults to `1`, so a chained body is rejected unless the
+request sends `0` (any number) or the exact count.
 
 ```bash
 curl -X POST http://localhost:8000/api/v2/statements \
   -H 'Content-Type: application/json' \
-  -d '{"statement": "CREATE TABLE t (a INT, b VARCHAR); INSERT INTO t VALUES (1, '\''x'\''); SELECT * FROM t"}'
+  -d '{"statement": "CREATE TABLE t (a INT, b VARCHAR); INSERT INTO t VALUES (1, '\''x'\''); SELECT * FROM t",
+       "parameters": {"MULTI_STATEMENT_COUNT": "0"}}'
+```
+
+The `parameters` object also honours `TIMEZONE` (an IANA zone name such as
+`America/Los_Angeles`, applied to the request; a numeric offset is rejected because DuckDB's
+session timezone only knows zone names) and the rowset's text formats:
+`DATE_OUTPUT_FORMAT` (`YYYY-MM-DD`), `TIME_OUTPUT_FORMAT` (`HH24:MI:SS`),
+`TIMESTAMP_OUTPUT_FORMAT` (`YYYY-MM-DD HH24:MI:SS.FF3`) and `BINARY_OUTPUT_FORMAT`
+(`HEX` or `BASE64`) — the defaults in parentheses are what an absent parameter produces.
+The pattern tokens `YYYY`, `YY`, `MM`, `DD`, `HH24`, `HH12`, `MI`, `SS`, `AM`/`PM` and
+`FF0`-`FF9` are translated; any other token, an unknown timezone, or a negative
+`MULTI_STATEMENT_COUNT` is a `422` rather than a silent default.
+
+```bash
+curl -X POST http://localhost:8000/api/v2/statements \
+  -H 'Content-Type: application/json' \
+  -d '{"statement": "SELECT CURRENT_DATE() AS d",
+       "parameters": {"DATE_OUTPUT_FORMAT": "DD.MM.YYYY"}}'
 ```
 
 Obtain a bearer token to keep session state (current database/schema/warehouse/role)
