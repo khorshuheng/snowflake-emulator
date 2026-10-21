@@ -233,6 +233,15 @@ UBIGINT`), and a VARIANT *value* searched in a JSON array (`ARRAY_CONTAINS`, `AR
 `ARRAY_REMOVE` removes the value rather than every NULL element (a NULL element survives; a NULL
 value returns NULL, as documented).
 
+`TIMESTAMP_NTZ(7..9)` is stored at **microsecond** precision. DuckDB maps a precision above 6 to
+`TIMESTAMP_NS` (int64 nanoseconds), which only spans roughly 1677-2262, so Snowflake's year range
+(1-9999) -- e.g. a `9999-12-31` expiry -- could not be stored at all. Capping storage at
+microseconds keeps the whole range: digits 7-9 are masked on write (truncated, not rounded the way
+Snowflake rounds), and `DESCRIBE`/`INFORMATION_SCHEMA.COLUMNS` still report the declared
+`TIMESTAMP_NTZ(9)` from the catalog side table. A table created by an older emulator *is* a
+nanosecond column on disk and keeps the narrower range until it is recreated. `TIMESTAMP_TZ`/
+`TIMESTAMP_LTZ` are unaffected (they already use a microsecond `TIMESTAMPTZ`).
+
 `REGEXP_SUBSTR` follows Snowflake's arguments: `position`, `occurrence`, `regex_parameters`
 and `group_num`. With the `e` ("extract") parameter it returns the part matched by group 1 (or
 by `group_num`, which implies `e`), without `e` it returns the whole match, a pattern with no

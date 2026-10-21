@@ -16,6 +16,12 @@ from snowflake_emulator.type_mapping import (
 
 _DECLARED_TYPE_OVERRIDE = re.compile(r"^(VARCHAR|CHAR|STRING|TEXT|BINARY|VARBINARY)\(\d+\)$")
 
+# A ``TIMESTAMP_NTZ(7..9)`` column is stored at microsecond precision (DuckDB's nanosecond
+# type only spans ~1677-2262, Snowflake's range is year 1-9999), so the declared precision has
+# to come back from the side table. Precision 0-6 needs no restoring: the physical type already
+# reports it. The side table keeps sqlglot's spelling (``TIMESTAMPNTZ(9)``).
+_TIMESTAMP_NTZ_PRECISION = re.compile(r"^TIMESTAMP_?NTZ\((\d+)\)$")
+
 
 def show_name_patterns(
     statement: exp.Expression,
@@ -95,7 +101,11 @@ def prefer_declared_type(declared: Any, duckdb_type: Any) -> str | None:
     """
     if not isinstance(declared, str):
         return None
-    return declared if _DECLARED_TYPE_OVERRIDE.match(declared.upper()) else None
+    upper = declared.upper()
+    match = _TIMESTAMP_NTZ_PRECISION.match(upper)
+    if match and int(match.group(1)) > 6:
+        return f"TIMESTAMP_NTZ({match.group(1)})"
+    return declared if _DECLARED_TYPE_OVERRIDE.match(upper) else None
 
 
 def temp_inclusive_scope(

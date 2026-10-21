@@ -271,6 +271,9 @@ class DuckDBManager:
                 c.column_name AS COLUMN_NAME,
                 c.column_index + 1 AS ORDINAL_POSITION,
                 CASE
+                    WHEN regexp_matches(upper(e.declared_type), '^TIMESTAMP_?NTZ\\(([7-9])\\)$')
+                      THEN 'TIMESTAMP_NTZ('
+                           || regexp_extract(upper(e.declared_type), '\\(([7-9])\\)', 1) || ')'
                     WHEN e.declared_type LIKE 'VARCHAR(%' OR e.declared_type LIKE 'CHAR(%'
                       OR e.declared_type LIKE 'STRING(%' OR e.declared_type LIKE 'TEXT(%'
                       OR e.declared_type LIKE 'BINARY(%' THEN e.declared_type

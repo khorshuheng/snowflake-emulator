@@ -293,6 +293,60 @@ def test_json_path_extraction_on_bound_variant_operand(client):
     assert table.column(2).to_pylist() == [1]
 
 
+def test_timestamp_ntz_nanosecond_precision_keeps_the_year_range(client):
+    """``TIMESTAMP_NTZ(7..9)`` is stored at microsecond precision, so Snowflake's year range works.
+
+    DuckDB stores precision > 6 as ``TIMESTAMP_NS`` (int64 nanoseconds), which only spans about
+    1677-2262, so a ``9999-12-31`` value -- an ordinary Snowflake expiry -- failed with
+    ``Could not convert string ... to INT64``. Storage is capped at microseconds and digits 7-9
+    are masked; the declared precision still reports from the catalog side table.
+    """
+    def post(statement, parameters=None):
+        body = {"statement": statement}
+        if parameters:
+            body["parameters"] = parameters
+        return client.post("/api/v2/statements", json=body)
+
+    def data(statement, parameters=None):
+        resp = post(statement, parameters)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    ff6 = {"TIMESTAMP_OUTPUT_FORMAT": "YYYY-MM-DD HH24:MI:SS.FF6"}
+
+    assert post(
+        "CREATE OR REPLACE TABLE ntz_wide (t9 TIMESTAMP_NTZ(9), t6 TIMESTAMP_NTZ(6))"
+    ).status_code == 200
+    # Year 9999 is inside Snowflake's range and past the nanosecond type's.
+    assert post(
+        "INSERT INTO ntz_wide VALUES ("
+        "'9999-12-31 23:59:59.123456789', '9999-12-31 23:59:59.123456')"
+    ).status_code == 200, post("SELECT 1").json()
+    # The column is a microsecond timestamp now, and digits 7-9 are masked (truncated).
+    assert data("SELECT DISTINCT typeof(t9) FROM ntz_wide") == [["TIMESTAMP"]]
+    assert data("SELECT t9 FROM ntz_wide", ff6) == [["9999-12-31 23:59:59.123456"]]
+    assert data("SELECT t6 FROM ntz_wide", ff6) == [["9999-12-31 23:59:59.123456"]]
+    # The declared precision is still reported.
+    described = {row[0]: row[1] for row in data("DESCRIBE TABLE ntz_wide")}
+    assert described["T9"] == "TIMESTAMP_NTZ(9)"
+    assert described["T6"] == "TIMESTAMP_NTZ(6)"
+    assert data(
+        "SELECT DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS "
+        "WHERE TABLE_NAME = 'NTZ_WIDE' AND COLUMN_NAME = 'T9'"
+    ) == [["TIMESTAMP_NTZ(9)"]]
+    # A CAST target is capped the same way.
+    assert data(
+        "SELECT CAST('9999-12-31 23:59:59.123456789' AS TIMESTAMP_NTZ(9)) AS ts", ff6
+    ) == [["9999-12-31 23:59:59.123456"]]
+    # Precision 0-6 and TIMESTAMP_TZ are untouched.
+    assert data(
+        "SELECT CAST('9999-12-31 23:59:59.123456' AS TIMESTAMP_NTZ(6)) AS ts", ff6
+    ) == [["9999-12-31 23:59:59.123456"]]
+    assert data(
+        "SELECT CAST('9999-12-31 00:00:00.123456789' AS TIMESTAMP_TZ(9)) AS ts", ff6
+    ) == [["9999-12-31 00:00:00.123456"]]
+
+
 def test_timestamp_precision_translation_and_metadata(client):
     # Snowflake's TIMESTAMP_TZ(p)/TIMESTAMP_LTZ(p) precision parameter must not make
     # the translated DuckDB DDL/CAST invalid (DuckDB rejects TIMESTAMPTZ(p)), and the
