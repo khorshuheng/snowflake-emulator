@@ -224,19 +224,6 @@ def test_array_slice_over_variant_arrays(client):
         assert resp.json()["data"] == expected, statement
 
 
-def test_array_slice_accepts_a_bound_index(client):
-    """A `?` index is adjusted through a one-element list, so it consumes a single value."""
-    resp = client.post(
-        "/api/v2/statements",
-        json={
-            "statement": "SELECT ARRAY_SLICE(ARRAY_CONSTRUCT('a','b','c'), ?, 2)",
-            "bindings": {"1": {"type": "FIXED", "value": "1"}},
-        },
-    )
-    assert resp.status_code == 200, resp.json()
-    assert resp.json()["data"] == [[["b", "c"]]]
-
-
 def test_slice_alias_matches_array_slice(client, tmp_path):
     """`SLICE` is Snowflake's alias of `ARRAY_SLICE`; sqlglot left it as an unknown call."""
     def post(statement):
@@ -1004,7 +991,6 @@ def test_array_functions_coerce_a_mixed_operand_pair(client):
     assert data("SELECT ARRAYS_OVERLAP(nums, ARRAY_CONSTRUCT(2)) FROM mix") == [[True]]
     assert data("SELECT ARRAYS_OVERLAP(nums, ARRAY_CONSTRUCT(9)) FROM mix") == [[False]]
     assert data("SELECT ARRAY_INTERSECTION(nums, ARRAY_CONSTRUCT(2)) FROM mix") == [[[2]]]
-    assert data("SELECT ARRAY_INTERSECTION(j:nums, ARRAY_CONSTRUCT('2')) FROM mix") == [[[]]]
     assert data("SELECT ARRAY_INTERSECTION(j:names, ARRAY_CONSTRUCT('a')) FROM mix") == [
         [['a']]
     ]

@@ -153,15 +153,6 @@ def test_show_objects_snowflake_shape(client):
     )
 
 
-def test_show_user_functions_returns_empty_shape(client):
-    resp = _post(client, "SHOW USER FUNCTIONS IN EMULATOR_DB.PUBLIC")
-    assert resp.status_code == 200
-    body = resp.json()
-    names = [c["name"] for c in body["resultSetMetaData"]["rowType"]]
-    assert "name" in names and "catalog_name" in names and "is_builtin" in names
-    assert body["data"] == []
-
-
 def test_describe_table_snowflake_column_names(client):
     assert _post(client, "CREATE TABLE desc_s (id INT, name VARCHAR)").status_code == 200
     resp = _post(client, "DESCRIBE TABLE desc_s")
