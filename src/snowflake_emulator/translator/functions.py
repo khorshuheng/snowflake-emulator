@@ -184,6 +184,66 @@ def _duckdb_type_text(declared_type: str | None) -> str | None:
         return None
 
 
+_TEXT_TYPE_PREFIXES = ("VARCHAR", "CHAR", "TEXT", "STRING", "BPCHAR")
+
+
+def _is_text_type(duckdb_type: str | None) -> bool:
+    """True for a DuckDB type whose Snowflake parameter holds text."""
+    return duckdb_type is not None and duckdb_type.strip().upper().startswith(
+        _TEXT_TYPE_PREFIXES
+    )
+
+
+def _text_parameter_coercion(
+    node: exp.Column,
+    kind: exp.DataType,
+    parameters: Sequence[tuple[str, str | None]],
+) -> exp.Expression:
+    """Coerce a text parameter after unifying the call's temporal argument types.
+
+    Snowflake resolves the call's argument types together before coercing them to a
+    parameter's declared text type: a DATE next to a TIMESTAMP becomes a TIMESTAMP (midnight),
+    while a string next to a DATE is read as a DATE. Casting each argument to text on its own
+    loses that: a DATE and a TIMESTAMP parameter would produce different text for the same
+    instant. ``typeof`` of the actual parameters is the only reliable signal inside a DuckDB
+    macro, where the arguments keep their caller types until the body coerces them.
+    """
+    names = [name for name, _ in parameters]
+
+    def any_type(pattern: str, *, exact: bool) -> exp.Expression:
+        matches = [
+            exp.EQ(
+                this=exp.Anonymous(this="typeof", expressions=[_identifier(name)]),
+                expression=exp.Literal.string(pattern),
+            )
+            if exact
+            else exp.Like(
+                this=exp.Anonymous(this="typeof", expressions=[_identifier(name)]),
+                expression=exp.Literal.string(pattern),
+            )
+            for name in names
+        ]
+        return exp.or_(*matches)
+
+    def text_cast(common_type: str | None) -> exp.Expression:
+        value = node.copy()
+        if common_type is not None:
+            value = exp.cast(
+                value,
+                exp.DataType.build(common_type, dialect=WRITE_DIALECT),
+                dialect=WRITE_DIALECT,
+            )
+        return exp.cast(value, kind, dialect=WRITE_DIALECT)
+
+    return exp.Case(
+        ifs=[
+            exp.If(this=any_type("TIMESTAMP%", exact=False), true=text_cast("TIMESTAMP")),
+            exp.If(this=any_type("DATE", exact=True), true=text_cast("DATE")),
+        ],
+        default=text_cast(None),
+    )
+
+
 def _cast_parameters(
     expression: exp.Expression, parameters: Sequence[tuple[str, str | None]]
 ) -> exp.Expression:
@@ -217,12 +277,18 @@ def _cast_parameters(
         duckdb_type = types.get(node.name.upper())
         if duckdb_type is None:
             return node
-        parent = node.parent
-        if isinstance(parent, exp.Cast) and parent.to.sql(dialect=WRITE_DIALECT) == duckdb_type:
-            return node  # already coerced
         kind = build(duckdb_type)
+        parent = node.parent
+        if (
+            not _is_text_type(duckdb_type)
+            and isinstance(parent, exp.Cast)
+            and parent.to.sql(dialect=WRITE_DIALECT) == duckdb_type
+        ):
+            return node  # already coerced
         if kind is None:
             return node
+        if _is_text_type(duckdb_type):
+            return _text_parameter_coercion(node, kind, parameters)
         return exp.cast(node.copy(), kind, dialect=WRITE_DIALECT)
 
     return expression.transform(replace)

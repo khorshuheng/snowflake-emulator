@@ -287,6 +287,54 @@ def test_udf_parameters_are_coerced_to_their_declared_type(client):
     assert _data(client, "SELECT arr_len(ARRAY_CONSTRUCT('a','b'))") == [[2]]
 
 
+def test_udf_text_parameters_unify_the_call_temporal_types(client):
+    """Text parameters are unified with their siblings before becoming strings.
+
+    Snowflake resolves a call's argument types together: a DATE next to a TIMESTAMP is
+    promoted to a TIMESTAMP (midnight), and a string next to a DATE is read as a DATE.
+    Casting each parameter to text independently would give two different strings for the
+    same instant.
+    """
+    def created(statement):
+        resp = _post(client, statement)
+        assert resp.status_code == 200, resp.json()
+
+    created(
+        "CREATE OR REPLACE FUNCTION date_args_equal(a VARCHAR, b VARCHAR) "
+        "RETURNS BOOLEAN AS $$ a = b $$"
+    )
+    # The string is read as a DATE, matching both date spellings.
+    assert _data(
+        client, "SELECT date_args_equal(DATE '2026-09-30', '2026-09-30 00:00:00.000')"
+    ) == [[True]]
+    assert _data(
+        client, "SELECT date_args_equal('2026-09-30 00:00', DATE '2026-09-30')"
+    ) == [[True]]
+    # The DATE is promoted to midnight TIMESTAMP, matching the timestamp argument.
+    assert _data(
+        client,
+        "SELECT date_args_equal(DATE '2026-09-30', TIMESTAMP '2026-09-30 00:00:00')",
+    ) == [[True]]
+    assert _data(
+        client,
+        "SELECT date_args_equal('2026-09-30 00:00:00', "
+        "TIMESTAMP '2026-09-30 00:00:00')",
+    ) == [[True]]
+
+    created(
+        "CREATE OR REPLACE FUNCTION date_args_text(a VARCHAR, b VARCHAR) "
+        "RETURNS VARCHAR AS $$ a || '|' || b $$"
+    )
+    assert _data(
+        client,
+        "SELECT date_args_text(DATE '2026-09-30', '2026-09-30 00:00:00.000')",
+    ) == [["2026-09-30|2026-09-30"]]
+    assert _data(
+        client,
+        "SELECT date_args_text(DATE '2026-09-30', TIMESTAMP '2026-09-30 00:00:00')",
+    ) == [["2026-09-30 00:00:00|2026-09-30 00:00:00"]]
+
+
 def test_dropping_one_overload_leaves_the_other_callable(client):
     _post(client, CASE_INSENSITIVE_EQUAL)
     _post(client, CASE_INSENSITIVE_ARRAY_EQUAL)
