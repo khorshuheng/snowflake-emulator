@@ -108,6 +108,7 @@ def _timestamp_to_sf_struct(ts: pa.ChunkedArray) -> pa.Array:
                 pa.field("fraction", pa.int32(), nullable=False),
                 pa.field("timezone", pa.int32(), nullable=False),
             ],
+            mask=combined.is_null(),
         )
     return pa.StructArray.from_arrays(
         arrays=[epoch, fraction],
@@ -115,6 +116,7 @@ def _timestamp_to_sf_struct(ts: pa.ChunkedArray) -> pa.Array:
             pa.field("epoch", pa.int64(), nullable=False),
             pa.field("fraction", pa.int32(), nullable=False),
         ],
+        mask=combined.is_null(),
     )
 
 

@@ -29,8 +29,17 @@ _scoped: ContextVar[frozenset[str]] = ContextVar("scoped_names", default=frozens
 
 # Table alias -> real table name, so a column qualified by an alias (``s.$1:id`` is a stage,
 # but ``t.name`` may be ``stage_t AS t``) still resolves. A derived-table alias has no real
-# table name and is absent, which leaves it unresolved -- the safe direction.
+# table name, so its output columns are described separately below.
 _aliases: ContextVar[dict[str, str]] = ContextVar("table_aliases", default={})
+
+# ``(derived_alias, column) -> DuckDB type`` for a derived table or CTE. A query-scoped
+# relation has no catalog columns, but its projection still decides what a column holds: a
+# ``$1:name`` projection is JSON, and a projected VARIANT column stays VARIANT. Without this,
+# an ``UPDATE ... FROM (SELECT $1:name AS name ...) s WHERE t.name = s.name`` compared a
+# VARCHAR with a bare name the resolver could not type, and DuckDB raised ``Malformed JSON``.
+_derived: ContextVar[dict[tuple[str, str], str]] = ContextVar(
+    "derived_column_types", default={}
+)
 
 
 def current_resolver() -> ColumnTypeResolver | None:
@@ -102,26 +111,55 @@ def reset_table_aliases(token: Token) -> None:
     _aliases.reset(token)
 
 
+def set_derived_column_types(types: dict[tuple[str, str], str]) -> Token:
+    """Publish the output column types of derived tables and CTEs for this pass."""
+    return _derived.set(types)
+
+
+def reset_derived_column_types(token: Token) -> None:
+    """Restore the derived-column map that was in scope before the setter."""
+    _derived.reset(token)
+
+
 def declared_column_type(node: exp.Expression | None) -> str | None:
     """The DuckDB type of a bare column, when the caller supplied a catalog lookup.
 
     A name the statement defines itself is not looked up: an unrelated table with the same
-    column name would otherwise decide how the column is rewritten.
+    column name would otherwise decide how the column is rewritten. A column qualified by a
+    derived-table alias is resolved from that relation's projection instead of the catalog.
+
+    A qualified column is never shadowed by an unqualified select alias of the same name: the
+    table qualifier names a relation, while the alias names a value in some SELECT list.
     """
-    resolver = _resolver.get()
-    if resolver is None or not isinstance(node, exp.Column):
-        return None
-    scoped = _scoped.get()
-    if node.name.upper() in scoped:
+    if not isinstance(node, exp.Column):
         return None
     table = node.table or None
     if table:
-        if table.upper() in scoped:
-            # A derived-table alias: it names a query result, not a catalog table.
+        derived = _derived.get().get((table.upper(), node.name.upper()))
+        if derived is not None:
+            return derived
+    resolver = _resolver.get()
+    if resolver is None:
+        return None
+    scoped = _scoped.get()
+    if not table and node.name.upper() in scoped:
+        return None
+    if table:
+        if table.upper() in scoped and (table.upper(), node.name.upper()) not in _derived.get():
+            # A derived/query-scoped name with no projected column of that name.
             return None
         # A table alias names a real table; a stage reference has no entry and stays unresolved.
         table = _aliases.get().get(table.upper(), table)
     return resolver(node.catalog or None, node.db or None, table, node.name)
+
+
+def declared_table_columns(table: exp.Table | None) -> list[str] | None:
+    """The catalog columns of `table`, in declaration order, when the catalog is in scope."""
+    resolver = _resolver.get()
+    getter = getattr(resolver, "table_columns", None)
+    if getter is None or not isinstance(table, exp.Table):
+        return None
+    return getter(table.text("catalog") or None, table.text("db") or None, table.name)
 
 
 def is_variant_typed(node: exp.Expression | None) -> bool:
@@ -138,3 +176,14 @@ def is_variant_typed(node: exp.Expression | None) -> bool:
         return True
     declared = declared_column_type(node)
     return declared is not None and declared.strip().upper().startswith("VARIANT")
+
+
+def is_json_typed(node: exp.Expression | None) -> bool:
+    """True for a column whose DuckDB type is JSON (Snowflake's OBJECT/ARRAY storage)."""
+    declared = declared_column_type(node)
+    return declared is not None and declared.strip().upper().startswith("JSON")
+
+
+def is_semi_structured_typed(node: exp.Expression | None) -> bool:
+    """True for a column that stores a semi-structured value (VARIANT or JSON)."""
+    return is_variant_typed(node) or is_json_typed(node)

@@ -173,7 +173,7 @@ def _rewrite_semi_structured_text_cast(node: exp.Expression) -> exp.Expression:
     if not (
         _is_json_value(operand)
         or _is_variant_value(operand)
-        or column_types.is_variant_typed(operand)
+        or column_types.is_semi_structured_typed(operand)
     ):
         return node
     inner = operand.transform(_rewrite_snowflake_specifics)
@@ -220,10 +220,11 @@ def _text_operand(node: exp.Expression | None) -> exp.Expression | None:
     if node is None:
         return node
     if column_types.is_variant_typed(node):
+        # ``->>`` on a VARIANT casts to VARCHAR first (its struct repr), so reach real JSON.
         node = exp.cast(node, exp.DataType.build("JSON"), dialect=WRITE_DIALECT)
-    if not _is_json_value(node):
-        return node
-    return _json_root_extract(node)
+    if column_types.is_json_typed(node) or _is_json_value(node):
+        return _json_root_extract(node)
+    return node
 
 
 def _rewrite_variant_text_function(node: exp.Expression) -> exp.Expression:
@@ -256,7 +257,7 @@ _COMPARISON_NODES = (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)
 def _is_semi_structured_value(node: exp.Expression | None) -> bool:
     """True for a value Snowflake stores as JSON/VARIANT (a path, PARSE_JSON, such a column)."""
     return node is not None and (
-        _is_json_value(node) or column_types.is_variant_typed(node)
+        _is_json_value(node) or column_types.is_semi_structured_typed(node)
     )
 
 
@@ -313,9 +314,10 @@ def _rewrite_semi_structured_comparison(node: exp.Expression) -> exp.Expression:
     the JSON holds the same string. DuckDB instead tries to parse ``'ada'`` as JSON and raises
     ``Malformed JSON``. A JSON string and the number it spells stay distinct either way.
     """
-    if isinstance(node.parent, exp.Update):
+    if isinstance(node.parent, exp.Update) and node in (node.parent.expressions or []):
         # ``UPDATE t SET col = ...`` is an EQ *assignment*: the write pass coerces its value to
-        # the target column's type, and the column itself must not be rewritten.
+        # the target column's type, and the column itself must not be rewritten. A WHERE
+        # comparison is a separate EQ hanging off the Update's ``where`` argument.
         return node
     left, right = node.this, node.args.get("expression")
     # Equality compares JSON *values*, so wrapping the other side is safe whatever it holds --
@@ -336,41 +338,78 @@ def _is_text_expression(node: exp.Expression | None) -> bool:
     return _is_text_column(column_types.declared_column_type(node))
 
 
+def _insert_target_columns(
+    statement: exp.Insert,
+) -> tuple[exp.Table | None, list[str]]:
+    """The INSERT target table and its target column names in order, when they are known.
+
+    Snowflake allows the column list to be omitted (the table's own order applies) and allows
+    an alias before an explicit list (``INSERT INTO t AS x (a, b)``); sqlglot puts the latter
+    under the table alias. Both forms need the same target-aware coercion as the plain
+    ``INSERT INTO t (a, b)`` form.
+    """
+    target = statement.this
+    if isinstance(target, exp.Schema):
+        table = target.this
+        columns = [
+            item.name
+            for item in target.expressions
+            if isinstance(item, exp.Expression)
+        ]
+        return (table if isinstance(table, exp.Table) else None), columns
+    if isinstance(target, exp.Table):
+        alias = target.args.get("alias")
+        columns: list[str] = []
+        if isinstance(alias, exp.TableAlias):
+            columns = [
+                item.name
+                for item in (alias.args.get("columns") or [])
+                if isinstance(item, exp.Expression)
+            ]
+        if not columns:
+            columns = column_types.declared_table_columns(target) or []
+        return target, columns
+    return None, []
+
+
+def _coerce_insert_select(
+    select: exp.Expression | None, table: exp.Table, columns: list[str]
+) -> None:
+    """Coerce each semi-structured select value written into a text target column."""
+    if isinstance(select, exp.Union):
+        _coerce_insert_select(select.this, table, columns)
+        _coerce_insert_select(select.expression, table, columns)
+        return
+    if not isinstance(select, exp.Select) or len(select.expressions) != len(columns):
+        return
+    rewritten: list[exp.Expression] = []
+    for target, item in zip(columns, select.expressions):
+        value = item.this if isinstance(item, exp.Alias) else item
+        if _is_text_column(_target_column_type(table, target)) and (
+            _is_semi_structured_value(value)
+        ):
+            converted = _text_operand(value)
+            if isinstance(item, exp.Alias):
+                item = item.copy()
+                item.set("this", converted)
+            else:
+                item = converted
+        rewritten.append(item)
+    select.set("expressions", rewritten)
+
+
 def rewrite_semi_structured_writes(statement: exp.Expression) -> exp.Expression:
     """Coerce a staged JSON value written into a text column to that column's text form.
 
-    ``INSERT INTO t (name) SELECT $1:name FROM @stage`` and ``UPDATE t SET name = s.$1:name``
-    would otherwise store DuckDB's JSON serialization, quotes and all (``"ada"``), where
-    Snowflake stores the string's text (``ada``).
+    ``INSERT INTO t (name) SELECT $1:name FROM @stage``, the same INSERT without a column
+    list, and ``UPDATE t SET name = s.$1:name`` would otherwise store DuckDB's JSON
+    serialization, quotes and all (``"ada"``), where Snowflake stores the string's text
+    (``ada``).
     """
-    if isinstance(statement, exp.Insert) and isinstance(statement.this, exp.Schema):
-        table = statement.this.this
-        columns = [
-            column.name
-            for column in statement.this.expressions
-            if isinstance(column, exp.Expression)
-        ]
-        select = statement.args.get("expression")
-        if (
-            isinstance(table, exp.Table)
-            and isinstance(select, exp.Select)
-            and len(select.expressions) == len(columns)
-        ):
-            statement.this.this  # keep the target in place
-            rewritten: list[exp.Expression] = []
-            for target, item in zip(columns, select.expressions):
-                value = item.this if isinstance(item, exp.Alias) else item
-                if _is_text_column(_target_column_type(table, target)) and (
-                    _is_semi_structured_value(value)
-                ):
-                    converted = _text_operand(value)
-                    if isinstance(item, exp.Alias):
-                        item = item.copy()
-                        item.set("this", converted)
-                    else:
-                        item = converted
-                rewritten.append(item)
-            select.set("expressions", rewritten)
+    if isinstance(statement, exp.Insert):
+        table, columns = _insert_target_columns(statement)
+        if table is not None and columns:
+            _coerce_insert_select(statement.args.get("expression"), table, columns)
     elif isinstance(statement, exp.Update) and isinstance(statement.this, exp.Table):
         table = statement.this
         for assignment in statement.expressions:
@@ -385,7 +424,6 @@ def rewrite_semi_structured_writes(statement: exp.Expression) -> exp.Expression:
             ):
                 assignment.set("expression", _text_operand(value))
     return statement
-
 
 def _rewrite_snowflake_specifics(node: exp.Expression) -> exp.Expression:
     """Rewrite Snowflake nodes that sqlglot can't fully transpile to DuckDB."""
@@ -404,6 +442,15 @@ def _rewrite_snowflake_specifics(node: exp.Expression) -> exp.Expression:
         return _rewrite_semi_structured_comparison(node)
     if isinstance(node, exp.In):
         return _rewrite_semi_structured_membership(node)
+
+    # ``PARSE_JSON(<variant>)``: DuckDB's ``JSON(variant)`` first renders the VARIANT's
+    # internal repr (``{'names': [X]}``) and then fails to parse it. Snowflake parses the
+    # value's JSON text, which is exactly what casting the VARIANT to JSON gives.
+    if isinstance(node, exp.ParseJSON):
+        operand = node.this
+        if _is_variant_value(operand) or column_types.is_variant_typed(operand):
+            return exp.cast(operand, exp.DataType.build("JSON"), dialect=WRITE_DIALECT)
+        return node
 
     # Snowflake JSON path extraction (``col:path``, ``GET_PATH``) transpiles to
     # DuckDB's ``->``/``->>``, which parses its operand as JSON on the fly. A VALUE

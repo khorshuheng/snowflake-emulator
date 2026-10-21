@@ -160,9 +160,18 @@ def match_stage_command(sql: str) -> str | None:
     return None
 
 
+def _strip_statement_terminator(sql: str) -> str:
+    """Drop a trailing statement semicolon; options and stage paths end at the statement.
+
+    The SQL API accepts a single statement with its terminating ``;``, so ``... OVERWRITE=TRUE;``
+    must not parse as the option value ``TRUE;``. A semicolon inside a quoted pattern is kept.
+    """
+    return sql.strip().rstrip(";").rstrip()
+
+
 def parse_put(sql: str) -> PutCommand:
     """Parse ``PUT file:///a.csv [file:///b.csv] @<stage> [PARALLEL=4] [OVERWRITE=TRUE]``."""
-    rest = sql[3:].strip()
+    rest = _strip_statement_terminator(sql)[3:].strip()
     at_index = rest.find("@")
     if at_index < 0:
         raise StageError("PUT requires a stage location, e.g. `PUT file:///x.csv @~/dir`.")
@@ -181,7 +190,7 @@ def parse_put(sql: str) -> PutCommand:
 
 def parse_get(sql: str) -> GetCommand:
     """Parse ``GET @<stage> file:///local/dir [PATTERN='...'] [PARALLEL=4]``."""
-    rest = sql[3:].strip()
+    rest = _strip_statement_terminator(sql)[3:].strip()
     parts = rest.split(maxsplit=2)
     if not parts:
         raise StageError("GET requires a stage location.")
@@ -195,7 +204,7 @@ def parse_get(sql: str) -> GetCommand:
 
 def parse_list(sql: str) -> ListCommand:
     """Parse ``LIST @<stage> [PATTERN='...']``."""
-    rest = sql[4:].strip()
+    rest = _strip_statement_terminator(sql)[4:].strip()
     parts = rest.split(maxsplit=1)
     if not parts:
         raise StageError("LIST requires a stage location.")
@@ -206,7 +215,7 @@ def parse_list(sql: str) -> ListCommand:
 
 def parse_remove(sql: str) -> RemoveCommand:
     """Parse ``REMOVE @<stage> [PATTERN='...']``."""
-    rest = sql[6:].strip()
+    rest = _strip_statement_terminator(sql)[6:].strip()
     parts = rest.split(maxsplit=1)
     if not parts:
         raise StageError("REMOVE requires a stage location.")

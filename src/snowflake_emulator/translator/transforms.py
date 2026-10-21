@@ -8,8 +8,11 @@ from snowflake_emulator.translator import column_types
 from snowflake_emulator.translator.aggregates import _rewrite_aggregate_functions
 from snowflake_emulator.translator.arrays import (
     ColumnTypeResolver,
+    _is_json_value,
+    _is_variant_value,
     _rewrite_json_array_functions,
 )
+from snowflake_emulator.translator.errors import TranslationError
 from snowflake_emulator.translator.regexp import _rewrite_regexp_functions
 from snowflake_emulator.translator.semi_structured import (
     _rewrite_information_schema,
@@ -54,6 +57,101 @@ def _rewrite_timestamp_precision(node: exp.Expression) -> exp.Expression:
     return node
 
 
+def _derived_column_types(statement: exp.Expression) -> dict[tuple[str, str], str]:
+    """The output column types of the statement's derived tables and CTEs.
+
+    A derived table has no catalog entry, so a column read from it would otherwise be
+    untyped: a staged ``$1:name AS name`` projection then compared as a plain name, and
+    DuckDB parsed the VARCHAR side as JSON (``Malformed JSON``). The projection itself says
+    what the column holds, so record the semi-structured ones (and any catalog type a
+    projected bare column carries).
+    """
+    types: dict[tuple[str, str], str] = {}
+
+    def record(alias: str, select: exp.Expression) -> None:
+        if not alias or not isinstance(select, exp.Select):
+            return
+        for item in select.expressions:
+            value = item.this if isinstance(item, exp.Alias) else item
+            name = item.alias_or_name
+            if not name or name == "*":
+                continue
+            if _is_json_value(value):
+                declared = "JSON"
+            elif _is_variant_value(value):
+                declared = "VARIANT"
+            else:
+                declared = None
+            declared = declared or column_types.declared_column_type(value)
+            if declared:
+                types[(alias.upper(), name.upper())] = declared
+
+    for subquery in statement.find_all(exp.Subquery):
+        record(subquery.alias, subquery.this)
+    for cte in statement.find_all(exp.CTE):
+        record(cte.alias, cte.this)
+    return types
+
+
+def _select_sources(select: exp.Select) -> set[str]:
+    """The table names/aliases a SELECT's own FROM and JOIN entries introduce."""
+    names: set[str] = set()
+
+    def add(node: exp.Expression | None) -> None:
+        if isinstance(node, exp.Table):
+            names.add((node.alias or node.name).upper())
+        elif isinstance(node, exp.Subquery) and node.alias:
+            names.add(node.alias.upper())
+        elif isinstance(node, exp.Lateral):
+            if node.alias:
+                names.add(node.alias.upper())
+            else:
+                add(node.this)
+
+    from_ = select.args.get("from_")
+    if isinstance(from_, exp.From):
+        add(from_.this)
+    for join in select.args.get("joins") or []:
+        if isinstance(join, exp.Join):
+            add(join.this)
+    return names
+
+
+def _outer_sources(select: exp.Select) -> set[str]:
+    """Names introduced by SELECTs enclosing `select` (the scopes it can correlate to)."""
+    names: set[str] = set()
+    node = select.parent
+    while node is not None:
+        if isinstance(node, exp.Select):
+            names.update(_select_sources(node))
+        node = node.parent
+    return names
+
+
+def _reject_correlated_limit(statement: exp.Expression) -> None:
+    """Reject LIMIT/FETCH in a correlated subquery, as Snowflake does.
+
+    Snowflake allows LIMIT/FETCH only in an *uncorrelated scalar* subquery. DuckDB accepts
+    the correlated form (often returning rows), so leaving it through would silently report
+    results Snowflake rejects. A subquery is treated as correlated when it references a table
+    name or alias introduced by an enclosing SELECT.
+    """
+    for select in statement.find_all(exp.Select):
+        if select.args.get("limit") is None:
+            continue
+        local = _select_sources(select)
+        outer = _outer_sources(select)
+        if not outer:
+            continue
+        for column in select.find_all(exp.Column):
+            qualifier = column.table.upper()
+            if qualifier and qualifier in outer and qualifier not in local:
+                raise TranslationError(
+                    "LIMIT / FETCH is not supported in a correlated subquery; Snowflake "
+                    "allows it only in an uncorrelated scalar subquery."
+                )
+
+
 def _apply_transforms(
     statement: exp.Expression, resolver: ColumnTypeResolver | None = None
 ) -> exp.Expression:
@@ -75,7 +173,11 @@ def _apply_transforms(
     alias_token = column_types.set_table_aliases(
         column_types.statement_table_aliases(statement)
     )
+    derived_token = column_types.set_derived_column_types(
+        _derived_column_types(statement)
+    )
     try:
+        _reject_correlated_limit(statement)
         statement = statement.transform(_rewrite_timestamp_precision)
         statement = statement.transform(_uppercase_unquoted_identifiers)
         statement = statement.transform(_rewrite_information_schema)
@@ -87,6 +189,7 @@ def _apply_transforms(
         # those operands must already be in their final DuckDB form.
         return _rewrite_json_array_functions(statement, resolver)
     finally:
+        column_types.reset_derived_column_types(derived_token)
         column_types.reset_table_aliases(alias_token)
         column_types.reset_scoped_names(scoped_token)
         column_types.reset_resolver(resolver_token)

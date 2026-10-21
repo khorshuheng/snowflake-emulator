@@ -23,6 +23,7 @@ from sqlglot import exp
 
 from snowflake_emulator.translator.constants import WRITE_DIALECT
 from snowflake_emulator.translator.errors import TranslationError
+from snowflake_emulator.translator.semi_structured import _text_operand
 
 # Constructs whose "(" does not open a capturing group. ``(?<name>`` is capturing, so the two
 # lookbehind forms are matched exactly rather than by the ``(?<`` prefix.
@@ -84,6 +85,11 @@ def _rewrite_regexp_substr(node: exp.Expression) -> exp.Expression:
     subject, pattern = node.this, node.args.get("expression")
     if not isinstance(subject, exp.Expression) or not isinstance(pattern, exp.Expression):
         return node
+    # Snowflake coerces a VARIANT/JSON argument to its text; DuckDB's regexp functions see the
+    # VARIANT struct repr (``{'names': [X]}``), which does not match the JSON quotes.
+    subject = _text_operand(subject)
+    pattern = _text_operand(pattern)
+    assert subject is not None and pattern is not None
 
     parameters_node = node.args.get("parameters")
     if isinstance(parameters_node, exp.Null):

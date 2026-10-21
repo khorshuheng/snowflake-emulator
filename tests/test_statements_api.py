@@ -691,6 +691,47 @@ def test_semi_structured_text_cast_returns_the_value(client):
         assert resp.json()["data"] == expected, statement
 
 
+def test_variant_value_used_as_text_in_nested_expressions(client):
+    """A VARIANT column is text even when wrapped in PARSE_JSON/REGEXP_SUBSTR.
+
+    ``PARSE_JSON(variant_col)`` used to render ``JSON(variant)``, which parses DuckDB's VARIANT
+    struct repr and raised ``Malformed JSON``; ``REGEXP_SUBSTR`` saw that repr too, so a pattern
+    looking for the JSON document's double quotes answered NULL. A qualified column must work
+    the same way as an unqualified one.
+    """
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    assert post("CREATE TABLE vtext (ident VARIANT)").status_code == 200
+    assert (
+        post("INSERT INTO vtext SELECT PARSE_JSON('{\"names\":[\"N300\"]}')").status_code
+        == 200
+    )
+
+    for statement, expected in (
+        ("SELECT TO_VARCHAR(PARSE_JSON(ident):names[0]) FROM vtext", [["N300"]]),
+        ("SELECT TO_VARCHAR(PARSE_JSON(v.ident):names[0]) FROM vtext v", [["N300"]]),
+        # PARSE_JSON of a variant is the same document, not a reparse of its repr.
+        ("SELECT TO_VARCHAR(PARSE_JSON(ident)) FROM vtext", [['{"names":["N300"]}']]),
+        (
+            "SELECT REGEXP_SUBSTR(ident, '\"([^\"]*)\"', 1, 1, 'e') FROM vtext",
+            [["names"]],
+        ),
+        (
+            "SELECT REGEXP_SUBSTR(v.ident, '\"([^\"]*)\"', 1, 1, 'e') FROM vtext v",
+            [["names"]],
+        ),
+        (
+            "SELECT REGEXP_SUBSTR(PARSE_JSON(ident), '\"([^\"]*)\"', 1, 1, 'e') "
+            "FROM vtext",
+            [["names"]],
+        ),
+    ):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        assert resp.json()["data"] == expected, statement
+
+
 def test_semi_structured_text_cast_over_staged_json(client, tmp_path):
     json_path = tmp_path / "doc.json"
     json_path.write_text(json.dumps({"s": "y", "o": {"k": 1}}) + "\n")
@@ -1957,6 +1998,24 @@ def test_staged_json_writes_coerce_to_the_target_columns(client, tmp_path):
         [1, "ada", 3],
         [2, "bob", 3],
     ]
+    # The column list may be omitted (the table's own order applies) or preceded by an alias.
+    assert run("CREATE TABLE stage_nolist (id INT, name VARCHAR)") == [
+        ["Statement executed successfully."]
+    ]
+    run("INSERT INTO stage_nolist SELECT $1:id, $1:name FROM @~/staged/rows.json")
+    assert run("SELECT id, name, LENGTH(name) FROM stage_nolist ORDER BY id") == [
+        [1, "ada", 3],
+        [2, "bob", 3],
+    ]
+    assert run("CREATE TABLE stage_alias (id INT, name VARCHAR)") == [
+        ["Statement executed successfully."]
+    ]
+    run("INSERT INTO stage_alias AS x (id, name) SELECT $1:id, $1:name FROM @~/staged/rows.json")
+    assert run("SELECT id, name, LENGTH(name) FROM stage_alias ORDER BY id") == [
+        [1, "ada", 3],
+        [2, "bob", 3],
+    ]
+
     # A number staged into a text column becomes its text, as Snowflake's VARIANT coercion does.
     assert run("CREATE TABLE stage_num (n VARCHAR)") == [["Statement executed successfully."]]
     run("INSERT INTO stage_num (n) SELECT $1:id FROM @~/staged/rows.json")
@@ -1969,6 +2028,28 @@ def test_staged_json_writes_coerce_to_the_target_columns(client, tmp_path):
     assert run(
         "SELECT COUNT(*) FROM stage_t t, @~/staged/rows.json s WHERE t.name = s.$1:name"
     ) == [[2]]
+    # The WHERE comparison coerces the VARCHAR side just like the SET value: comparing it
+    # with the staged JSON value used to raise ``Malformed JSON``.
+    assert run("UPDATE stage_t SET name = 'x'") == [[2]]
+    assert run("UPDATE stage_t SET name = s.$1:name FROM @~/staged/rows.json s "
+               "WHERE stage_t.name = s.$1:name") == [[0]]
+    assert run("UPDATE stage_t SET name = s.$1:name FROM @~/staged/rows.json s "
+               "WHERE stage_t.id = s.$1:id") == [[2]]
+    assert run("SELECT name FROM stage_t ORDER BY id") == [["ada"], ["bob"]]
+
+    # A derived relation over the stage is still a staged JSON value: its projected
+    # ``$1:name`` column is JSON, so the SET value and comparison are coerced too.
+    assert run("CREATE TABLE stage_derived (id INT, name VARCHAR)") == [
+        ["Statement executed successfully."]
+    ]
+    run("INSERT INTO stage_derived SELECT $1:id, $1:name FROM @~/staged/rows.json")
+    assert run("UPDATE stage_derived SET name = s.name FROM "
+               "(SELECT $1:id AS id, $1:name AS name FROM @~/staged/rows.json) s "
+               "WHERE stage_derived.id = s.id") == [[2]]
+    assert run("SELECT id, name, LENGTH(name) FROM stage_derived ORDER BY id") == [
+        [1, "ada", 3],
+        [2, "bob", 3],
+    ]
 
     # The projection form now goes through the same rewrites as a plain SELECT.
     assert run("CREATE TABLE stage_p (name VARCHAR)") == [["Statement executed successfully."]]
@@ -2388,6 +2469,36 @@ def test_copy_into_stage_subquery_rejects_dropped_clause(client, tmp_path):
     )
     assert resp.status_code == 422
     assert "unsupported clause" in resp.json()["detail"]["message"]
+
+
+def test_correlated_subquery_limit_is_rejected(client):
+    """Snowflake allows LIMIT/FETCH only in an uncorrelated scalar subquery.
+
+    DuckDB executes a correlated subquery with LIMIT (and returns rows), so without a check
+    the emulator would report results Snowflake rejects.
+    """
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    assert post("CREATE TABLE ct (id INT, g INT)").status_code == 200
+    assert post("INSERT INTO ct VALUES (1, 1), (2, 1), (3, 2)").status_code == 200
+
+    for statement in (
+        "SELECT id FROM ct c WHERE id = "
+        "(SELECT id FROM ct WHERE g = c.g ORDER BY id LIMIT 1)",
+        "SELECT id FROM ct c WHERE EXISTS "
+        "(SELECT 1 FROM ct WHERE g = c.g LIMIT 1)",
+        "SELECT id FROM ct c WHERE id IN "
+        "(SELECT id FROM ct WHERE g = c.g FETCH FIRST 1 ROWS ONLY)",
+    ):
+        resp = post(statement)
+        assert resp.status_code == 422, (statement, resp.json())
+        assert "correlated subquery" in resp.json()["detail"]["message"], statement
+
+    # An uncorrelated scalar subquery may still use LIMIT.
+    assert post(
+        "SELECT id FROM ct WHERE id = (SELECT id FROM ct ORDER BY id DESC LIMIT 1)"
+    ).json()["data"] == [[3]]
 
 
 def test_insert_select_from_staged_file(client, tmp_path):

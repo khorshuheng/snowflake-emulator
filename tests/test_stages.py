@@ -138,6 +138,16 @@ def test_parse_stage_options_tolerate_whitespace_around_equals():
     assert parse_put("PUT file:///a.csv @~/s PARALLEL = 8").options == {"PARALLEL": "8"}
 
 
+def test_parse_stage_commands_drop_trailing_statement_semicolon():
+    """The SQL API accepts a trailing ``;``; it must not become part of an option or path."""
+    put = parse_put("PUT file:///a.csv @~/s OVERWRITE=TRUE;")
+    assert put.stage.path == "s"
+    assert put.options == {"OVERWRITE": "TRUE"}
+    assert parse_get("GET @~/s file:///tmp/o;").local_dir == "/tmp/o"
+    assert parse_list("LIST @~/s PATTERN='a;b';").pattern == "a;b"
+    assert parse_remove("REMOVE @~/s/data.csv;").stage.path == "s/data.csv"
+
+
 def test_parse_stage_options_keep_quoted_values_with_spaces():
     assert parse_list("LIST @~/s PATTERN = '.*a b.*'").pattern == ".*a b.*"
     assert parse_list("LIST @~/s PATTERN='.*a b.*'").pattern == ".*a b.*"

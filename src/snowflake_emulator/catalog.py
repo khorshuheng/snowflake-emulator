@@ -25,23 +25,23 @@ def column_type_resolver(cursor: Any, session: Any) -> ColumnTypeResolver:
     hold a table of the same name (a temporary table shadows a permanent one, as it does for
     a query).
     """
-    columns: list[tuple[str, str, str, str, str]] | None = None
+    columns: list[tuple[str, str, str, str, str, str]] | None = None
 
-    def load() -> list[tuple[str, str, str, str, str]]:
+    def load() -> list[tuple[str, str, str, str, str, str]]:
         nonlocal columns
         if columns is None:
             columns = [
                 tuple(str(value) for value in row)
                 for row in cursor.execute(
-                    "SELECT database_name, schema_name, table_name, column_name, data_type "
-                    "FROM duckdb_columns()"
+                    "SELECT database_name, schema_name, table_name, column_name, data_type, "
+                    "column_index FROM duckdb_columns()"
                 ).fetchall()
             ]
         return columns
 
-    def rank(row: tuple[str, str, str, str, str]) -> tuple[int, int, int]:
+    def rank(row: tuple[str, str, str, str, str, str]) -> tuple[int, int, int]:
         """Sort key: a temporary table first, then the session's schema, then its database."""
-        database, schema, _, _, _ = row
+        database, schema, *_ = row
         return (
             0 if database.lower() == "temp" else 1,
             0 if schema.lower() == str(session.schema).lower() else 1,
@@ -69,4 +69,36 @@ def column_type_resolver(cursor: Any, session: Any) -> ColumnTypeResolver:
             return None
         return sorted(candidates, key=rank)[0][4]
 
+    def resolve_table_columns(
+        catalog: str | None, schema: str | None, table: str
+    ) -> list[str] | None:
+        """The columns of `table` in declaration order, or None when it is not in scope.
+
+        An INSERT without an explicit column list needs this: the target column order is the
+        table's own, so a staged JSON value can be coerced to each target's type.
+        """
+        wanted_table = table.upper()
+        candidates = [row for row in load() if row[2].upper() == wanted_table]
+        for index, wanted in ((0, catalog), (1, schema)):
+            if wanted:
+                candidates = [
+                    row for row in candidates if row[index].upper() == wanted.upper()
+                ]
+        if not candidates:
+            return None
+        groups: dict[tuple[str, str, str], list[tuple[str, str, str, str, str, str]]] = {}
+        for row in candidates:
+            groups.setdefault((row[0], row[1], row[2]), []).append(row)
+        chosen = min(groups, key=lambda key: rank(groups[key][0]))
+        return [
+            row[3]
+            for row in sorted(
+                groups[chosen],
+                key=lambda row: int(row[5]) if row[5].lstrip("-").isdigit() else 0,
+            )
+        ]
+
+    # The translator gets one callable; the table-column lookup rides along for the rewrite
+    # that needs a target's column order (INSERT ... SELECT without a column list).
+    resolve.table_columns = resolve_table_columns  # type: ignore[attr-defined]
     return resolve
