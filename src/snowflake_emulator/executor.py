@@ -209,7 +209,7 @@ def _execute_sql(
             continue
 
         statement = _substitute_variables(statement, session)
-        statement = _substitute_session_functions(statement, session)
+        statement = _substitute_session_functions(statement, session, timezone)
 
         stmt_sql = statement.sql(dialect="snowflake")
 
@@ -435,16 +435,21 @@ def _execute_sql(
 
 
 def _substitute_session_functions(
-    statement: exp.Expression, session: SessionContext
+    statement: exp.Expression, session: SessionContext, timezone: str | None = None
 ) -> exp.Expression:
-    """Replace Snowflake's CURRENT_* session functions with their session values."""
+    """Replace Snowflake's CURRENT_* session functions with their session values.
+
+    ``CURRENT_TIMEZONE()`` reports the zone the statement runs in -- a request's ``TIMEZONE``
+    parameter when one was sent, UTC otherwise -- so it cannot contradict the timestamps it
+    renders alongside.
+    """
     values: dict[type[exp.Expression], str] = {
         exp.CurrentUser: session.user,
         exp.CurrentRole: session.role,
         exp.CurrentWarehouse: session.warehouse,
         exp.CurrentAccount: "EMULATOR_ACCOUNT",
         exp.CurrentRegion: "LOCAL",
-        exp.CurrentTimezone: "UTC",
+        exp.CurrentTimezone: timezone or "UTC",
         exp.CurrentSession: str(abs(hash(session.token)) % 10_000_000),
     }
 

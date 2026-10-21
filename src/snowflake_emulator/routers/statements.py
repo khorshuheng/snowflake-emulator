@@ -106,6 +106,25 @@ def _request_parameters(parameters: dict[str, Any] | None) -> tuple[int | None, 
                 },
             )
 
+    for name in (
+        "DATE_OUTPUT_FORMAT",
+        "TIME_OUTPUT_FORMAT",
+        "TIMESTAMP_OUTPUT_FORMAT",
+        "BINARY_OUTPUT_FORMAT",
+    ):
+        value = upper.get(name)
+        if value is not None and not isinstance(value, str):
+            # A number or a list would be coerced into a pattern ("5" renders the year 5),
+            # answer with wrong text instead of an error.
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={
+                    "message": f"{name} must be a string, got {type(value).__name__}.",
+                    "sqlState": "22023",
+                    "code": "100177",
+                },
+            )
+
     try:
         formats = output_formats_from_parameters(parameters)
     except OutputFormatError as exc:
