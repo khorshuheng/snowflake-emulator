@@ -233,6 +233,14 @@ UBIGINT`), and a VARIANT *value* searched in a JSON array (`ARRAY_CONTAINS`, `AR
 `ARRAY_REMOVE` removes the value rather than every NULL element (a NULL element survives; a NULL
 value returns NULL, as documented).
 
+`REGEXP_SUBSTR` follows Snowflake's arguments: `position`, `occurrence`, `regex_parameters`
+and `group_num`. With the `e` ("extract") parameter it returns the part matched by group 1 (or
+by `group_num`, which implies `e`), without `e` it returns the whole match, a pattern with no
+capturing group under `e` behaves as if `e` were unset, and no match is NULL (including when any
+argument is NULL). The parameters string must be a literal, since DuckDB cannot apply
+non-literal regex flags. Lookarounds (`(?=...)`, `(?<=...)`) are PCRE constructs that DuckDB's
+RE2 engine rejects.
+
 `HASH_AGG(...)` is a `SUM(HASH(...))` folded into a signed 64-bit value: order-independent,
 deterministic, influenced by NULLs and duplicates, `0` for an empty input, and never NULL. It is
 a `GROUP BY` aggregate here — the window form and `HASH_AGG(*)` are rejected rather than

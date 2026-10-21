@@ -9,6 +9,7 @@ from snowflake_emulator.translator.arrays import (
     ColumnTypeResolver,
     _rewrite_json_array_functions,
 )
+from snowflake_emulator.translator.regexp import _rewrite_regexp_functions
 from snowflake_emulator.translator.semi_structured import (
     _rewrite_information_schema,
     _rewrite_snowflake_specifics,
@@ -31,6 +32,7 @@ def _apply_transforms(
     statement = statement.transform(_rewrite_information_schema)
     statement = statement.transform(_rewrite_snowflake_specifics)
     statement = statement.transform(_rewrite_aggregate_functions)
+    statement = _rewrite_regexp_functions(statement)
     # After the rewrites above: an array call is rebuilt from its operands' SQL, so
     # those operands must already be in their final DuckDB form.
     return _rewrite_json_array_functions(statement, column_types)

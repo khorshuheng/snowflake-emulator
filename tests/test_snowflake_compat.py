@@ -404,6 +404,62 @@ def test_internal_error_returns_snowflake_shaped_422(client):
     assert "Invalid identifier" in resp.json()["detail"]["message"]
 
 
+def test_regexp_substr_extract_and_null_semantics(client):
+    """``REGEXP_SUBSTR`` returns group 1 under ``e``, the whole match otherwise, NULL for no match.
+
+    sqlglot renders the call as DuckDB's ``regexp_extract`` with group 0, so ``'e'`` was ignored
+    (``REGEXP_SUBSTR('k="v1"', '"([^"]*)"', 1, 1, 'e')`` answered ``"v1"`` instead of ``v1``) and
+    a miss answered an empty string where Snowflake answers NULL.
+    """
+    def data(statement):
+        resp = _post(client, statement)
+        assert resp.status_code == 200, resp.json()
+        return resp.json()["data"]
+
+    subject = "'It was the best of times, it was the worst of times'"
+    pattern = r"'the\W+(\w+)'"
+    # Documented example: the extracted group, at the first and the second occurrence.
+    assert data(f"SELECT REGEXP_SUBSTR({subject}, {pattern}, 1, 1, 'ie', 1)") == [["best"]]
+    assert data(f"SELECT REGEXP_SUBSTR({subject}, {pattern}, 1, 2, 'e', 1)") == [["worst"]]
+
+    # 'e' alone means group 1; without it the whole match is returned.
+    assert data("""SELECT REGEXP_SUBSTR('k="v1"', '"([^"]*)"', 1, 1, 'e')""") == [["v1"]]
+    assert data("""SELECT REGEXP_SUBSTR('k="v1"', '"([^"]*)"', 1, 1, 'e', 1)""") == [["v1"]]
+    assert data("""SELECT REGEXP_SUBSTR('k="v1"', '"([^"]*)"')""") == [['"v1"']]
+    assert data("""SELECT REGEXP_SUBSTR('k="v1"', '"([^"]*)"', 1, 1)""") == [['"v1"']]
+
+    # A pattern with no capturing group under 'e' behaves as if 'e' were unset.
+    assert data("""SELECT REGEXP_SUBSTR('abc', 'b', 1, 1, 'e')""") == [["b"]]
+    assert data("""SELECT REGEXP_SUBSTR('abc', '(?:b)', 1, 1, 'e')""") == [["b"]]
+
+    # Any group, case-insensitive parameters, occurrence and position.
+    assert data("""SELECT REGEXP_SUBSTR('abc', '(b)(c)', 1, 1, 'e', 2)""") == [["c"]]
+    assert data("""SELECT REGEXP_SUBSTR('ABC', '(b)', 1, 1, 'ie')""") == [["B"]]
+    assert data("""SELECT REGEXP_SUBSTR('k="v1" x="v2"', '"([^"]*)"', 1, 2, 'e')""") == [["v2"]]
+    assert data("""SELECT REGEXP_SUBSTR('a1b2', '([0-9])', 3, 1, 'e')""") == [["2"]]
+
+    # No match is NULL; a match that is empty stays an empty string.
+    assert data("""SELECT REGEXP_SUBSTR('no match here', '(z)', 1, 1, 'e')""") == [[None]]
+    assert data("""SELECT REGEXP_SUBSTR('no match here', '(z)')""") == [[None]]
+    assert data("""SELECT REGEXP_SUBSTR('abc', 'x*')""") == [[""]]
+    assert data("SELECT REGEXP_SUBSTR(NULL, '(a)')") == [[None]]
+    assert data("SELECT REGEXP_SUBSTR('abc', NULL)") == [[None]]
+
+    # A NULL flags argument returns NULL; a computed one is rejected, because DuckDB cannot
+    # apply non-literal regex flags and would silently ignore 'e' and 'i'.
+    assert data("""SELECT REGEXP_SUBSTR('k="v1"', '"([^"]*)"', 1, 1, NULL)""") == [[None]]
+    computed = _post(
+        client,
+        """SELECT REGEXP_SUBSTR('k="v1"', '"([^"]*)"', 1, 1, p) FROM (SELECT 'e' AS p)""",
+    )
+    assert computed.status_code == 422, computed.json()
+    assert "string literal" in computed.json()["detail"]["message"]
+
+    rejected = _post(client, "SELECT REGEXP_SUBSTR('abc', '(b)', 0)")
+    assert rejected.status_code == 422
+    assert "positive integer" in rejected.json()["detail"]["message"]
+
+
 def test_backslash_escapes_stay_literal_in_string_literals(client):
     """sqlglot >= 30.21 decodes backslash escapes inside Snowflake string literals.
 
