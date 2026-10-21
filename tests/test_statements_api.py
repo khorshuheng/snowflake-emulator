@@ -2373,7 +2373,10 @@ def test_select_from_staged_json_large_record(client, tmp_path):
     _stage(client, headers, csv_path, "@~/staged")
 
     selected = _select(client, headers, "SELECT LENGTH($1:s) AS n FROM @~/staged/big.json")
-    assert selected["data"] == [[2_000_002]]
+    # The string's own length: a semi-structured string is coerced to its text without the
+    # JSON quotes (Snowflake: "a string stored in VARIANT is preserved as is"), where this
+    # used to count the serialized `"..."`.
+    assert selected["data"] == [[2_000_000]]
     wide = _select(client, headers, "SELECT LENGTH($1) AS n FROM @~/staged/big.csv")
     assert wide["data"] == [[3_000_000]]
 

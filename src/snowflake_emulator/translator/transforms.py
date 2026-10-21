@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from sqlglot import exp
 
+from snowflake_emulator.translator import column_types
 from snowflake_emulator.translator.aggregates import _rewrite_aggregate_functions
 from snowflake_emulator.translator.arrays import (
     ColumnTypeResolver,
@@ -53,7 +54,7 @@ def _rewrite_timestamp_precision(node: exp.Expression) -> exp.Expression:
 
 
 def _apply_transforms(
-    statement: exp.Expression, column_types: ColumnTypeResolver | None = None
+    statement: exp.Expression, resolver: ColumnTypeResolver | None = None
 ) -> exp.Expression:
     """Apply the Snowflake-to-DuckDB AST rewrites shared by statements and UDF bodies.
 
@@ -63,12 +64,23 @@ def _apply_transforms(
     resolves a bare column's type for the array rewrites; a UDF body has no catalog in
     scope, so it is optional.
     """
-    statement = statement.transform(_rewrite_timestamp_precision)
-    statement = statement.transform(_uppercase_unquoted_identifiers)
-    statement = statement.transform(_rewrite_information_schema)
-    statement = statement.transform(_rewrite_snowflake_specifics)
-    statement = statement.transform(_rewrite_aggregate_functions)
-    statement = _rewrite_regexp_functions(statement)
-    # After the rewrites above: an array call is rebuilt from its operands' SQL, so
-    # those operands must already be in their final DuckDB form.
-    return _rewrite_json_array_functions(statement, column_types)
+    # A bare column's type decides several rewrites (an array operand's list form, a VARIANT
+    # value's text coercion), so the resolver and the statement's own names are in scope for
+    # the whole pipeline, not just the array pass.
+    resolver_token = column_types.set_resolver(resolver)
+    scoped_token = column_types.set_scoped_names(
+        column_types.statement_scoped_names(statement)
+    )
+    try:
+        statement = statement.transform(_rewrite_timestamp_precision)
+        statement = statement.transform(_uppercase_unquoted_identifiers)
+        statement = statement.transform(_rewrite_information_schema)
+        statement = statement.transform(_rewrite_snowflake_specifics)
+        statement = statement.transform(_rewrite_aggregate_functions)
+        statement = _rewrite_regexp_functions(statement)
+        # After the rewrites above: an array call is rebuilt from its operands' SQL, so
+        # those operands must already be in their final DuckDB form.
+        return _rewrite_json_array_functions(statement, resolver)
+    finally:
+        column_types.reset_scoped_names(scoped_token)
+        column_types.reset_resolver(resolver_token)

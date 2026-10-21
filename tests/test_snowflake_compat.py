@@ -550,6 +550,51 @@ def test_the_regexp_rewrite_is_idempotent():
     assert once == twice
 
 
+def test_variant_value_renders_as_json_text(client):
+    """A VARIANT value used as text renders Snowflake's JSON document, not DuckDB's struct repr.
+
+    DuckDB casts VARIANT to VARCHAR through its own repr (``{'names': [X]}``), and ``->>`` on a
+    VARIANT casts to VARCHAR first, so the JSON document has to be reached with
+    ``CAST(v AS JSON) ->> '$'``. Snowflake also coerces a VARIANT argument of a string function
+    to that text, and preserves a string variant without its quotes.
+    """
+    def _data(statement):
+        resp = _post(client, statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert _post(
+        client,
+        "CREATE OR REPLACE TABLE vtext "
+        "(obj VARIANT, arr VARIANT, s VARIANT, n VARIANT, plain VARCHAR)",
+    ).status_code == 200
+    assert _post(
+        client,
+        "INSERT INTO vtext SELECT PARSE_JSON('{\"names\": [\"X\"]}'), "
+        'PARSE_JSON(\'["a","b"]\'), PARSE_JSON(\'"str"\'), PARSE_JSON(\'42\'), \'plain\'',
+    ).status_code == 200
+
+    expected_object = '{"names":["X"]}'
+    # Document text, compact, and a string variant without its quotes (the docs: "a string
+    # stored in VARIANT is preserved as is").
+    assert _data(
+        "SELECT obj::VARCHAR, arr::VARCHAR, s::VARCHAR, n::VARCHAR FROM vtext"
+    ) == [[expected_object, '["a","b"]', "str", "42"]]
+    assert _data("SELECT TO_VARCHAR(obj) FROM vtext") == [[expected_object]]
+    # A string function sees that same text.
+    assert _data("SELECT UPPER(obj) FROM vtext") == [['{"NAMES":["X"]}']]
+    assert _data("SELECT REVERSE(obj) FROM vtext") == [['}]"X"[:"seman"{']]
+    assert _data("SELECT LENGTH(obj) FROM vtext") == [[len(expected_object)]]
+    assert _data("SELECT CONTAINS(obj, 'names') FROM vtext") == [[True]]
+    assert _data("SELECT obj || '!' FROM vtext") == [[expected_object + "!"]]
+    # A native VARCHAR column and a JSON path keep their own behaviour.
+    assert _data("SELECT plain::VARCHAR, plain || '!' FROM vtext") == [["plain", "plain!"]]
+    assert _data("SELECT obj:names::VARCHAR FROM vtext") == [['["X"]']]
+
+    # The value itself is untouched: it is still a VARIANT, not text.
+    assert _data("SELECT typeof(obj) FROM vtext") == [["VARIANT"]]
+
+
 def test_backslash_escapes_stay_literal_in_string_literals(client):
     """sqlglot >= 30.21 decodes backslash escapes inside Snowflake string literals.
 

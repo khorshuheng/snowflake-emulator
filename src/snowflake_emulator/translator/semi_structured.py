@@ -8,6 +8,7 @@ from sqlglot import exp
 from snowflake_emulator.core.constants import INFORMATION_SCHEMA_SCHEMA
 from snowflake_emulator.translator.arrays import _is_json_value, _is_variant_value
 from snowflake_emulator.translator.ast_helpers import _quoted_identifier
+from snowflake_emulator.translator import column_types
 from snowflake_emulator.translator.constants import (
     EMULATED_SNOWFLAKE_VERSION,
     WRITE_DIALECT,
@@ -169,15 +170,80 @@ def _rewrite_semi_structured_text_cast(node: exp.Expression) -> exp.Expression:
     from descending into its children, and a ``col:path`` operand is not yet a JSON value.
     """
     operand = node.this
-    if not (_is_json_value(operand) or _is_variant_value(operand)):
+    if not (
+        _is_json_value(operand)
+        or _is_variant_value(operand)
+        or column_types.is_variant_typed(operand)
+    ):
         return node
     inner = operand.transform(_rewrite_snowflake_specifics)
-    if _is_variant_value(inner):
+    if _is_variant_value(inner) or column_types.is_variant_typed(inner):
+        # ``CAST(<variant> AS JSON)`` is required: DuckDB's ``->>`` on a VARIANT casts it to
+        # VARCHAR first, which yields its struct repr (``{'names': [X]}``) and then fails to
+        # parse as JSON.
         inner = exp.cast(inner, exp.DataType.build("JSON"), dialect=WRITE_DIALECT)
     extracted = _json_root_extract(inner)
     if isinstance(node, exp.ToChar):
         return extracted  # its DuckDB rendering is already a text cast
     return exp.Cast(this=extracted, to=node.to)
+
+
+
+# Snowflake coerces a VARIANT/JSON argument to its JSON *text* in these functions, where DuckDB
+# would hand the function a VARIANT (rendered as a struct repr) or a JSON value (rendered with
+# quotes). Each entry names the arguments the function treats as text.
+_TEXT_ARGUMENTS: dict[type, tuple[str, ...]] = {
+    exp.Upper: ("this",),
+    exp.Lower: ("this",),
+    exp.Initcap: ("this",),
+    exp.Reverse: ("this",),
+    exp.Length: ("this",),
+    exp.Trim: ("this",),
+    exp.Substring: ("this",),
+    exp.Left: ("this",),
+    exp.Right: ("this",),
+    exp.Replace: ("this",),
+    exp.SplitPart: ("this",),
+    exp.Split: ("this",),
+    exp.Contains: ("this",),
+    exp.Pad: ("this",),
+    exp.StrPosition: ("substr",),
+    exp.DPipe: ("this", "expression"),
+    exp.Concat: ("expressions",),
+}
+
+
+def _text_operand(node: exp.Expression | None) -> exp.Expression | None:
+    """Present a semi-structured value as the JSON text Snowflake coerces it to."""
+    if node is None:
+        return node
+    if column_types.is_variant_typed(node):
+        node = exp.cast(node, exp.DataType.build("JSON"), dialect=WRITE_DIALECT)
+    if not _is_json_value(node):
+        return node
+    return _json_root_extract(node)
+
+
+def _rewrite_variant_text_function(node: exp.Expression) -> exp.Expression:
+    """Coerce a semi-structured argument of a string function to its JSON text.
+
+    ``UPPER(variant_col)`` has to uppercase the JSON text; DuckDB would uppercase (or reverse,
+    measure, split, compare) its VARIANT repr instead.
+    """
+    keys = _TEXT_ARGUMENTS.get(type(node))
+    if keys is None:
+        return node
+    for key in keys:
+        value = node.args.get(key)
+        if isinstance(value, list):
+            rewritten = [_text_operand(item) for item in value]
+            if any(new is not old for new, old in zip(rewritten, value)):
+                node.set(key, rewritten)
+        elif isinstance(value, exp.Expression):
+            rewritten = _text_operand(value)
+            if rewritten is not value:
+                node.set(key, rewritten)
+    return node
 
 
 def _rewrite_snowflake_specifics(node: exp.Expression) -> exp.Expression:
@@ -191,6 +257,8 @@ def _rewrite_snowflake_specifics(node: exp.Expression) -> exp.Expression:
         return _rewrite_semi_structured_text_cast(node)
     if isinstance(node, exp.ToChar) and node.args.get("format") is None:
         return _rewrite_semi_structured_text_cast(node)
+    if type(node) in _TEXT_ARGUMENTS:
+        return _rewrite_variant_text_function(node)
 
     # Snowflake JSON path extraction (``col:path``, ``GET_PATH``) transpiles to
     # DuckDB's ``->``/``->>``, which parses its operand as JSON on the fly. A VALUE

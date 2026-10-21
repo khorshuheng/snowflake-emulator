@@ -233,6 +233,13 @@ UBIGINT`), and a VARIANT *value* searched in a JSON array (`ARRAY_CONTAINS`, `AR
 `ARRAY_REMOVE` removes the value rather than every NULL element (a NULL element survives; a NULL
 value returns NULL, as documented).
 
+A VARIANT value used as text renders Snowflake's JSON document, compact and canonical:
+`ident::VARCHAR`, `TO_VARCHAR(ident)` and the string functions (`UPPER`, `LOWER`, `REVERSE`,
+`LENGTH`, `SUBSTR`, `TRIM`, `REPLACE`, `SPLIT*`, `CONTAINS`, `LPAD`/`RPAD`, `CHARINDEX`, `||`,
+`CONCAT`) coerce an object to `{"names":["X"]}` and a string stored in it to the string without
+its JSON quotes, as Snowflake documents. DuckDB's own VARIANT cast would render its struct repr
+(`{'names': [X]}`). A bare VARIANT column is recognised through the catalog type lookup.
+
 `TIMESTAMP_NTZ(7..9)` is stored at **microsecond** precision. DuckDB maps a precision above 6 to
 `TIMESTAMP_NS` (int64 nanoseconds), which only spans roughly 1677-2262, so Snowflake's year range
 (1-9999) -- e.g. a `9999-12-31` expiry -- could not be stored at all. Capping storage at

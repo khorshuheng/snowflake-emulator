@@ -2,28 +2,13 @@
 
 from __future__ import annotations
 
-from contextvars import ContextVar
-from typing import Callable
-
 import sqlglot
 from sqlglot import exp
 
+from snowflake_emulator.translator import column_types
+from snowflake_emulator.translator.column_types import ColumnTypeResolver
 from snowflake_emulator.translator.constants import WRITE_DIALECT, _FLATTEN_MARKER
 from snowflake_emulator.translator.errors import TranslationError
-
-# ``(table_name_or_None, column_name) -> DuckDB type name``, supplied by the caller that has a
-# catalog (see ``snowflake_emulator.catalog``). A bare column has no type in the AST, and an
-# array function needs one to tell a real DuckDB LIST from a VARIANT/JSON array.
-ColumnTypeResolver = Callable[[str | None, str], str | None]
-
-_column_types: ContextVar[ColumnTypeResolver | None] = ContextVar(
-    "_column_types", default=None
-)
-
-# Column and table names the *statement itself* defines (select aliases, CTE names, derived
-# table aliases). A bare column with one of these names belongs to the query, not to a catalog
-# table that happens to share it, so it must not inherit that table's type.
-_scoped_names: ContextVar[frozenset[str]] = ContextVar("_scoped_names", default=frozenset())
 
 # Each level of ARRAY_FLATTEN is a separate DuckDB call, so a deep flatten is bounded.
 _ARRAY_FLATTEN_MAX_DEPTH = 10
@@ -146,25 +131,6 @@ def _json_list(node: exp.Expression | None) -> exp.Expression | None:
     return exp.cast(node, exp.DataType.build("JSON[]"), dialect=WRITE_DIALECT)
 
 
-def _declared_column_type(node: exp.Expression | None) -> str | None:
-    """The DuckDB type of a bare column, when the caller supplied a catalog lookup.
-
-    A name the statement defines itself -- a select alias, a CTE, a derived table alias -- is
-    not looked up: an unrelated table with the same column name would otherwise decide how the
-    column is rewritten, which mis-orders a query-scoped VARIANT value or fails it with a raw
-    DuckDB binder error.
-    """
-    resolver = _column_types.get()
-    if resolver is None or not isinstance(node, exp.Column):
-        return None
-    scoped = _scoped_names.get()
-    if node.name.upper() in scoped or (node.table and node.table.upper() in scoped):
-        return None
-    return resolver(
-        node.catalog or None, node.db or None, node.table or None, node.name
-    )
-
-
 def _is_list_type(declared: str) -> bool:
     """True for a DuckDB type that is already a LIST, e.g. ``VARCHAR[]`` or ``LIST(INTEGER)``."""
     return declared.strip().upper().endswith("[]") or declared.upper().startswith("LIST(")
@@ -200,7 +166,7 @@ def _array_list(node: exp.Expression | None) -> exp.Expression | None:
         return _json_list(node)
     if isinstance(node, exp.Array):
         return node
-    declared = _declared_column_type(node)
+    declared = column_types.declared_column_type(node)
     if declared is not None:
         if _is_json_list_type(declared):
             return exp.cast(
@@ -261,16 +227,6 @@ def _encoded_element(
     return value
 
 
-def _is_variant_typed(node: exp.Expression | None) -> bool:
-    """True when `node` evaluates to a VARIANT value: a VARIANT column, cast or array."""
-    if node is None:
-        return False
-    if _is_variant_value(node) or _is_variant_array_value(node):
-        return True
-    declared = _declared_column_type(node)
-    return declared is not None and _is_variant_list_type(declared)
-
-
 def _aggregates_to_variant_list(node: exp.Expression) -> bool:
     """True when `node` is an aggregate that builds a list of VARIANT elements.
 
@@ -284,7 +240,7 @@ def _aggregates_to_variant_list(node: exp.Expression) -> bool:
     argument = node.this
     if isinstance(argument, exp.Distinct):
         argument = argument.this
-    return _is_variant_typed(argument)
+    return column_types.is_variant_typed(argument)
 
 
 def _comparable_array_and_value(
@@ -298,7 +254,7 @@ def _comparable_array_and_value(
     treats it as unequal -- ``ARRAY_CONTAINS(<variant 2>, PARSE_JSON('[2,3]'))`` answered FALSE
     although the array holds that number. Anything else keeps the array's own space.
     """
-    if _is_variant_typed(value):
+    if column_types.is_variant_typed(value):
         if array is not None and not _is_variant_array_value(array):
             array = _encoded_array_elements(array, "variant")
         return array, _variant_element(value)
@@ -409,7 +365,7 @@ def _rewrite_ordering_function(node: exp.Expression) -> exp.Expression:
     array = _rewrite_operand(node.this)
     if _is_json_array_value(array):
         return _rewrite_json_ordering(node, _json_list(array) or array)
-    declared = _declared_column_type(array)
+    declared = column_types.declared_column_type(array)
     if declared is not None:
         if _is_json_list_type(declared):
             return _rewrite_json_ordering(
@@ -880,7 +836,7 @@ def _rewrite_array_remove(node: exp.Expression) -> exp.Expression:
     """
     array = _array_list(_rewrite_json_array_functions(node.this))
     value = _rewrite_json_array_functions(node.args.get("expression"))
-    if _is_variant_array_value(array) and not _is_variant_typed(value):
+    if _is_variant_array_value(array) and not column_types.is_variant_typed(value):
         # A VARIANT array with a plain value compares in JSON space, like the other comparison
         # functions (a VARIANT-vs-VARIANT comparison of different types raises).
         array = _json_from_variant_list(array)
@@ -1043,11 +999,11 @@ def _rewrite_operand(node: exp.Expression | None) -> exp.Expression | None:
     """
     if node is None:
         return None
-    return _rewrite_json_array_functions(node, _column_types.get())
+    return _rewrite_json_array_functions(node, column_types.current_resolver())
 
 
 def _rewrite_json_array_functions(
-    statement: exp.Expression, column_types: ColumnTypeResolver | None = None
+    statement: exp.Expression, resolver: ColumnTypeResolver | None = None
 ) -> exp.Expression:
     """Apply ``_rewrite_json_array_function`` to every array call in `statement`.
 
@@ -1057,7 +1013,7 @@ def _rewrite_json_array_functions(
     recursively (``_rewrite_json_array_function``). A node detached by an ancestor's
     replacement is skipped.
 
-    `column_types` answers a bare column's DuckDB type for the call sites that turn on one --
+    `resolver` answers a bare column's DuckDB type for the call sites that turn on one --
     ``ARRAY_SORT``/``ARRAY_MAX``/``ARRAY_MIN`` and the list form an operand is cast to. It is
     published for the duration of the pass (the rewrites are otherwise pure AST transforms)
     and restored afterwards, so a nested call from a rebuild reuses the same resolver.
@@ -1071,21 +1027,10 @@ def _rewrite_json_array_functions(
             alias.replace(exp.ArraySlice(this=array, start=start, end=end, zero_based=True))
 
     root = statement
-    scoped = _scoped_names.get() | {
-        name.upper()
-        for name in (
-            *[alias.alias for alias in statement.find_all(exp.Alias) if alias.alias],
-            *[cte.alias for cte in statement.find_all(exp.CTE) if cte.alias],
-            *[
-                table.alias
-                for table in statement.find_all(exp.Table)
-                if table.alias
-            ],
-        )
-        if name
-    }
-    token = _column_types.set(column_types)
-    scoped_token = _scoped_names.set(frozenset(scoped))
+    token = column_types.set_resolver(resolver)
+    scoped_token = column_types.set_scoped_names(
+        column_types.statement_scoped_names(statement)
+    )
     try:
         for node in list(statement.find_all(*_JSON_ARRAY_FUNCTIONS, exp.Anonymous)):
             if node.parent is None and node is not root:
@@ -1101,6 +1046,6 @@ def _rewrite_json_array_functions(
             else:
                 root = replacement
     finally:
-        _scoped_names.reset(scoped_token)
-        _column_types.reset(token)
+        column_types.reset_scoped_names(scoped_token)
+        column_types.reset_resolver(token)
     return root
