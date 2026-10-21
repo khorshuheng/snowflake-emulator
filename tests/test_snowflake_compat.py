@@ -435,6 +435,30 @@ def test_merge_qualified_update_set(client):
     assert resp.json()["data"] == [[99]]
 
 
+def test_merge_qualified_insert_target_columns(client):
+    """Snowflake allows ``INSERT (target.col, ...)`` in MERGE; DuckDB needs it unqualified."""
+    assert _post(client, "CREATE TABLE mq_t (id INT, v VARCHAR)").status_code == 200
+    assert _post(client, "CREATE TABLE mq_s (id INT, v VARCHAR)").status_code == 200
+    assert _post(client, "INSERT INTO mq_s VALUES (1, 'a')").status_code == 200
+    merged = _post(
+        client,
+        "MERGE INTO mq_t USING mq_s ON mq_t.id = mq_s.id "
+        "WHEN NOT MATCHED THEN INSERT (mq_t.id, v) VALUES (mq_s.id, mq_s.v)",
+    )
+    assert merged.status_code == 200, merged.json()
+    assert _post(client, "SELECT id, v FROM mq_t").json()["data"] == [[1, "a"]]
+
+    # The same with table aliases, as in the reported form.
+    assert _post(client, "CREATE TABLE mq_t2 (id INT, v VARCHAR)").status_code == 200
+    merged = _post(
+        client,
+        "MERGE INTO mq_t2 t USING mq_s s ON t.id = s.id "
+        "WHEN NOT MATCHED THEN INSERT (t.id, t.v) VALUES (s.id, s.v)",
+    )
+    assert merged.status_code == 200, merged.json()
+    assert _post(client, "SELECT id, v FROM mq_t2").json()["data"] == [[1, "a"]]
+
+
 def test_javascript_udf_rejected(client):
     # Non-SQL UDFs have no runtime in DuckDB; they must fail loudly, not silently
     # create a function whose body is the JS source text.

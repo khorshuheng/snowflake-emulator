@@ -371,8 +371,9 @@ def _reject_correlated_limit(statement: exp.Expression) -> None:
                 )
             if correlated:
                 raise TranslationError(
-                    "LIMIT / FETCH is not supported in a correlated subquery; Snowflake "
-                    "allows it only in an uncorrelated scalar subquery."
+                    "SQL compilation error: Unsupported subquery type cannot be evaluated",
+                    errno="002031",
+                    sqlstate="42601",
                 )
 
 

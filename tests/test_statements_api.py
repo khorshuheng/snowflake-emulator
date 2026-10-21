@@ -2493,7 +2493,10 @@ def test_correlated_subquery_limit_is_rejected(client):
     ):
         resp = post(statement)
         assert resp.status_code == 422, (statement, resp.json())
-        assert "correlated subquery" in resp.json()["detail"]["message"], statement
+        detail = resp.json()["detail"]
+        assert detail["code"] == "002031", statement
+        assert detail["sqlState"] == "42601", statement
+        assert "Unsupported subquery type cannot be evaluated" in detail["message"], statement
 
     # An uncorrelated scalar subquery may still use LIMIT.
     assert post(
@@ -2510,7 +2513,9 @@ def test_correlated_subquery_limit_is_rejected(client):
         "FROM outr ORDER BY id"
     )
     assert unqualified.status_code == 422, unqualified.json()
-    assert "correlated subquery" in unqualified.json()["detail"]["message"]
+    detail = unqualified.json()["detail"]
+    assert detail["code"] == "002031"
+    assert detail["sqlState"] == "42601"
 
 
 def test_derived_alias_types_do_not_leak_across_scopes(client):

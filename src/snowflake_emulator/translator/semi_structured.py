@@ -661,6 +661,23 @@ def _rewrite_snowflake_specifics(node: exp.Expression) -> exp.Expression:
             )
             return rewritten
 
+    # ``MERGE ... INSERT (t.col, ...)`` -> unqualified target columns. Snowflake accepts the
+    # target-table qualifier in the INSERT column list, but DuckDB reads it as a column
+    # named after the table (``INSERT (TARGET.ID)`` -> "does not have a column TARGET").
+    if isinstance(node, exp.Merge):
+        whens = node.args.get("whens")
+        for when in whens.expressions if isinstance(whens, exp.Whens) else []:
+            then = when.args.get("then") if isinstance(when, exp.When) else None
+            if not isinstance(then, exp.Insert):
+                continue
+            target = then.this
+            if isinstance(target, (exp.Tuple, exp.Schema)):
+                for column in target.expressions:
+                    if isinstance(column, exp.Column):
+                        for key in ("table", "db", "catalog"):
+                            column.args.pop(key, None)
+        return node
+
     # ``MERGE ... UPDATE SET t.col = ...`` -> unqualified target column. DuckDB rejects
     # the target-table qualifier on the left side of a SET assignment.
     if isinstance(node, exp.Update):
