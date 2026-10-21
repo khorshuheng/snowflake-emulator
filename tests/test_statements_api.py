@@ -1908,6 +1908,67 @@ def test_hash_agg_and_ratio_to_report(client):
     ]
 
 
+def test_staged_json_writes_coerce_to_the_target_columns(client, tmp_path):
+    """A staged JSON value written into a text column is its text, not DuckDB's JSON serialization.
+
+    Three paths are covered: ``INSERT ... SELECT $1:c`` and ``UPDATE ... SET c = s.$1:c`` (which
+    stored ``"ada"``, quotes and all), a comparison between a VARCHAR column and a staged value
+    (which raised ``Malformed JSON ... Input: "ada"``, where Snowflake coerces the text side to a
+    VARIANT), and a ``COPY INTO ... FROM (SELECT ...)`` projection (which bypassed the translator
+    and so disagreed with the same expression in a plain SELECT).
+    """
+    data = tmp_path / "rows.json"
+    data.write_text('{"id": 1, "name": "ada"}\n{"id": 2, "name": "bob"}\n')
+    headers = _stage_headers(client)
+    _stage(client, headers, data, "@~/staged")
+
+    def run(statement):
+        resp = client.post(
+            "/api/v2/statements", json={"statement": statement}, headers=headers
+        )
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    # A plain SELECT already rendered the string's text; the write paths must agree with it.
+    assert run("SELECT $1:name::VARCHAR AS n FROM @~/staged/rows.json ORDER BY $1:id") == [
+        ["ada"],
+        ["bob"],
+    ]
+
+    assert run("CREATE TABLE stage_t (id INT, name VARCHAR)") == [
+        ["Statement executed successfully."]
+    ]
+    run("INSERT INTO stage_t (id, name) SELECT $1:id, $1:name FROM @~/staged/rows.json")
+    assert run("SELECT id, name, LENGTH(name) FROM stage_t ORDER BY id") == [
+        [1, "ada", 3],
+        [2, "bob", 3],
+    ]
+    # A number staged into a text column becomes its text, as Snowflake's VARIANT coercion does.
+    assert run("CREATE TABLE stage_num (n VARCHAR)") == [["Statement executed successfully."]]
+    run("INSERT INTO stage_num (n) SELECT $1:id FROM @~/staged/rows.json")
+    assert run("SELECT n, LENGTH(n) FROM stage_num ORDER BY n") == [["1", 1], ["2", 1]]
+
+    # UPDATE ... FROM over the staged file assigns the text and matches an existing VARCHAR row.
+    assert run("UPDATE stage_t SET name = s.$1:name FROM @~/staged/rows.json s "
+               "WHERE stage_t.id = s.$1:id") == [[2]]
+    assert run("SELECT name FROM stage_t ORDER BY id") == [["ada"], ["bob"]]
+    assert run(
+        "SELECT COUNT(*) FROM stage_t t, @~/staged/rows.json s WHERE t.name = s.$1:name"
+    ) == [[2]]
+
+    # The projection form now goes through the same rewrites as a plain SELECT.
+    assert run("CREATE TABLE stage_p (name VARCHAR)") == [["Statement executed successfully."]]
+    run("COPY INTO stage_p FROM (SELECT $1:name::VARCHAR FROM @~/staged/rows.json)")
+    assert run("SELECT name FROM stage_p ORDER BY name") == [["ada"], ["bob"]]
+
+    # A JSON value written into a VARIANT column is untouched: still a VARIANT holding the string.
+    assert run("CREATE TABLE stage_v (v VARIANT)") == [["Statement executed successfully."]]
+    run("INSERT INTO stage_v (v) SELECT $1:name FROM @~/staged/rows.json")
+    assert run("SELECT typeof(v), v::VARCHAR FROM stage_v ORDER BY 1 LIMIT 1") == [
+        ["VARIANT", "ada"]
+    ]
+
+
 def test_copy_json_array_document_is_one_record_without_strip(client, tmp_path):
     """Both JSON readers agree: without STRIP_OUTER_ARRAY an array document is one record.
 

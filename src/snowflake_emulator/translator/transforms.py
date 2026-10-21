@@ -15,6 +15,7 @@ from snowflake_emulator.translator.semi_structured import (
     _rewrite_information_schema,
     _rewrite_snowflake_specifics,
     _uppercase_unquoted_identifiers,
+    rewrite_semi_structured_writes,
 )
 
 
@@ -71,16 +72,21 @@ def _apply_transforms(
     scoped_token = column_types.set_scoped_names(
         column_types.statement_scoped_names(statement)
     )
+    alias_token = column_types.set_table_aliases(
+        column_types.statement_table_aliases(statement)
+    )
     try:
         statement = statement.transform(_rewrite_timestamp_precision)
         statement = statement.transform(_uppercase_unquoted_identifiers)
         statement = statement.transform(_rewrite_information_schema)
         statement = statement.transform(_rewrite_snowflake_specifics)
+        statement = rewrite_semi_structured_writes(statement)
         statement = statement.transform(_rewrite_aggregate_functions)
         statement = _rewrite_regexp_functions(statement)
         # After the rewrites above: an array call is rebuilt from its operands' SQL, so
         # those operands must already be in their final DuckDB form.
         return _rewrite_json_array_functions(statement, resolver)
     finally:
+        column_types.reset_table_aliases(alias_token)
         column_types.reset_scoped_names(scoped_token)
         column_types.reset_resolver(resolver_token)

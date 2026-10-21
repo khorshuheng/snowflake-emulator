@@ -233,6 +233,14 @@ UBIGINT`), and a VARIANT *value* searched in a JSON array (`ARRAY_CONTAINS`, `AR
 `ARRAY_REMOVE` removes the value rather than every NULL element (a NULL element survives; a NULL
 value returns NULL, as documented).
 
+A staged JSON value written into a **text column** is coerced to its text, as Snowflake's
+VARIANT coercion does: `INSERT INTO t (name) SELECT $1:name FROM @stage` and
+`UPDATE t SET name = s.$1:name FROM @stage s` store `ada`, not DuckDB's JSON serialization
+`"ada"`. A comparison between a text column and a staged value (`t.name = s.$1:name`) makes the
+text side a JSON string, so it matches instead of raising `Malformed JSON`. A
+`COPY INTO ... FROM (SELECT ...)` projection goes through the same translator as a plain
+`SELECT`, so `$1:c::VARCHAR` loads the same value in both places.
+
 A VARIANT value used as text renders Snowflake's JSON document, compact and canonical:
 `ident::VARCHAR`, `TO_VARCHAR(ident)` and the string functions (`UPPER`, `LOWER`, `REVERSE`,
 `LENGTH`, `SUBSTR`, `TRIM`, `REPLACE`, `SPLIT*`, `CONTAINS`, `LPAD`/`RPAD`, `CHARINDEX`, `||`,

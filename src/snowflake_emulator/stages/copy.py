@@ -11,6 +11,7 @@ from typing import Any
 from sqlglot import exp
 
 from snowflake_emulator.file_formats import resolve_file_format
+from snowflake_emulator.translator import transpile_to_duckdb
 from snowflake_emulator.sessions import SessionContext
 from snowflake_emulator.stages.manager import StageManager
 from snowflake_emulator.stages.refs import (
@@ -161,7 +162,10 @@ def _subquery_stage_source(subquery: exp.Subquery) -> tuple[str, str] | None:
             "COPY INTO ... FROM (SELECT ...) requires a select list over the stage."
         )
     projection = ", ".join(
-        _stage_positional_expression(expression, stage_ref).sql(dialect="duckdb")
+        # Through the translator, so a projected expression gets the same Snowflake rewrites
+        # as the same expression in a plain SELECT (a ``$1:c::VARCHAR`` that is left to
+        # DuckDB serializes the JSON value, quotes and all).
+        transpile_to_duckdb(_stage_positional_expression(expression, stage_ref))
         for expression in select.expressions
     )
     return stage_ref, projection

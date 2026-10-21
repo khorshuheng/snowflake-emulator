@@ -285,8 +285,12 @@ def test_copy_stage_source_carries_subquery_projection():
     table_sql, stage_ref, _file_format, _pattern, projection = copy_stage_source(node)
     assert table_sql == "t"
     assert stage_ref == "@stage/file.json"
-    # `$N` is rewritten to the quoted positional column the raw staged relation exposes.
-    assert projection == '"$1" -> \'$.name\' AS name, "$1" -> \'$.age\' AS age'
+    # `$N` is rewritten to the quoted positional column the raw staged relation exposes, and
+    # the expression goes through the translator, so it renders exactly as the same expression
+    # does in a plain SELECT (including the JSON cast and the upper-cased alias).
+    assert projection == (
+        "CAST(\"$1\" AS JSON) -> '$.name' AS NAME, CAST(\"$1\" AS JSON) -> '$.age' AS AGE"
+    )
 
 
 def test_copy_stage_source_subquery_without_stage_is_none():
@@ -332,8 +336,9 @@ def test_copy_stage_source_subquery_rewrites_qualified_positional():
     )
     _table, stage_ref, _fmt, _pattern, projection = copy_stage_source(node)
     assert stage_ref == "@stage"
-    # The subquery alias cannot be resolved by the rebuilt relation, so it is dropped.
-    assert projection == '"$1" -> \'$.a\' AS a'
+    # The subquery alias cannot be resolved by the rebuilt relation, so it is dropped; the
+    # projection still goes through the translator.
+    assert projection == "CAST(\"$1\" AS JSON) -> '$.a' AS A"
 
 
 def test_copy_stage_source_subquery_rejects_missing_positional():

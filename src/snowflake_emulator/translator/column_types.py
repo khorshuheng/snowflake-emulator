@@ -27,6 +27,11 @@ _resolver: ContextVar[ColumnTypeResolver | None] = ContextVar(
 # table that happens to share it, so it must not inherit that table's type.
 _scoped: ContextVar[frozenset[str]] = ContextVar("scoped_names", default=frozenset())
 
+# Table alias -> real table name, so a column qualified by an alias (``s.$1:id`` is a stage,
+# but ``t.name`` may be ``stage_t AS t``) still resolves. A derived-table alias has no real
+# table name and is absent, which leaves it unresolved -- the safe direction.
+_aliases: ContextVar[dict[str, str]] = ContextVar("table_aliases", default={})
+
 
 def current_resolver() -> ColumnTypeResolver | None:
     """The resolver in scope, for a pass that re-enters itself on an operand."""
@@ -54,17 +59,39 @@ def reset_scoped_names(token: Token) -> None:
 
 
 def statement_scoped_names(statement: exp.Expression) -> frozenset[str]:
-    """The upper-cased names `statement` defines: aliases, CTEs and derived-table aliases."""
+    """The upper-cased names `statement` defines as *values*: column aliases and CTE names.
+
+    A table alias is not one of these: it names a real table and is translated by
+    ``statement_table_aliases`` rather than being excluded from resolution.
+    """
     names = {
         name.upper()
         for name in (
             *[alias.alias for alias in statement.find_all(exp.Alias) if alias.alias],
             *[cte.alias for cte in statement.find_all(exp.CTE) if cte.alias],
-            *[table.alias for table in statement.find_all(exp.Table) if table.alias],
         )
         if name
     }
     return frozenset(names)
+
+
+def statement_table_aliases(statement: exp.Expression) -> dict[str, str]:
+    """The upper-cased ``alias -> table`` map for the tables the statement names."""
+    return {
+        table.alias.upper(): table.name.upper()
+        for table in statement.find_all(exp.Table)
+        if table.alias and table.name
+    }
+
+
+def set_table_aliases(aliases: dict[str, str]) -> Token:
+    """Publish the statement's table aliases for the current translation pass."""
+    return _aliases.set(aliases)
+
+
+def reset_table_aliases(token: Token) -> None:
+    """Restore the alias map that was in scope before `set_table_aliases`."""
+    _aliases.reset(token)
 
 
 def declared_column_type(node: exp.Expression | None) -> str | None:
@@ -77,9 +104,14 @@ def declared_column_type(node: exp.Expression | None) -> str | None:
     if resolver is None or not isinstance(node, exp.Column):
         return None
     scoped = _scoped.get()
-    if node.name.upper() in scoped or (node.table and node.table.upper() in scoped):
+    if node.name.upper() in scoped:
         return None
-    return resolver(node.catalog or None, node.db or None, node.table or None, node.name)
+    table = node.table or None
+    if table:
+        # A table alias names a real table (a stage reference or a derived table has no entry,
+        # and stays unresolved).
+        table = _aliases.get().get(table.upper(), table)
+    return resolver(node.catalog or None, node.db or None, table, node.name)
 
 
 def is_variant_typed(node: exp.Expression | None) -> bool:
