@@ -781,29 +781,6 @@ def _has_negative_subscript(node: exp.Expression) -> bool:
     )
 
 
-# The types Snowflake applies a format model to (a numeric or binary format is rejected).
-_TEMPORAL_TYPES = (
-    exp.DataType.Type.DATE,
-    exp.DataType.Type.DATETIME,
-    exp.DataType.Type.TIME,
-    exp.DataType.Type.TIMETZ,
-    exp.DataType.Type.TIMESTAMP,
-    exp.DataType.Type.TIMESTAMPTZ,
-    exp.DataType.Type.TIMESTAMPLTZ,
-    exp.DataType.Type.TIMESTAMPNTZ,
-)
-
-
-def _is_temporal(node: exp.Expression | None) -> bool:
-    """True for a DATE/TIME/TIMESTAMP value: the input a TO_CHAR format model applies to."""
-    if isinstance(node, exp.Paren):
-        return _is_temporal(node.this)
-    if isinstance(node, exp.Cast) and isinstance(node.to, exp.DataType):
-        return node.to.this in _TEMPORAL_TYPES
-    declared = column_types.declared_column_type(node)
-    return declared is not None and declared.strip().upper().startswith(("DATE", "TIME"))
-
-
 def _rewrite_snowflake_specifics(node: exp.Expression) -> exp.Expression:
     """Rewrite Snowflake nodes that sqlglot can't fully transpile to DuckDB."""
     # ``IS_<type>`` predicates, ``OBJECT_PICK``/``OBJECT_DELETE``/``OBJECT_INSERT``,
@@ -821,17 +798,6 @@ def _rewrite_snowflake_specifics(node: exp.Expression) -> exp.Expression:
         return _rewrite_semi_structured_text_cast(node)
     if isinstance(node, exp.ToChar) and node.args.get("format") is None:
         return _rewrite_semi_structured_text_cast(node)
-    # A numeric or binary format model is dropped by the DuckDB generator (sqlglot warns that
-    # ``format`` is unsupported), which would silently answer an unformatted string. Snowflake
-    # applies the format, so reject the call instead of dropping it. Date/time formats are
-    # translated, so a temporal operand keeps working.
-    if isinstance(node, exp.ToChar) and node.args.get("format") is not None:
-        if not _is_temporal(node.this):
-            raise TranslationError(
-                "TO_CHAR/TO_VARCHAR format models are only supported for a DATE/TIME/TIMESTAMP "
-                "value; DuckDB would silently drop the numeric format."
-            )
-        return node
     if type(node) in _TEXT_ARGUMENTS:
         return _rewrite_variant_text_function(node)
     if isinstance(node, _COMPARISON_NODES):

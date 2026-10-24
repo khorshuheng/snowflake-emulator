@@ -218,9 +218,6 @@ Not translated, and left as a loud error rather than a guess:
 - `ARRAY_FLATTEN(arr, depth)` — the emulator's legacy depth form, where Snowflake's
   documented signature is `ARRAY_FLATTEN(arr)` (one level). The depth must be a constant
   between 1 and 10; a computed depth is rejected;
-- a **numeric `TO_CHAR`/`TO_VARCHAR` format model** (`TO_CHAR(1234.5, '9999.99')`): DuckDB
-  drops the format, so the call is rejected rather than answering an unformatted string. A
-  DATE/TIME/TIMESTAMP format model is translated.
 
 A `FILTER`/`TRANSFORM`/`REDUCE` lambda over a JSON or VARIANT array receives a VARIANT
 element, as in Snowflake, so `FILTER(j:n, x -> x = 'a')` filters without an encoding helper
@@ -296,8 +293,16 @@ JSON value, which the SQL API reports as `variant` rather than `object`.
 `ARRAY_SIZE` of a VARIANT answers NULL when the value is not an array (docs: "otherwise, NULL is
 returned if the value is not an array") instead of raising, and a negative array index
 (`v:arr[-1]`) answers NULL, since the documented path grammar allows only non-negative indices.
-A numeric `TO_CHAR`/`TO_VARCHAR` format model is rejected rather than silently dropped (DuckDB
-ignores it); a DATE/TIME/TIMESTAMP format model is translated.
+
+Snowflake's **numeric format models** are applied instead of dropped by DuckDB
+(`number_format.py`): `TO_CHAR`/`TO_VARCHAR` support the fixed-position elements (`9`, `0`, `X`,
+`.`, `D`, `,`, `G`, `$`, `%`, `B`, `S`, `MI`, `EE`..`EEEEEEE`, `FM`, quoted literals) with the
+default reserved sign blank, fill vs compact mode, blank-vs-zero positions and `#` overflow, plus
+the text-minimal `TM`, `TM9(n,g)` and `TME` elements. `TO_NUMBER`/`TO_DECIMAL`/`TO_NUMERIC`
+parse with the model (`TO_NUMBER('1,234.50','9,999.99')` -> `1235`: the documented default scale
+is 0) and `TRY_TO_NUMBER` answers NULL instead of failing. A model the engine cannot honour (`V`,
+`RN`, `FX`, `AUTO`/`|`) is a loud error, and a DATE/TIME/TIMESTAMP model keeps sqlglot's own
+translation.
 
 `FLATTEN` projects Snowflake's documented columns: `SEQ` is the input record's number (one
 record per lateral evaluation, so every row of one record shares it), `KEY` is NULL for an array
@@ -491,6 +496,10 @@ Caveats:
   API (`$1:s` -> `y`, a number as a number, an object as an object), while the connector's
   wire protocol keeps returning VARIANT as its JSON text (`"y"`, `42`) — which is what that
   protocol and the Arrow path decode;
+- an Arrow result encodes a scale-0 `NUMBER` wider than 18 digits as Arrow `DECIMAL128`
+  (Snowflake's physical type; a smaller `NUMBER(18,0)` stays `int64`), so a 38-digit value
+  round-trips and pandas does not wrap on a sum. A DuckDB `HUGEINT` above `NUMBER(38,0)` (a
+  39-digit value) cannot be represented and answers `100038`/`22000` instead of a bare HTTP 500;
 - a **bare VARIANT column** cast to text (`SELECT variant_col::VARCHAR`) uses DuckDB's own
   VARIANT text form: right for a string, but an object shows as the variant's internal
   form, so use `variant_col::JSON::VARCHAR` when you need the document text;
@@ -564,6 +573,8 @@ src/snowflake_emulator/
     functions.py        # SQL UDF translation and macro rendering
     parsing.py          # statement splitting and ARRAY_FLATTEN preprocessing
     semi_structured.py  # JSON/VARIANT, FLATTEN and Snowflake-specific rewrites
+    object_functions.py # IS_* predicates, OBJECT_* functions, GET_IGNORE_CASE, OBJECT_CONSTRUCT(*)
+    scalar_semantics.py # DATEADD/DATE_TRUNC types, LPAD/RPAD, division by zero, format models
     transforms.py       # rewrite pipeline shared by statements and UDF bodies
     constants.py        # dialect names and parser markers
     errors.py           # TranslationError
@@ -576,6 +587,7 @@ src/snowflake_emulator/
     manager.py           # on-disk stage tree and stage DDL
     copy.py              # COPY INTO source resolution and DuckDB load SQL
   statement_store.py      # cache of executed statement results, by handle
+  number_format.py         # Snowflake numeric format models (TO_CHAR/TO_NUMBER)
   type_mapping.py          # DuckDB type -> Snowflake rowType mapping
   wire_format.py            # DuckDB value -> connector wire-format string encoding
   middleware.py              # gzip request-body decompression (connector always gzips)

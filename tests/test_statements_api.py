@@ -3541,16 +3541,65 @@ def test_negative_array_index_answers_null(client):
     ) == [[None, 10]]
 
 
-def test_numeric_to_char_format_is_rejected(client):
-    """A numeric `TO_CHAR` format model is refused instead of silently dropped."""
+def test_numeric_format_models(client):
+    """`TO_CHAR`/`TO_VARCHAR` apply Snowflake's numeric format model (default sign blank)."""
     def post(statement):
         return client.post("/api/v2/statements", json={"statement": statement})
 
-    resp = post("SELECT TO_CHAR(1234.5, '9999.99')")
-    assert resp.status_code == 422
-    assert "format models are only supported" in resp.json()["detail"]["message"]
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
 
-    # A date/time format model is still translated.
-    resp = post("SELECT TO_CHAR('2024-01-02'::DATE, 'YYYY-MM-DD')")
-    assert resp.status_code == 200, resp.json()
-    assert resp.json()["data"] == [["2024-01-02"]]
+    # The documented examples from the SQL format models page.
+    assert data("SELECT TO_VARCHAR(1.2, '999,999.999'), TO_VARCHAR(123.456, '999,999.999')") == [
+        ["      1.2  ", "    123.456"]
+    ]
+    assert data(
+        "SELECT TO_VARCHAR(1.2, 'S000,000.000'), TO_VARCHAR(-123456.789, 'S000,000.000')"
+    ) == [["+000,001.200", "-123,456.789"]]
+    assert data(
+        "SELECT TO_VARCHAR(1.2, 'FM999,999.999'), "
+        "TO_VARCHAR(-123456.789, 'FM999,999.999')"
+    ) == [["1.2", "-123,456.789"]]
+    assert data("SELECT TO_CHAR(1234, '9d999EE'), TO_CHAR(12, '\">\"99\"<\"')") == [
+        [" 1.234E3", "> 12<"]
+    ]
+    assert data("SELECT TO_CHAR(-123.45, '999.99MI'), TO_VARCHAR(0.25, 'TM9%')") == [
+        ["123.45-", "25%"]
+    ]
+    # A DATE/TIME format model keeps sqlglot's own translation.
+    assert data("SELECT TO_CHAR('2024-01-02'::DATE, 'YYYY-MM-DD')") == [["2024-01-02"]]
+
+
+def test_numeric_format_model_parsing(client):
+    """`TO_NUMBER(text, model)` parses with the model; the default scale is 0 (docs)."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    # Default precision 38 / scale 0 rounds the parsed value, as documented for TO_NUMBER.
+    assert data("SELECT TO_NUMBER('1,234.50', '9,999.99')") == [[1235]]
+    assert data("SELECT TO_NUMBER('1,234.50', '9,999.99', 8, 2)") == [[1234.5]]
+    assert data("SELECT TO_NUMBER('012,345.67', '000,000.00', 8, 2)") == [[12345.67]]
+    assert data("SELECT TO_NUMBER('-1,234.50', '9,999.99', 8, 2)") == [[-1234.5]]
+    # TRY_TO_NUMBER answers NULL; TO_NUMBER raises a data error.
+    assert data("SELECT TRY_TO_NUMBER('bad', '999')") == [[None]]
+    resp = post("SELECT TO_NUMBER('bad', '999')")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert (detail["sqlState"], detail["code"]) == ("22000", "100038")
+    assert "Invalid number format" in detail["message"]
+    # A semi-structured operand is converted to its text first (an unquoted string variant).
+    assert data(
+        "SELECT TO_NUMBER(j:s, '99,999.99', 8, 2), TO_CHAR(j:n, '999,999') FROM "
+        "(SELECT PARSE_JSON('{\"s\":\"12,345.67\",\"n\":1234}') j)"
+    ) == [[12345.67, "   1,234"]]
+    # A model the emulator cannot honour is refused at translation time.
+    resp = post("SELECT TO_CHAR(1.5, 'V99')")
+    assert resp.status_code == 422
+    assert "not supported" in resp.json()["detail"]["message"]

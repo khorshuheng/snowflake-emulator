@@ -517,3 +517,31 @@ def test_fetch_arrow_all_empty_result(connection):
     # An empty result carries an empty Arrow payload, so the connector returns None.
     assert cur.fetch_arrow_all() is None
     assert cur.fetchall() == []
+
+
+def test_wide_number_arrow_keeps_precision(connection):
+    """A NUMBER that does not fit int64 reaches pandas as DECIMAL128, without wrapping.
+
+    Snowflake sends a wide scale-0 NUMBER as Arrow DECIMAL; the emulator used to send
+    int64, so fetching a 38-digit value raised ArrowInvalid (an HTTP 500) and summing
+    large int64 values wrapped silently.
+    """
+    cur = connection.cursor()
+    cur.execute("CREATE OR REPLACE TABLE wide (n NUMBER(38,0), small NUMBER(18,0))")
+    cur.execute(
+        "INSERT INTO wide VALUES (99999999999999999999999999999999999999, 42)"
+    )
+    cur.execute("SELECT n, small FROM wide")
+    table = cur.fetch_arrow_all()
+    assert table.schema.field("N").type == __import__("pyarrow").decimal128(38, 0)
+    assert table.schema.field("SMALL").type == __import__("pyarrow").int64()
+    assert str(table.column("N")[0].as_py()) == "99999999999999999999999999999999999999"
+
+    frame = cur.fetch_pandas_all()
+    assert str(frame["N"].sum()) == "99999999999999999999999999999999999999"
+
+    # Two int64-max values sum exactly rather than wrapping around.
+    cur.execute("CREATE OR REPLACE TABLE near (n NUMBER(38,0))")
+    cur.execute("INSERT INTO near VALUES (9223372036854775807), (9223372036854775807)")
+    frame = cur.execute("SELECT n FROM near").fetch_pandas_all()
+    assert int(frame["N"].sum()) == 18446744073709551614

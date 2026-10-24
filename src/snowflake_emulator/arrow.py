@@ -18,6 +18,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from snowflake_emulator.core.errors import ExecutionError
 from snowflake_emulator.core.results import ColumnMeta
 from snowflake_emulator.type_mapping import parse_precision_scale
 
@@ -27,7 +28,22 @@ def _arrow_type(col: ColumnMeta) -> pa.DataType:
     precision, scale = parse_precision_scale(col.duckdb_type)
     sf_type = col.type
     if sf_type == "fixed":
-        return pa.decimal128(precision or 38, scale) if scale and scale > 0 else pa.int64()
+        # A scale-0 NUMBER becomes an int64 only when the declared precision guarantees the
+        # value fits; Snowflake sends a wide NUMBER as DECIMAL128, and an int64 column also
+        # wraps silently in pandas once a sum passes 2**63. DuckDB integer types without a
+        # declared precision keep int64, except the unsigned/128-bit ones that do not fit.
+        if scale and scale > 0:
+            return pa.decimal128(precision or 38, scale)
+        if precision is not None and precision <= 18:
+            return pa.int64()
+        if precision is None:
+            declared = (col.duckdb_type or "").strip().upper()
+            if declared in ("BIGINT", "INTEGER", "SMALLINT", "TINYINT", "UINTEGER",
+                            "USMALLINT", "UTINYINT"):
+                return pa.int64()
+            if declared == "UBIGINT":
+                return pa.decimal128(20, 0)
+        return pa.decimal128(precision or 38, 0)
     if sf_type == "real":
         return pa.float64()
     if sf_type == "boolean":
@@ -154,7 +170,20 @@ def encode_arrow(row_type: list[ColumnMeta], rows: list[list[Any]]) -> str:
     fields = []
     for index, col in enumerate(row_type):
         arrow_type = _arrow_type(col)
-        arrays.append(pa.array([_cell(row[index], col) for row in rows], type=arrow_type))
+        try:
+            arrays.append(
+                pa.array([_cell(row[index], col) for row in rows], type=arrow_type)
+            )
+        except (pa.ArrowException, OverflowError, ValueError) as exc:
+            # A value the Snowflake type cannot represent (a 39-digit DuckDB HUGEINT is
+            # beyond NUMBER(38,0)) must not surface as an unclassified HTTP 500 that the
+            # client retries; report Snowflake's numeric-out-of-range pair instead.
+            raise ExecutionError(
+                f"A value in column {col.name!r} does not fit its Snowflake type "
+                f"{col.duckdb_type or col.type}: {exc}",
+                errno="100038",
+                sqlstate="22000",
+            ) from exc
         fields.append(pa.field(col.name, arrow_type))
     table = pa.Table.from_arrays(arrays, schema=pa.schema(fields))
     return base64.b64encode(to_ipc_bytes(_to_sf(table, row_type))).decode("ascii")

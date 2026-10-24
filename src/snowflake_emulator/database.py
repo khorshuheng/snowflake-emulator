@@ -30,9 +30,54 @@ from typing import Any, Iterator
 import duckdb
 
 from snowflake_emulator.core.constants import INFORMATION_SCHEMA_SCHEMA
+from snowflake_emulator.number_format import NumberFormatError, format_number, parse_number
 from snowflake_emulator.settings import settings
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+
+
+def _register_helper_functions(connection: duckdb.DuckDBPyConnection) -> None:
+    """Register the native helpers the translator rewrites calls onto.
+
+    DuckDB's own ``to_char``/``to_number`` drop Snowflake's numeric format model, so the
+    translator maps those calls to these two functions. The callbacks are available from
+    the session cursors as well (DuckDB shares registered Python functions with cursors).
+    """
+
+    def format_cell(value: str | None, model: str | None) -> str | None:
+        if value is None or model is None:
+            return None
+        try:
+            return format_number(str(value), str(model))
+        except NumberFormatError as exc:
+            raise ValueError(f"Invalid number format: {exc}") from exc
+
+    def parse_cell(value: str | None, model: str | None, safe: bool | None) -> str | None:
+        if value is None or model is None:
+            return None
+        try:
+            return parse_number(str(value), str(model))
+        except NumberFormatError as exc:
+            if safe:
+                return None
+            raise ValueError(f"Invalid number format: {exc}") from exc
+
+    # ``null_handling="special"`` lets the callbacks receive (and answer) NULL themselves;
+    # ``TRY_TO_NUMBER`` relies on that to return NULL for unparseable input.
+    connection.create_function(
+        "sfemu_format_number",
+        format_cell,
+        ["VARCHAR", "VARCHAR"],
+        "VARCHAR",
+        null_handling="special",
+    )
+    connection.create_function(
+        "sfemu_parse_number",
+        parse_cell,
+        ["VARCHAR", "VARCHAR", "BOOLEAN"],
+        "VARCHAR",
+        null_handling="special",
+    )
 
 
 def _quote_ident(identifier: str) -> str:
@@ -57,6 +102,7 @@ class DuckDBManager:
         # as its own catalog, so no user data ends up in a catalog the client never
         # addresses.
         self._connection = duckdb.connect(":memory:")
+        _register_helper_functions(self._connection)
         self._attached_catalogs: set[str] = set()
         # One connection per session, created lazily. DuckDB scopes TEMP tables to the
         # connection rather than to the database instance, so a session has to keep

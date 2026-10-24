@@ -65,6 +65,10 @@ def classify_exception(exc: BaseException) -> tuple[str, str]:
         if "Duplicate struct entry name" in str(exc):
             return "100103", "22000"
         return _BINDER
+    # A numeric format model that does not match the input (``translator.scalar_semantics``
+    # raises through the ``sfemu_parse_number`` helper) is a conversion failure.
+    if "Invalid number format" in str(exc):
+        return _DATA
     # A statement that raises ``error('Division by zero')`` (see the division rewrite in
     # ``translator.scalar_semantics``) carries Snowflake's division-by-zero pair, which the
     # exception type alone cannot express.
