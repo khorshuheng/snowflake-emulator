@@ -12,8 +12,10 @@ from snowflake_emulator.translator.arrays import (
     _is_variant_value,
     _rewrite_json_array_functions,
 )
+from snowflake_emulator.translator.constants import FLATTEN_RELATION_META
 from snowflake_emulator.translator.errors import TranslationError
 from snowflake_emulator.translator.regexp import _rewrite_regexp_functions
+from snowflake_emulator.translator.scalar_semantics import rewrite_scalar_semantics
 from snowflake_emulator.translator.semi_structured import (
     _rewrite_information_schema,
     _rewrite_snowflake_specifics,
@@ -57,6 +59,30 @@ def _rewrite_timestamp_precision(node: exp.Expression) -> exp.Expression:
     return node
 
 
+# The columns Snowflake's FLATTEN exposes, and the DuckDB type each one holds in the rewritten
+# relation. Snowflake's VALUE and THIS are VARIANT, which the emulator stores as JSON; typing
+# them lets the text coercion see a semi-structured value, so `VALUE::VARCHAR` answers `a"b`
+# rather than DuckDB's JSON text and `LENGTH(VALUE)` counts the value, not its quotes.
+_FLATTEN_COLUMN_TYPES = {
+    "SEQ": "BIGINT",
+    "KEY": "VARCHAR",
+    "PATH": "VARCHAR",
+    "INDEX": "BIGINT",
+    "VALUE": "JSON",
+    "THIS": "JSON",
+}
+
+
+def _is_flatten_call(node: exp.Expression | None) -> bool:
+    """True for an un-rewritten ``FLATTEN`` source: an ``EXPLODE`` of an ``INPUT =>`` kwarg."""
+    if isinstance(node, exp.TableFromRows):
+        node = node.this
+    if not isinstance(node, exp.Explode) or not isinstance(node.this, exp.Kwarg):
+        return False
+    key = node.this.this
+    return isinstance(key, exp.Var) and (key.name or "").upper() == "INPUT"
+
+
 def _derived_type_resolver(statement: exp.Expression):
     """Build a scope-aware lookup for derived-table/CTE projection types.
 
@@ -98,10 +124,17 @@ def _derived_type_resolver(statement: exp.Expression):
             elif isinstance(node, exp.Lateral):
                 if isinstance(node.this, exp.Subquery):
                     sources.append(((node.alias or "").upper(), node.this.this))
+                elif _is_flatten_call(node.this):
+                    # ``LATERAL FLATTEN(...)``: not rewritten yet when a projection above it is
+                    # visited, so the type lookup has to read the original call as well.
+                    sources.append(((node.alias or "").upper(), node.this))
                 elif isinstance(node.this, exp.Table):
                     cte = ctes.get(node.this.name.upper())
                     if cte is not None:
                         sources.append(((node.alias or node.this.name).upper(), cte))
+            elif _is_flatten_call(node):
+                # ``TABLE(FLATTEN(...)) f``
+                sources.append(((node.alias or "").upper(), node))
 
         from_ = scope.args.get("from_")
         if isinstance(from_, exp.From):
@@ -126,6 +159,34 @@ def _derived_type_resolver(statement: exp.Expression):
                     arms.append(node)
             return arms
         return []
+
+    def flatten_columns(relation: exp.Expression) -> set[str]:
+        """The columns a FLATTEN source exposes; empty for any other relation.
+
+        Covers both the original call (``EXPLODE``/``TABLE()``, still in the tree when a
+        projection above it is rewritten) and the ``json_each``-based subquery it becomes,
+        which is marked with ``FLATTEN_RELATION_META``.
+        """
+        if _is_flatten_call(relation):
+            return set(_FLATTEN_COLUMN_TYPES)
+        if not relation.meta.get(FLATTEN_RELATION_META):
+            return set()
+        return {
+            name
+            for select in select_arms(relation)
+            for item in select.expressions
+            if (name := (item.alias_or_name or "").upper())
+        }
+
+    def source_excludes_name(relation: exp.Expression, name: str) -> bool:
+        """True only when `relation`'s columns are known and none of them is `name`."""
+        if isinstance(relation, exp.Table):
+            columns = column_types.declared_table_columns(relation)
+            if columns is None:
+                return False
+            return name not in {column.upper() for column in columns}
+        names = _relation_projection_names(relation)
+        return names is not None and name not in names
 
     def merge_types(types: list[str | None]) -> str | None:
         """One type for a UNION column; any semi-structured arm wins."""
@@ -158,6 +219,9 @@ def _derived_type_resolver(statement: exp.Expression):
         relation: exp.Expression, name: str, seen: frozenset[tuple[int, str]]
     ) -> tuple[bool, str | None]:
         """Whether `relation` exposes `name`, and its type when known."""
+        if _is_flatten_call(relation):
+            declared = _FLATTEN_COLUMN_TYPES.get(name.upper())
+            return declared is not None, declared
         found = False
         types: list[str | None] = []
         for select in select_arms(relation):
@@ -192,7 +256,7 @@ def _derived_type_resolver(statement: exp.Expression):
         # resolving them against a derived projection changed array-function behavior that is
         # deliberately left to the catalog/unknown path.
         if not (node.name.startswith("$") and node.name[1:].isdigit()):
-            return None
+            return unqualified_flatten_relation(node, scopes[0])
         scope = scopes[0]
         if scope.args.get("joins"):
             return None
@@ -200,6 +264,30 @@ def _derived_type_resolver(statement: exp.Expression):
         if len(sources) == 1:
             return sources[0][1]
         return None
+
+    def unqualified_flatten_relation(
+        node: exp.Column, scope: exp.Select | exp.Update
+    ) -> exp.Expression | None:
+        """The FLATTEN relation an unqualified column names, when that is unambiguous.
+
+        Snowflake exposes a lateral view's own columns (the SEQUENCE, KEY, PATH, INDEX, VALUE
+        and THIS of ``FLATTEN``) without a qualifier, so ``SELECT VALUE FROM ..., LATERAL
+        FLATTEN(...)`` reads the flattened element. The name is attributed only when exactly
+        one source is a rewritten FLATTEN, that relation projects the name, and every other
+        source in scope is known not to declare it -- an unknown source keeps the lookup
+        conservative, as for the other unqualified names.
+        """
+        name = node.name.upper()
+        sources = relation_sources(scope)
+        flatten = [relation for _, relation in sources if flatten_columns(relation)]
+        if len(flatten) != 1 or name not in flatten_columns(flatten[0]):
+            return None
+        for _, relation in sources:
+            if relation is flatten[0]:
+                continue
+            if not source_excludes_name(relation, name):
+                return None
+        return flatten[0]
 
     def resolve_column(
         node: exp.Column, seen: frozenset[tuple[int, str]] = frozenset()
@@ -407,6 +495,7 @@ def _apply_transforms(
         statement = statement.transform(_uppercase_unquoted_identifiers)
         statement = statement.transform(_rewrite_information_schema)
         statement = statement.transform(_rewrite_snowflake_specifics)
+        statement = statement.transform(rewrite_scalar_semantics)
         statement = rewrite_semi_structured_writes(statement)
         statement = statement.transform(_rewrite_aggregate_functions)
         statement = _rewrite_regexp_functions(statement)

@@ -489,8 +489,30 @@ def _rewrite_array_contains(node: exp.Expression) -> exp.Expression:
 
 
 def _rewrite_array_size(node: exp.Expression) -> exp.Expression:
-    """``ARRAY_SIZE(col:path)``: DuckDB needs a LIST, not the JSON the array is stored as."""
-    node.set("this", _array_list(_rewrite_operand(node.this)))
+    """``ARRAY_SIZE(col:path)``: DuckDB needs a LIST, not the JSON the array is stored as.
+
+    Snowflake's VARIANT form answers NULL when the value is not an array ("otherwise, NULL is
+    returned if the value is not an array"), while ``array_length`` raises. The type is checked
+    first so a non-array variant is never cast to a list at all.
+    """
+    operand = _rewrite_operand(node.this)
+    if isinstance(operand, exp.Expression) and (
+        _is_variant_value(operand) or column_types.is_variant_typed(operand)
+    ):
+        variant = _sql(operand)
+        return sqlglot.parse_one(
+            f"CASE WHEN variant_typeof({variant}) LIKE 'ARRAY%' "
+            f"THEN ARRAY_LENGTH(CAST(CAST({variant} AS JSON) AS JSON[])) ELSE NULL END",
+            read=WRITE_DIALECT,
+        )
+    if _is_json_value(operand):
+        document = _sql(operand)
+        return sqlglot.parse_one(
+            f"CASE WHEN JSON_TYPE({document}) = 'ARRAY' "
+            f"THEN ARRAY_LENGTH(CAST({document} AS JSON[])) ELSE NULL END",
+            read=WRITE_DIALECT,
+        )
+    node.set("this", _array_list(operand))
     return node
 
 

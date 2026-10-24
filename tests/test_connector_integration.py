@@ -439,6 +439,8 @@ def test_variant_cells_are_typed_and_sent_as_json_text(connection):
     assert json.loads(row[0]) == "y"
     assert row[1] == "42"
     assert row[2] == "true"
+    # A struct-backed object is the compact JSON text Snowflake sends, not a spaced dump.
+    assert row[3] == '{"k":1}'
     assert json.loads(row[3]) == {"k": 1}
     assert [col.type_code for col in cur.description] == [
         FIELD_ID_TO_NAME_LOOKUP["VARIANT"]
@@ -447,6 +449,11 @@ def test_variant_cells_are_typed_and_sent_as_json_text(connection):
     cur.execute("SELECT TO_VARIANT('42') AS v")
     assert cur.fetchall() == [('"42"',)]  # the string, not the number
     assert cur.fetch_arrow_all().column("V").to_pylist() == ['"42"']
+
+    # The Arrow path carries the same compact JSON text for an object variant.
+    cur.execute("SELECT TO_VARIANT(OBJECT_CONSTRUCT('k', 'v')) AS o")
+    assert cur.fetchall() == [('{"k":"v"}',)]
+    assert cur.fetch_arrow_all().column("O").to_pylist() == ['{"k":"v"}']
 
 
 def test_semi_structured_text_cast(connection):

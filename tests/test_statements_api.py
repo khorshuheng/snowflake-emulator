@@ -675,9 +675,11 @@ def test_semi_structured_text_cast_returns_the_value(client):
         ("SELECT j:s::VARCHAR(1) FROM txt", [["y"]]),
         ("SELECT j:s::CHAR(3) FROM txt", [["y"]]),
         ("SELECT CAST(PARSE_JSON('\"y\"') AS VARCHAR)", [["y"]]),
-        # A number is its text, and a JSON null or missing path is NULL as in Snowflake.
+        # A number is its text, a path that matches nothing is NULL, and a JSON null is the
+        # word `null` (TO_VARCHAR: "A JSON null value is converted to a string containing the
+        # word "null""; a missing value is converted to SQL NULL).
         ("SELECT j:n::VARCHAR FROM txt", [["1"]]),
-        ("SELECT j:nl::VARCHAR FROM txt", [[None]]),
+        ("SELECT j:nl::VARCHAR FROM txt", [["null"]]),
         ("SELECT j:missing::VARCHAR FROM txt", [[None]]),
         # An object or array keeps its document text.
         ("SELECT j:o::VARCHAR FROM txt", [["{\"k\":1}"]]),
@@ -689,6 +691,129 @@ def test_semi_structured_text_cast_returns_the_value(client):
         resp = post(statement)
         assert resp.status_code == 200, (statement, resp.json())
         assert resp.json()["data"] == expected, statement
+
+
+def test_to_json_of_a_variant_returns_the_json_representation(client):
+    """`TO_JSON` returns the value's JSON document, not a string of DuckDB's VARIANT form.
+
+    DuckDB's ``to_json`` casts a VARIANT to VARCHAR first, so a numeric variant became the
+    JSON string ``"42"`` and an object became a quoted internal repr (``"{'k': v}"``).
+    Snowflake documents TO_JSON as the JSON *representation* of the value: ``42``, and the
+    document text for an object.
+    """
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post("CREATE TABLE tj (v VARIANT)").status_code == 200
+    assert (
+        post(
+            "INSERT INTO tj SELECT "
+            "PARSE_JSON('{\"k\":\"a\\\"b\",\"tags\":[\"a\\\"b\",1]}')"
+        ).status_code
+        == 200
+    )
+
+    document = '{"k":"a\\"b","tags":["a\\"b",1]}'
+    for statement, expected in (
+        # A VARIANT column keeps its document, quotes inside strings and all.
+        ("SELECT TO_JSON(v) FROM tj", [[document]]),
+        # A string variant stays a JSON string; a number and a boolean do not.
+        ("SELECT TO_JSON(TO_VARIANT('a\"b'))", [['"a\\"b"']]),
+        (
+            "SELECT TO_JSON(TO_VARIANT(42)), TO_JSON(TO_VARIANT(true))",
+            [["42", "true"]],
+        ),
+        # A struct-backed VARIANT is the document, not DuckDB's repr in a JSON string.
+        (
+            "SELECT TO_JSON(TO_VARIANT(OBJECT_CONSTRUCT('k', 'a\"b')))",
+            [['{"k":"a\\"b"}']],
+        ),
+        # A JSON value already holds its document text, and NULL stays NULL.
+        ("SELECT TO_JSON(PARSE_JSON('{\"a\":1}'))", [['{"a":1}']]),
+        ("SELECT TO_JSON(NULL)", [[None]]),
+        # The result is VARCHAR (JSON text), so it compares as text.
+        ("SELECT TYPEOF(TO_JSON(TO_VARIANT(42)))", [["VARCHAR"]]),
+        ("SELECT TO_JSON(TO_VARIANT(42)) = '42'", [[True]]),
+    ):
+        assert data(statement) == expected, statement
+
+
+def test_parse_json_of_a_string_variant_parses_its_text(client):
+    """`PARSE_JSON(variant)` parses the value's text, as Snowflake's coercion does.
+
+    A VARIANT is coercible to VARCHAR, and that conversion preserves a stored string as is
+    (no JSON quotes). Parsing the value's *document* instead made a string variant that holds
+    JSON text stay a string: ``PARSE_JSON(TO_VARIANT('{"a":1}'))`` answered ``{"a":1}``
+    rather than the object Snowflake parses.
+    """
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    # A string variant holding a document is reparsed into that document.
+    assert data("SELECT PARSE_JSON(TO_VARIANT('{\"a\":1}')):a::VARCHAR") == [["1"]]
+    assert data("SELECT PARSE_JSON(TO_VARIANT('[1,2]'))::VARCHAR") == [["[1,2]"]]
+    # A number variant is parsed from its digits, so the result is the number.
+    assert data("SELECT PARSE_JSON(TO_VARIANT('42')) = 42") == [[True]]
+    assert data("SELECT PARSE_JSON(TO_VARIANT('42')) = '42'") == [[False]]
+    # A JSON null variant parses back to a JSON null, which is not an SQL NULL.
+    assert data("SELECT PARSE_JSON(TO_VARIANT('null')) IS NULL") == [[False]]
+    assert data("SELECT TO_VARCHAR(PARSE_JSON(TO_VARIANT('null')))") == [["null"]]
+    # A string variant that is not valid JSON fails the parse, as in Snowflake.
+    resp = post("SELECT PARSE_JSON(TO_VARIANT('abc'))")
+    assert resp.status_code == 422
+    assert "Malformed JSON" in resp.json()["detail"]["message"]
+
+
+def test_flatten_value_is_a_variant_when_used_as_text(client):
+    """FLATTEN's VALUE/THIS are VARIANT, so a string element's JSON quotes are dropped.
+
+    The relation is rewritten to a ``json_each``-shaped subquery, which has no catalog entry,
+    so without typing it ``VALUE::VARCHAR`` kept DuckDB's JSON serialization (``"a\\"b"``)
+    and ``LENGTH``/``UPPER`` measured and transformed those quotes -- 6 and ``"A\\"B"`` where
+    Snowflake answers ``a"b``, 3 and ``A"B``.
+    """
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post("CREATE TABLE flat_txt (j VARIANT)").status_code == 200
+    assert (
+        post(
+            "INSERT INTO flat_txt SELECT "
+            "PARSE_JSON('{\"tags\":[\"a\\\"b\",1]}')"
+        ).status_code
+        == 200
+    )
+
+    qualified = (
+        "SELECT f.value::VARCHAR, LENGTH(f.value), UPPER(f.value) "
+        "FROM flat_txt t, LATERAL FLATTEN(input => t.j:tags) f ORDER BY f.index"
+    )
+    assert data(qualified) == [["a\"b", 3, 'A"B'], ["1", 1, "1"]]
+    # A FLATTEN's columns are also visible without a qualifier.
+    assert data(
+        "SELECT value::VARCHAR, LENGTH(value) "
+        "FROM LATERAL FLATTEN(input => PARSE_JSON('[\"a\\\"b\"]'))"
+    ) == [["a\"b", 3]]
+    # TABLE(FLATTEN(...)) is the same relation, and THIS keeps an object's document text.
+    assert data(
+        "SELECT f.value::VARCHAR, f.this::VARCHAR FROM "
+        "TABLE(FLATTEN(input => PARSE_JSON('{\"k\":\"a\\\"b\"}'))) f"
+    ) == [["a\"b", '{"k":"a\\"b"}']]
 
 
 def test_variant_value_used_as_text_in_nested_expressions(client):
@@ -2056,11 +2181,12 @@ def test_staged_json_writes_coerce_to_the_target_columns(client, tmp_path):
     run("COPY INTO stage_p FROM (SELECT $1:name::VARCHAR FROM @~/staged/rows.json)")
     assert run("SELECT name FROM stage_p ORDER BY name") == [["ada"], ["bob"]]
 
-    # A JSON value written into a VARIANT column is untouched: still a VARIANT holding the string.
+    # A JSON value written into a VARIANT column is untouched: still a VARIANT holding the string
+    # (TYPEOF names the type *stored* in the VARIANT, which is VARCHAR for that string).
     assert run("CREATE TABLE stage_v (v VARIANT)") == [["Statement executed successfully."]]
     run("INSERT INTO stage_v (v) SELECT $1:name FROM @~/staged/rows.json")
     assert run("SELECT typeof(v), v::VARCHAR FROM stage_v ORDER BY 1 LIMIT 1") == [
-        ["VARIANT", "ada"]
+        ["VARCHAR", "ada"]
     ]
 
 
@@ -3044,3 +3170,387 @@ def test_get_statement_supports_partition_polling(client):
     assert second["data"] == []
     assert second["resultSetMetaData"]["numRows"] == 0
     assert second["resultSetMetaData"]["rowType"][0]["name"] == "X"
+
+
+def test_get_and_get_path_read_a_variant_column(client):
+    """`GET`/`GET_PATH` read the VARIANT's document; `GET` used to parse its internal repr."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post("CREATE TABLE gv (v VARIANT)").status_code == 200
+    assert (
+        post("""INSERT INTO gv SELECT PARSE_JSON('{"s":"x","arr":[1,2]}')""").status_code
+        == 200
+    )
+    assert data("SELECT GET(v,'s'), GET_PATH(v,'s'), GET_PATH(v,'arr[1]') FROM gv") == [
+        ["x", "x", 2]
+    ]
+    # A JSON operand reads the same way.
+    assert data("SELECT GET(PARSE_JSON('{\"a\":1}'),'a')") == [[1]]
+
+
+def test_typeof_names_the_type_stored_in_the_variant(client):
+    """`TYPEOF` answers Snowflake's names for the stored value, not DuckDB's JSON/VARIANT."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post("CREATE TABLE tv (v VARIANT)").status_code == 200
+    assert (
+        post(
+            "INSERT INTO tv SELECT "
+            """PARSE_JSON('{"s":"x","i":1,"dec":1.5,"b":true,"arr":[1,2],"""
+            """"o":{"k":1},"nl":null}')"""
+        ).status_code
+        == 200
+    )
+
+    assert data("SELECT TYPEOF(v) FROM tv") == [["OBJECT"]]
+    # A JSON null is NULL_VALUE; a value that is not there (SQL NULL) is NULL.
+    assert data(
+        "SELECT TYPEOF(v:s), TYPEOF(v:i), TYPEOF(v:dec), TYPEOF(v:b), TYPEOF(v:arr), "
+        "TYPEOF(v:o), TYPEOF(v:nl), TYPEOF(v:missing), TYPEOF(NULL) FROM tv"
+    ) == [
+        [
+            "VARCHAR", "INTEGER", "DECIMAL", "BOOLEAN", "ARRAY", "OBJECT",
+            "NULL_VALUE", "NULL", "NULL",
+        ]
+    ]
+
+
+def test_flatten_output_columns_follow_snowflake(client):
+    """SEQ counts the input record, KEY is NULL for arrays, PATH is `[i]`/`key` (docs table)."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post("CREATE TABLE fv (v VARIANT)").status_code == 200
+    assert (
+        post(
+            """INSERT INTO fv SELECT PARSE_JSON('{"arr":[1,2],"o":{"k":"v"}}')"""
+        ).status_code
+        == 200
+    )
+
+    # An array element: KEY NULL, PATH `[i]`, INDEX i, and one SEQ per input record.
+    assert data(
+        "SELECT f.seq, f.key, f.path, f.index, f.value::VARCHAR "
+        "FROM fv t, LATERAL FLATTEN(input => t.v:arr) f ORDER BY f.index"
+    ) == [[1, None, "[0]", 0, "1"], [1, None, "[1]", 1, "2"]]
+    # An object member: the key is both KEY and PATH, and INDEX is NULL.
+    assert data(
+        "SELECT f.seq, f.key, f.path, f.index "
+        "FROM fv t, LATERAL FLATTEN(input => t.v:o) f"
+    ) == [[1, "k", "k", None]]
+    # The PATH argument prefixes the path (`b[0]` in the docs, `o.k` for an object).
+    assert data(
+        "SELECT f.path FROM fv t, LATERAL FLATTEN(input => t.v, path => 'o') f"
+    ) == [["o.k"]]
+    # A zero-row OUTER expansion: SEQ 1 and an empty PATH, as the docs table shows.
+    assert data(
+        "SELECT seq, key, path, index, value FROM "
+        "TABLE(FLATTEN(input => PARSE_JSON('[]'), outer => TRUE))"
+    ) == [[1, None, "", None, None]]
+
+
+def test_parse_json_rejects_duplicate_keys_and_maps_empty_to_null(client):
+    """`PARSE_JSON` is strict about duplicates and returns NULL for an empty document."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert data("SELECT PARSE_JSON(''), PARSE_JSON('   ')") == [[None, None]]
+    # A string that is only known at run time can be empty too.
+    assert data("SELECT PARSE_JSON(x) FROM (SELECT '' x)") == [[None]]
+
+    resp = post("""SELECT PARSE_JSON('{"a":1,"a":2}')""")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert (detail["sqlState"], detail["code"]) == ("22000", "100069")
+    assert 'duplicate object attribute "a"' in detail["message"]
+
+    # The 'd' parameter allows duplicates (last key wins); TRY_PARSE_JSON answers NULL.
+    assert data("""SELECT PARSE_JSON('{"a":1,"a":2}', 'd')""") == [[{"a": 2}]]
+    assert data("""SELECT TRY_PARSE_JSON('{"a":1,"a":2}')""") == [[None]]
+
+
+def test_object_construct_omits_sql_null_pairs(client):
+    """An OBJECT omits a pair whose key or value is SQL NULL; a JSON null keeps its key."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert data("SELECT OBJECT_CONSTRUCT('a', NULL, 'b', 2)") == [[{"b": 2}]]
+    # A JSON null is not omitted, and is not the string 'null'.
+    assert data("SELECT OBJECT_CONSTRUCT('a', PARSE_JSON('null'), 'b', 1)") == [
+        [{"a": None, "b": 1}]
+    ]
+    # A SQL NULL key omits the pair too; dropping every pair is an empty object.
+    assert data("SELECT OBJECT_CONSTRUCT(NULL, 1)") == [[{}]]
+    # A run-time NULL value still keeps its key: a DuckDB STRUCT cannot drop a field.
+    assert data("SELECT OBJECT_CONSTRUCT('a', x, 'b', 2) FROM (SELECT NULL x)") == [
+        [{"a": None, "b": 2}]
+    ]
+
+
+def test_pad_with_an_empty_pad_string_inserts_no_padding(client):
+    """`LPAD`/`RPAD` with an empty pad truncate but never pad, as the docs state."""
+    resp = client.post(
+        "/api/v2/statements",
+        json={"statement": "SELECT LPAD('abc', 5, ''), RPAD('abc', 5, ''), "
+        "LPAD('abc', 2, ''), RPAD('abc', 2, '')"},
+    )
+    assert resp.status_code == 200, resp.json()
+    assert resp.json()["data"] == [["abc", "abc", "ab", "ab"]]
+
+
+def test_dateadd_and_date_trunc_keep_a_date(client):
+    """A DATE input stays a DATE for a day-or-larger part, and is a TIMESTAMP below it."""
+    resp = client.post(
+        "/api/v2/statements",
+        json={
+            "statement": "SELECT DATEADD('day',2,'2024-01-30'::DATE) AS d1, "
+            "DATEADD('hour',2,'2024-01-30'::DATE) AS d2, "
+            "DATE_TRUNC('week','2024-01-03'::DATE) AS d3, "
+            "DATE_TRUNC('hour','2024-01-03'::DATE) AS d4"
+        },
+    )
+    assert resp.status_code == 200, resp.json()
+    body = resp.json()
+    assert [col["type"] for col in body["resultSetMetaData"]["rowType"]] == [
+        "date",
+        "timestamp_ntz",
+        "date",
+        "timestamp_ntz",
+    ]
+    assert body["data"] == [
+        ["2024-02-01", "2024-01-30 02:00:00.000", "2024-01-01", "2024-01-03 00:00:00.000"]
+    ]
+
+    # A DATE column is typed from the catalog, and a TIMESTAMP column keeps its own type.
+    assert client.post(
+        "/api/v2/statements",
+        json={"statement": "CREATE TABLE dts (d DATE, t TIMESTAMP_NTZ)"},
+    ).status_code == 200
+    assert client.post(
+        "/api/v2/statements",
+        json={"statement": "INSERT INTO dts SELECT '2024-01-31', '2024-01-31 10:20:30'"},
+    ).status_code == 200
+    resp = client.post(
+        "/api/v2/statements",
+        json={
+            "statement": "SELECT DATEADD(day,1,d) AS a, DATEADD(hour,1,d) AS b, "
+            "DATE_TRUNC(day,d) AS c, DATE_TRUNC(hour,d) AS e, DATE_TRUNC(day,t) AS f FROM dts"
+        },
+    )
+    assert resp.status_code == 200, resp.json()
+    body = resp.json()
+    assert [col["type"] for col in body["resultSetMetaData"]["rowType"]] == [
+        "date",
+        "timestamp_ntz",
+        "date",
+        "timestamp_ntz",
+        "timestamp_ntz",
+    ]
+    assert body["data"] == [
+        [
+            "2024-02-01",
+            "2024-01-31 01:00:00.000",
+            "2024-01-31",
+            "2024-01-31 00:00:00.000",
+            "2024-01-31 00:00:00.000",
+        ]
+    ]
+
+
+def test_is_type_predicates_read_the_stored_type(client):
+    """`IS_<type>` answers from the type stored in the VARIANT, not DuckDB's storage type."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert data(
+        "SELECT IS_OBJECT(PARSE_JSON('{}')), IS_ARRAY(PARSE_JSON('[]')), "
+        "IS_VARCHAR(PARSE_JSON('\"x\"')), IS_BOOLEAN(PARSE_JSON('true'))"
+    ) == [[True, True, True, True]]
+    # Snowflake stores a JSON decimal exactly, so it is DECIMAL rather than DOUBLE.
+    assert data(
+        "SELECT IS_INTEGER(PARSE_JSON('1')), IS_DECIMAL(PARSE_JSON('1.5')), "
+        "IS_DOUBLE(PARSE_JSON('1.5'))"
+    ) == [[True, True, False]]
+    # A variant built from a typed value keeps that type.
+    assert data(
+        "SELECT IS_DATE(TO_VARIANT(TO_DATE('2024-02-24'))), "
+        "IS_TIME(TO_VARIANT(TO_TIME('10:00:00'))), "
+        "IS_TIMESTAMP_NTZ(TO_VARIANT(TO_TIMESTAMP('2024-02-24 10:00:00'))), "
+        "IS_DOUBLE(TO_VARIANT(1.5::DOUBLE)), IS_BINARY(TO_VARIANT('ab'::BINARY))"
+    ) == [[True, True, True, True, True]]
+    # A SQL NULL answers NULL; a JSON null is a value of type NULL_VALUE.
+    assert data(
+        "SELECT IS_INTEGER(NULL), IS_INTEGER(PARSE_JSON('null')), "
+        "IS_VARCHAR(PARSE_JSON('1'))"
+    ) == [[None, False, False]]
+    assert data(
+        "SELECT TYPEOF(TO_VARIANT(TO_DATE('2024-02-24'))), TYPEOF(TO_VARIANT(1.5::DOUBLE))"
+    ) == [["DATE", "DOUBLE"]]
+
+
+def test_object_pick_delete_insert(client):
+    """`OBJECT_PICK`/`OBJECT_DELETE`/`OBJECT_INSERT` select, drop and insert key-value pairs."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert data(
+        """SELECT OBJECT_PICK(PARSE_JSON('{"a":1,"b":2,"c":3}'), 'a', 'c')"""
+    ) == [[{"a": 1, "c": 3}]]
+    # A key that is not present is ignored, and every key missing is an empty OBJECT.
+    assert data("""SELECT OBJECT_PICK(PARSE_JSON('{"a":1}'), 'zz')""") == [[{}]]
+    # The documented array-of-keys form.
+    assert data(
+        """SELECT OBJECT_PICK(PARSE_JSON('{"a":1,"b":2}'), PARSE_JSON('["a"]'))"""
+    ) == [[{"a": 1}]]
+    assert data(
+        """SELECT OBJECT_DELETE(PARSE_JSON('{"a":1,"b":2}'), 'a')"""
+    ) == [[{"b": 2}]]
+    assert data("""SELECT OBJECT_DELETE(PARSE_JSON('{"a":1}'), 'a')""") == [[{}]]
+
+    assert data("""SELECT OBJECT_INSERT(PARSE_JSON('{"a":1}'), 'b', 2)""") == [
+        [{"a": 1, "b": 2}]
+    ]
+    assert data("""SELECT OBJECT_INSERT(PARSE_JSON('{"a":1}'), 'a', 2, TRUE)""") == [
+        [{"a": 2}]
+    ]
+    # An existing key without updateFlag is an error.
+    resp = post("""SELECT OBJECT_INSERT(PARSE_JSON('{"a":1}'), 'a', 2)""")
+    assert resp.status_code == 422
+    assert "Duplicate key" in resp.json()["detail"]["message"]
+    # A SQL NULL value omits the pair; a JSON null value is inserted.
+    assert data("""SELECT OBJECT_INSERT(PARSE_JSON('{"a":1}'), 'b', NULL)""") == [[{"a": 1}]]
+    assert data(
+        """SELECT OBJECT_INSERT(PARSE_JSON('{"a":1}'), 'b', PARSE_JSON('null'))"""
+    ) == [[{"a": 1, "b": None}]]
+    # The functions also accept an OBJECT (a struct-backed value).
+    assert data("SELECT OBJECT_PICK(OBJECT_CONSTRUCT('a', 1, 'b', 2), 'a')") == [[{"a": 1}]]
+
+
+def test_get_ignore_case_matches_a_field_name(client):
+    """`GET_IGNORE_CASE` matches one field name without regard to case."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert data(
+        """SELECT GET_IGNORE_CASE(PARSE_JSON('{"Aa":1,"b b":2}'), 'aa'),
+                  GET_IGNORE_CASE(PARSE_JSON('{"Aa":1}'), 'zz')"""
+    ) == [[1, None]]
+    # A field name with a space is one key, not a path.
+    assert data("""SELECT GET_IGNORE_CASE(PARSE_JSON('{"b b":2}'), 'B B')""") == [[2]]
+    assert data("SELECT GET_IGNORE_CASE(NULL, 'a')") == [[None]]
+
+
+def test_object_construct_star_uses_the_source_columns(client):
+    """`OBJECT_CONSTRUCT(*)` takes the columns in scope, with the ILIKE/EXCLUDE filters."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post("CREATE TABLE star_t (province VARCHAR, created_date DATE)").status_code == 200
+    assert (
+        post("INSERT INTO star_t SELECT 'Alberta', '2024-01-19'::DATE").status_code == 200
+    )
+    both = {"PROVINCE": "Alberta", "CREATED_DATE": "2024-01-19"}
+    assert data("SELECT OBJECT_CONSTRUCT(*) FROM star_t") == [[both]]
+    assert data("SELECT OBJECT_CONSTRUCT(t.*) FROM star_t t") == [[both]]
+    assert data("SELECT OBJECT_CONSTRUCT(* ILIKE 'prov%') FROM star_t") == [
+        [{"PROVINCE": "Alberta"}]
+    ]
+    assert data("SELECT OBJECT_CONSTRUCT(* EXCLUDE created_date) FROM star_t") == [
+        [{"PROVINCE": "Alberta"}]
+    ]
+
+
+def test_array_size_of_a_non_array_variant_is_null(client):
+    """A VARIANT that is not an array answers NULL; a real array keeps its size."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert data("""SELECT ARRAY_SIZE(PARSE_JSON('1')), ARRAY_SIZE(PARSE_JSON('{"a":1}'))""") == [
+        [None, None]
+    ]
+    assert data("SELECT ARRAY_SIZE(PARSE_JSON('[1,2,3]')), ARRAY_SIZE(ARRAY_CONSTRUCT(1,2))") == [
+        [3, 2]
+    ]
+    assert data("SELECT ARRAY_SIZE(NULL)") == [[None]]
+
+
+def test_negative_array_index_answers_null(client):
+    """The documented path grammar allows only non-negative indices; DuckDB reads -1."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert data(
+        """SELECT v:arr[-1], v:arr[0] FROM (SELECT PARSE_JSON('{"arr":[10,20]}') v)"""
+    ) == [[None, 10]]
+
+
+def test_numeric_to_char_format_is_rejected(client):
+    """A numeric `TO_CHAR` format model is refused instead of silently dropped."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    resp = post("SELECT TO_CHAR(1234.5, '9999.99')")
+    assert resp.status_code == 422
+    assert "format models are only supported" in resp.json()["detail"]["message"]
+
+    # A date/time format model is still translated.
+    resp = post("SELECT TO_CHAR('2024-01-02'::DATE, 'YYYY-MM-DD')")
+    assert resp.status_code == 200, resp.json()
+    assert resp.json()["data"] == [["2024-01-02"]]

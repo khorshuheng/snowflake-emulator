@@ -51,10 +51,11 @@ def _cell(value: Any, col: ColumnMeta) -> Any:
         return None
     if col.type == "variant" and (col.duckdb_type or "").strip().upper() == "VARIANT":
         # As in the wire encoder: a DuckDB VARIANT is a plain value that must reach the
-        # connector as JSON text, while a JSON cell already is JSON text.
-        return json.dumps(value, default=str)
+        # connector as its JSON text, compact the way Snowflake sends it. A JSON cell
+        # already is JSON text.
+        return json.dumps(value, default=str, separators=(",", ":"))
     if isinstance(value, (dict, list)):
-        return json.dumps(value, default=str)
+        return json.dumps(value, default=str, separators=(",", ":"))
     if col.type == "time" and isinstance(value, datetime.time):
         return (
             (value.hour * 3600 + value.minute * 60 + value.second) * 1_000_000_000

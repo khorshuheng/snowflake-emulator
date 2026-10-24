@@ -217,7 +217,10 @@ Not translated, and left as a loud error rather than a guess:
   (`ARRAY_SLICE(arr, ?, ?)` names each index once);
 - `ARRAY_FLATTEN(arr, depth)` — the emulator's legacy depth form, where Snowflake's
   documented signature is `ARRAY_FLATTEN(arr)` (one level). The depth must be a constant
-  between 1 and 10; a computed depth is rejected.
+  between 1 and 10; a computed depth is rejected;
+- a **numeric `TO_CHAR`/`TO_VARCHAR` format model** (`TO_CHAR(1234.5, '9999.99')`): DuckDB
+  drops the format, so the call is rejected rather than answering an unformatted string. A
+  DATE/TIME/TIMESTAMP format model is translated.
 
 A `FILTER`/`TRANSFORM`/`REDUCE` lambda over a JSON or VARIANT array receives a VARIANT
 element, as in Snowflake, so `FILTER(j:n, x -> x = 'a')` filters without an encoding helper
@@ -255,7 +258,58 @@ A VARIANT value used as text renders Snowflake's JSON document, compact and cano
 `LENGTH`, `SUBSTR`, `TRIM`, `REPLACE`, `SPLIT*`, `CONTAINS`, `LPAD`/`RPAD`, `CHARINDEX`, `||`,
 `CONCAT`) coerce an object to `{"names":["X"]}` and a string stored in it to the string without
 its JSON quotes, as Snowflake documents. DuckDB's own VARIANT cast would render its struct repr
-(`{'names': [X]}`). A bare VARIANT column is recognised through the catalog type lookup.
+(`{'names': [X]}`). A bare VARIANT column is recognised through the catalog type lookup, and so
+are a `FLATTEN`'s VALUE/THIS columns (which Snowflake types as VARIANT), so `f.value::VARCHAR`
+and `UPPER(f.value)` see `a"b` rather than the JSON text `"a\"b"`. A JSON null is the word
+`null` -- Snowflake's conversion of a JSON null to a string -- while a path that matches nothing
+stays SQL NULL.
+
+`TO_JSON` returns the value's JSON *representation*: `42` for a numeric variant and the document
+text for an object (DuckDB's own `to_json` casts the VARIANT to VARCHAR first, which would
+answer the JSON strings `"42"` and `"{'k': v}"`). `PARSE_JSON(<variant>)` parses the value's
+text, the way Snowflake's VARIANT -> VARCHAR coercion does, so a string variant holding a
+document becomes that document and a string variant that is not valid JSON is an error.
+`PARSE_JSON` also follows the documented input rules: an empty or whitespace-only document is
+NULL, and a duplicate object key is an error (`100069 (22000)`, or NULL for `TRY_PARSE_JSON`)
+unless the `'d'` parameter allows it -- exact for a string literal, while a run-time document
+keeps DuckDB's parse (last key wins). `TYPEOF` names the type stored *in* the VARIANT
+(`OBJECT`, `ARRAY`, `VARCHAR`, `INTEGER`, `DECIMAL`, `BOOLEAN`, `NULL_VALUE`, `NULL`), not
+DuckDB's `JSON`/`VARIANT`; as Snowflake warns for its own TYPEOF, a number can come back
+DECIMAL where Snowflake says DOUBLE, because DuckDB's JSON parse normalizes the exponent form.
+`GET`/`GET_PATH` read a VARIANT column (sqlglot renders `GET` as a bare `->`, whose operand
+DuckDB parses as text, so the operand is cast to JSON first), and `GET_IGNORE_CASE` matches a
+single field name case-insensitively (the documented signature takes one key, not a path). The
+`IS_*` type predicates (`IS_OBJECT`, `IS_ARRAY`, `IS_VARCHAR`/`IS_CHAR`, `IS_INTEGER`,
+`IS_DECIMAL`, `IS_DOUBLE`/`IS_REAL`/`IS_FLOAT`, `IS_BOOLEAN`, `IS_BINARY`, `IS_DATE`,
+`IS_TIME`, `IS_TIMESTAMP_NTZ`/`_LTZ`/`_TZ`) read the type stored in the value, answer NULL for a
+SQL NULL argument, and see `TRUE` for a variant built from a typed value (`IS_DATE(TO_VARIANT(
+TO_DATE(...)))`). Because the emulator stores `TIMESTAMP_LTZ` and `TIMESTAMP_TZ` as one
+`TIMESTAMPTZ`, both timestamp predicates answer for either.
+
+`OBJECT_PICK`, `OBJECT_DELETE` and `OBJECT_INSERT` select, drop and insert key-value pairs
+(the array-of-keys form of `OBJECT_PICK` included, `OBJECT_INSERT`'s duplicate-key error and
+`updateFlag` included, and SQL NULL keys/values omitted). `OBJECT_CONSTRUCT(*)` takes the
+columns in scope, honouring `* ILIKE '<pattern>'` and `* EXCLUDE (...)`; a source whose columns
+the catalog cannot enumerate is a loud error rather than a silently empty object. These return a
+JSON value, which the SQL API reports as `variant` rather than `object`.
+
+`ARRAY_SIZE` of a VARIANT answers NULL when the value is not an array (docs: "otherwise, NULL is
+returned if the value is not an array") instead of raising, and a negative array index
+(`v:arr[-1]`) answers NULL, since the documented path grammar allows only non-negative indices.
+A numeric `TO_CHAR`/`TO_VARCHAR` format model is rejected rather than silently dropped (DuckDB
+ignores it); a DATE/TIME/TIMESTAMP format model is translated.
+
+`FLATTEN` projects Snowflake's documented columns: `SEQ` is the input record's number (one
+record per lateral evaluation, so every row of one record shares it), `KEY` is NULL for an array
+element, `INDEX` is set only for one, and `PATH` is `[i]` / `key` -- prefixed by the `PATH`
+argument, e.g. `tags[0]` -- rather than DuckDB's JSON-path text. An `OUTER => TRUE` zero-row
+expansion answers `SEQ` 1 with an empty `PATH` and NULL `KEY`/`INDEX`/`VALUE`.
+
+An OBJECT (an `OBJECT_CONSTRUCT` call or a `{'k': v}` constant) omits a key-value pair whose key
+or value is SQL NULL, as documented, and keeps a JSON null value (it reaches the client as a JSON
+null, not the text `null`). The omission is exact when the arguments are literals: the emulator
+stores an OBJECT as a DuckDB STRUCT, which cannot drop a field it has typed, so a *run-time* NULL
+value still keeps its key.
 
 `TIMESTAMP_NTZ(7..9)` is stored at **microsecond** precision. DuckDB maps a precision above 6 to
 `TIMESTAMP_NS` (int64 nanoseconds), which only spans roughly 1677-2262, so Snowflake's year range
@@ -273,6 +327,12 @@ capturing group under `e` behaves as if `e` were unset, and no match is NULL (in
 argument is NULL). The parameters string must be a literal, since DuckDB cannot apply
 non-literal regex flags. Lookarounds (`(?=...)`, `(?<=...)`) are PCRE constructs that DuckDB's
 RE2 engine rejects.
+
+A few scalar rules that DuckDB gets wrong are restored to the documented behavior: division by
+zero raises Snowflake's `100051 (22012)` (DuckDB answers NULL), while a NULL dividend or divisor
+still gives NULL and `DIV0`/`DIV0NULL` keep answering; `LPAD`/`RPAD` with an empty pad string
+insert no padding but still truncate; and `DATEADD`/`DATE_TRUNC` keep a DATE input a DATE when
+the part is day or larger, answering TIMESTAMP_NTZ for a smaller part.
 
 `HASH_AGG(...)` is a `SUM(HASH(...))` folded into a signed 64-bit value: order-independent,
 deterministic, influenced by NULLs and duplicates, `0` for an empty input, and never NULL. It is
@@ -434,6 +494,10 @@ Caveats:
 - a **bare VARIANT column** cast to text (`SELECT variant_col::VARCHAR`) uses DuckDB's own
   VARIANT text form: right for a string, but an object shows as the variant's internal
   form, so use `variant_col::JSON::VARCHAR` when you need the document text;
+- a `FLATTEN`'s `SEQ` is 1 for every input record, matching Snowflake's documented examples,
+  but a scan over several records does not number them 1, 2, 3 the way Snowflake does; and an
+  `OBJECT_CONSTRUCT` argument that is NULL at run time still keeps its key (the literal case is
+  exact), because an OBJECT is stored as a DuckDB STRUCT;
 - a JSON value nested inside a **STRUCT/MAP** cell keeps its text
   (`SELECT STRUCT_PACK(a := PARSE_JSON('1'))` -> `{'A': '1'}`, `MAP {'k': PARSE_JSON('1')}`,
   or a DuckDB-flavoured `STRUCT(a JSON)` column): only a top-level JSON cell and the elements
@@ -442,6 +506,11 @@ Caveats:
   DuckDB-specific SQL and is left as it is;
 - A `:` path on a non-JSON column (`$1:key` over CSV/Parquet) yields NULL rather than
   Snowflake's compile error.
+- `OBJECT_PICK`/`OBJECT_DELETE`/`OBJECT_INSERT` and the `IS_*` predicates return a JSON value
+  where Snowflake returns an OBJECT (the `rowType` reports `variant`), and the emulator stores
+  `TIMESTAMP_LTZ` and `TIMESTAMP_TZ` as one type, so `IS_TIMESTAMP_LTZ` and `IS_TIMESTAMP_TZ`
+  answer alike. `OBJECT_CONSTRUCT(*)` needs a FROM source whose columns can be enumerated, and
+  `PARSE_JSON` rejects the `undefined` array element Snowflake accepts (e.g. `[1, ,77]`).
 - The stage's own `FILE_FORMAT` (`CREATE STAGE ... FILE_FORMAT = ...`) is not modelled,
   so an explicit `(FILE_FORMAT => ...)` clause is required for anything but the inferred
   per-extension format.

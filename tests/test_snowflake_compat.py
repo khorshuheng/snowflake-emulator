@@ -615,8 +615,9 @@ def test_variant_value_renders_as_json_text(client):
     assert _data("SELECT plain::VARCHAR, plain || '!' FROM vtext") == [["plain", "plain!"]]
     assert _data("SELECT obj:names::VARCHAR FROM vtext") == [['["X"]']]
 
-    # The value itself is untouched: it is still a VARIANT, not text.
-    assert _data("SELECT typeof(obj) FROM vtext") == [["VARIANT"]]
+    # The value itself is untouched: it is still a VARIANT, not text. TYPEOF names the type
+    # stored *in* the VARIANT, as Snowflake documents it.
+    assert _data("SELECT typeof(obj) FROM vtext") == [["OBJECT"]]
 
 
 def test_backslash_escapes_stay_literal_in_string_literals(client):

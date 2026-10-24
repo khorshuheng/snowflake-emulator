@@ -51,7 +51,8 @@ def encode_cell(value: Any, sf_type: str, scale: int, duckdb_type: str = "") -> 
         # A DuckDB VARIANT holds a plain value, while the wire carries the JSON text the
         # connector decodes: a string variant is quoted, a number or boolean is not. A JSON
         # cell is already JSON text, so it falls through to the generic handling below.
-        return json.dumps(value, default=str)
+        # Snowflake's VARIANT text is compact, so the separators carry no spaces.
+        return json.dumps(value, default=str, separators=(",", ":"))
 
     if sf_type == "boolean":
         return "1" if value else "0"
@@ -88,7 +89,7 @@ def encode_cell(value: Any, sf_type: str, scale: int, duckdb_type: str = "") -> 
         return repr(float(value))
 
     if isinstance(value, (dict, list)):
-        return json.dumps(value, default=str)
+        return json.dumps(value, default=str, separators=(",", ":"))
 
     if isinstance(value, decimal.Decimal):
         return str(value)

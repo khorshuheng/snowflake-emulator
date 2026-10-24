@@ -93,3 +93,22 @@ def test_wire_protocol_reports_classified_binder_error(client):
     )
     assert resp.json()["code"] == "002043"
     assert resp.json()["data"]["sqlState"] == "02000"
+
+
+def test_division_by_zero_reports_snowflake_division_error(client):
+    """Snowflake raises ``100051 (22012)`` for ``1/0``; DuckDB answers NULL."""
+    resp = _post(client, "SELECT 1/0")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert (detail["sqlState"], detail["code"]) == ("22012", "100051")
+    assert "Division by zero" in detail["message"]
+
+
+def test_division_by_zero_guards_are_not_errors(client):
+    """The rewritten division keeps NULL dividends, NULL divisors and DIV0 answering."""
+    resp = _post(
+        client,
+        "SELECT DIV0(1,0), DIV0(NULL,0), DIV0NULL(NULL,0), 1/NULL, 4/2",
+    )
+    assert resp.status_code == 200
+    assert resp.json()["data"] == [[0.0, None, 0.0, None, 2.0]]

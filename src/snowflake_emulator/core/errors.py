@@ -65,6 +65,11 @@ def classify_exception(exc: BaseException) -> tuple[str, str]:
         if "Duplicate struct entry name" in str(exc):
             return "100103", "22000"
         return _BINDER
+    # A statement that raises ``error('Division by zero')`` (see the division rewrite in
+    # ``translator.scalar_semantics``) carries Snowflake's division-by-zero pair, which the
+    # exception type alone cannot express.
+    if "Division by zero" in str(exc):
+        return "100051", "22012"
     if isinstance(exc, duckdb.CatalogException):
         return _CATALOG
     if isinstance(exc, (duckdb.ParserException, duckdb.SyntaxException)):

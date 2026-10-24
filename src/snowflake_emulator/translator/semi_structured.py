@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import sqlglot
 from sqlglot import exp
 
@@ -11,10 +13,16 @@ from snowflake_emulator.translator.ast_helpers import _quoted_identifier
 from snowflake_emulator.translator import column_types
 from snowflake_emulator.translator.constants import (
     EMULATED_SNOWFLAKE_VERSION,
+    FLATTEN_RELATION_META,
+    TO_JSON_RESULT_META,
     WRITE_DIALECT,
     _SIMPLE_IDENTIFIER_RE,
 )
 from snowflake_emulator.translator.errors import TranslationError
+from snowflake_emulator.translator.object_functions import (
+    rewrite_object_function,
+    rewrite_typeof,
+)
 
 
 def _flatten_kwargs(explode: exp.Explode) -> dict[str, exp.Expression]:
@@ -62,7 +70,15 @@ def _flatten_subquery(
 
     The operand is rewritten first and cast to JSON: a VARIANT column is not JSON to
     DuckDB (``json_each`` rejects it), and this pass runs before the operand's own
-    ``col:path`` rewrite, so the cast has to be applied here.
+    ``col:path`` rewrite, so the cast has to be applied here. ``value`` is projected as an
+    explicit JSON cast, and the relation is marked, so the column-type lookup can tell that
+    a reference to ``value``/``this`` holds semi-structured data (Snowflake's FLATTEN
+    exposes VARIANT columns) and coerce it to text without DuckDB's JSON quotes.
+
+    The projection follows Snowflake's documented output columns: ``SEQ`` is the input
+    record's number (one record per lateral evaluation), ``KEY`` is NULL for an array
+    element, ``PATH`` is ``[i]``/``key`` (prefixed by the ``PATH`` argument) rather than
+    DuckDB's JSON-path text, and ``INDEX`` is only set for an array element.
     """
     operand = exp.cast(
         input_expr.transform(_rewrite_snowflake_specifics),
@@ -72,19 +88,27 @@ def _flatten_subquery(
     if path is not None:
         operand = exp.func("json_extract", operand, exp.Literal.string(f"$.{path}"))
     x = operand.sql(dialect=WRITE_DIALECT)
+    prefix = exp.Literal.string(path or "").sql(dialect=WRITE_DIALECT)
+    separator = exp.Literal.string("." if path else "").sql(dialect=WRITE_DIALECT)
+    element = f"JSON_TYPE({x}) = 'ARRAY'"
     rows = (
-        f"SELECT ROW_NUMBER() OVER () - 1 AS seq, key, fullkey AS path, "
-        f"TRY_CAST(key AS BIGINT) AS index, value, {x} AS this "
+        "SELECT 1 AS seq, "
+        f"CASE WHEN {element} THEN NULL ELSE key END AS key, "
+        f"CASE WHEN {element} THEN {prefix} || '[' || key || ']' "
+        f"ELSE {prefix} || {separator} || key END AS path, "
+        f"TRY_CAST(CASE WHEN {element} THEN key END AS BIGINT) AS index, "
+        f"CAST(value AS JSON) AS value, {x} AS this "
         f"FROM json_each({x})"
     )
     if outer:
         rows = (
             f"({rows}) UNION ALL "
-            "SELECT NULL::BIGINT AS seq, NULL::VARCHAR AS key, NULL::VARCHAR AS path, "
-            f"NULL::BIGINT AS index, NULL::JSON AS value, {x} AS this "
+            "SELECT 1 AS seq, NULL::VARCHAR AS key, '' AS path, NULL::BIGINT AS index, "
+            f"NULL::JSON AS value, {x} AS this "
             f"WHERE NOT EXISTS (SELECT 1 FROM json_each({x}))"
         )
     select = sqlglot.parse_one(rows, read=WRITE_DIALECT)
+    select.meta[FLATTEN_RELATION_META] = True
     return exp.Subquery(this=select)
 
 
@@ -150,9 +174,22 @@ def _is_text_type(data_type: exp.Expression | None) -> bool:
 
 
 def _json_root_extract(operand: exp.Expression) -> exp.Expression:
-    """``operand ->> '$'``: the text of a JSON value (a string without its quotes)."""
-    return exp.JSONExtractScalar(
+    """The text of a JSON value, as Snowflake coerces it: a string without its quotes.
+
+    ``->> '$'`` renders an object/array as its document text, a number as its digits and a
+    string without its quotes -- exactly Snowflake's VARIANT -> VARCHAR rule. It answers NULL
+    for a JSON null, though, which Snowflake renders as the word ``null``: "a JSON null value
+    is converted to a string containing the word 'null'". That case is spelled out, while a
+    SQL NULL (a path that matched nothing) stays NULL. The operand is therefore named twice.
+    """
+    text = exp.JSONExtractScalar(
         this=operand, expression=exp.JSONPath(expressions=[exp.JSONPathRoot()])
+    )
+    rendered = operand.sql(dialect=WRITE_DIALECT)
+    return sqlglot.parse_one(
+        f"COALESCE({text.sql(dialect=WRITE_DIALECT)}, "
+        f"CASE WHEN JSON_TYPE({rendered}) = 'NULL' THEN 'null' END)",
+        read=WRITE_DIALECT,
     )
 
 
@@ -171,6 +208,10 @@ def _rewrite_semi_structured_text_cast(node: exp.Expression) -> exp.Expression:
     from descending into its children, and a ``col:path`` operand is not yet a JSON value.
     """
     operand = node.this
+    if node.meta.get(TO_JSON_RESULT_META):
+        # ``TO_JSON``'s own text cast: a variant string keeps its quotes there, so the
+        # unquoting text form must not replace it on a later pass.
+        return node
     if not (
         _is_json_value(operand)
         or _is_variant_value(operand)
@@ -188,6 +229,199 @@ def _rewrite_semi_structured_text_cast(node: exp.Expression) -> exp.Expression:
         return extracted  # its DuckDB rendering is already a text cast
     return exp.Cast(this=extracted, to=node.to)
 
+
+def _rewrite_to_json(node: exp.JSONFormat) -> exp.Expression:
+    """``TO_JSON(<variant>)``: the value's JSON representation, not DuckDB's VARCHAR form.
+
+    Snowflake's ``TO_JSON`` returns the JSON document (``42`` for a numeric variant,
+    ``{"k":"v"}`` for an object). DuckDB's ``to_json`` first casts a VARIANT to VARCHAR, so
+    the same values reach it as text and come back as JSON *strings*: ``"42"``, and for a
+    struct-backed object its internal repr wrapped in quotes. Casting the VARIANT to JSON
+    reaches the document first. A JSON operand already holds the document text, so only a
+    VARIANT value is rewritten.
+    """
+    operand = node.this
+    if not isinstance(operand, exp.Expression):
+        return node
+    if not (_is_variant_value(operand) or column_types.is_variant_typed(operand)):
+        return node
+    document = exp.cast(
+        operand.transform(_rewrite_snowflake_specifics),
+        exp.DataType.build("JSON"),
+        dialect=WRITE_DIALECT,
+    )
+    result = exp.cast(document, exp.DataType.build("VARCHAR"), dialect=WRITE_DIALECT)
+    result.meta[TO_JSON_RESULT_META] = True
+    return result
+
+
+def _rewrite_get_extract(node: exp.GetExtract) -> exp.Expression:
+    """``GET(<variant>, 'path')``: reach the VARIANT's JSON document before extracting.
+
+    ``GET_PATH`` arrives as a JSON extract that sqlglot already casts to JSON; ``GET``
+    renders a bare ``->``, whose operand DuckDB parses as text -- so a VARIANT column's
+    internal repr fails with ``Malformed JSON``. A JSON operand needs no cast.
+    """
+    operand = node.this
+    if not isinstance(operand, exp.Expression):
+        return node
+    if not (_is_variant_value(operand) or column_types.is_variant_typed(operand)):
+        return node
+    node.set(
+        "this",
+        exp.cast(
+            operand.transform(_rewrite_snowflake_specifics),
+            exp.DataType.build("JSON"),
+            dialect=WRITE_DIALECT,
+        ),
+    )
+    return node
+
+
+_PARSE_JSON_PARAMETERS = ("d", "s")
+
+# Marks the empty-document guard this module builds around a run-time PARSE_JSON, so a second
+# pass does not wrap it again.
+_PARSE_JSON_GUARD_META = "sfemu_parse_json_guard"
+
+
+def _parse_json_parameter(node: exp.ParseJSON) -> str | None:
+    """The ``'d'``/``'s'`` parameter of ``PARSE_JSON``, when one is given."""
+    parameter = node.args.get("expression")
+    if parameter is None:
+        return None
+    if not (isinstance(parameter, exp.Literal) and parameter.is_string):
+        raise TranslationError(
+            "PARSE_JSON's parameter must be the string constant 'd' or 's'."
+        )
+    value = str(parameter.this).strip().lower()
+    if value not in _PARSE_JSON_PARAMETERS:
+        raise TranslationError(
+            f"PARSE_JSON's parameter must be 'd' or 's', not '{parameter.this}'."
+        )
+    return value
+
+
+def _first_duplicate_key(document: str) -> str | None:
+    """The first duplicated object key of a JSON document, or None when it has none."""
+    duplicates: list[str] = []
+
+    def collect(pairs: list[tuple[str, object]]) -> dict:
+        seen: set[str] = set()
+        for key, _ in pairs:
+            if key in seen:
+                duplicates.append(key)
+            seen.add(key)
+        return dict(pairs)
+
+    try:
+        json.loads(document, object_pairs_hook=collect)
+    except ValueError:
+        return None  # not JSON at all: that error is the engine's to report
+    return duplicates[0] if duplicates else None
+
+
+def _rewrite_parse_json(node: exp.ParseJSON) -> exp.Expression:
+    """``PARSE_JSON``: Snowflake's empty-document and duplicate-key rules.
+
+    Snowflake parses the *text* of a semi-structured operand (the VARIANT -> VARCHAR rule
+    preserves a stored string as is), returns NULL for an empty or whitespace-only
+    document, and rejects duplicate object keys unless the ``'d'`` parameter allows them.
+    The duplicate check is exact for a string literal; a value only known at run time
+    keeps DuckDB's parse (last key wins), which is the documented ``'d'`` behavior.
+    """
+    safe = bool(node.args.get("safe"))
+    if node.meta.get(_PARSE_JSON_GUARD_META):
+        return node
+    allow_duplicates = _parse_json_parameter(node) == "d"
+    operand = node.this
+    if isinstance(operand, exp.Expression) and _is_semi_structured_value(operand):
+        text = _text_operand(operand)
+        if text is not None:
+            node.set("this", text)
+            operand = text
+    if isinstance(operand, exp.Literal) and operand.is_string:
+        document = str(operand.this)
+        if not document.strip():
+            return exp.Null()  # an empty document is NULL, not a parse error
+        duplicate = None if allow_duplicates else _first_duplicate_key(document)
+        if duplicate is not None:
+            if safe:
+                return exp.Null()  # TRY_PARSE_JSON answers NULL for any parse failure
+            raise TranslationError(
+                f'Error parsing JSON: duplicate object attribute "{duplicate}"',
+                errno="100069",
+                sqlstate="22000",
+            )
+        return node
+    if not isinstance(operand, exp.Expression):
+        return node
+    # A string that is only known at run time can still be empty: that is NULL too.
+    guarded = sqlglot.parse_one(
+        f"CASE WHEN TRIM({operand.sql(dialect=WRITE_DIALECT)}) = '' THEN NULL "
+        f"ELSE {node.sql(dialect=WRITE_DIALECT)} END",
+        read=WRITE_DIALECT,
+    )
+    for inner in guarded.find_all(exp.ParseJSON):
+        inner.meta[_PARSE_JSON_GUARD_META] = True
+    return guarded
+
+
+def _is_object_key(node: exp.Expression | None) -> bool:
+    """True for an OBJECT's key: a string literal (an identifier key is a STRUCT_PACK)."""
+    return isinstance(node, exp.Literal) and node.is_string
+
+
+def _is_json_null_literal(node: exp.Expression | None) -> bool:
+    """True for ``PARSE_JSON('null')``: a JSON null value, which is not an SQL NULL."""
+    if not isinstance(node, exp.ParseJSON):
+        return False
+    value = node.this
+    return (
+        isinstance(value, exp.Literal)
+        and value.is_string
+        and str(value.this).strip() == "null"
+    )
+
+
+def _rewrite_object_literal(node: exp.Struct) -> exp.Expression:
+    """An OBJECT constant / ``OBJECT_CONSTRUCT`` omits the pairs with a SQL NULL.
+
+    Doc: "If the key or value is NULL -- that is, SQL NULL -- the key-value pair is
+    omitted ... A key-value pair consisting of a string that isn't NULL as the key and a
+    JSON null as the value ... isn't omitted." The emulator builds a DuckDB STRUCT, which
+    cannot drop a field once its type is fixed, so the omission is exact for a literal
+    argument list; a run-time NULL value still keeps its key (see the README).
+    """
+    pairs = node.expressions
+    if not pairs or not all(isinstance(pair, exp.PropertyEQ) for pair in pairs):
+        return node
+    if not all(_is_object_key(pair.this) or isinstance(pair.this, exp.Null) for pair in pairs):
+        return node  # identifier keys: a STRUCT_PACK-style struct, not a Snowflake OBJECT
+    kept: list[exp.Expression] = []
+    changed = False
+    for pair in pairs:
+        value = pair.args.get("expression")
+        if isinstance(pair.this, exp.Null) or isinstance(value, exp.Null):
+            changed = True
+            continue
+        if _is_json_null_literal(value):
+            # A JSON null keeps its key and must not become the text 'null'; a SQL NULL in
+            # a JSON field still reaches the client as a JSON null.
+            pair.set(
+                "expression",
+                exp.cast(
+                    exp.Null(), exp.DataType.build("JSON"), dialect=WRITE_DIALECT
+                ),
+            )
+            changed = True
+        kept.append(pair)
+    if not changed:
+        return node
+    if not kept:
+        return sqlglot.parse_one("CAST('{}' AS JSON)", read=WRITE_DIALECT)
+    node.set("expressions", kept)
+    return node
 
 
 # Snowflake coerces a VARIANT/JSON argument to its JSON *text* in these functions, where DuckDB
@@ -534,8 +768,50 @@ def rewrite_semi_structured_writes(statement: exp.Expression) -> exp.Expression:
                 assignment.set("expression", _text_operand(value))
     return statement
 
+def _has_negative_subscript(node: exp.Expression) -> bool:
+    """True when a literal JSON path indexes an array from the end (``v:arr[-1]``)."""
+    path = node.args.get("expression")
+    if not isinstance(path, exp.JSONPath):
+        return False
+    return any(
+        isinstance(part, exp.JSONPathSubscript)
+        and isinstance(part.this, int)
+        and part.this < 0
+        for part in path.expressions
+    )
+
+
+# The types Snowflake applies a format model to (a numeric or binary format is rejected).
+_TEMPORAL_TYPES = (
+    exp.DataType.Type.DATE,
+    exp.DataType.Type.DATETIME,
+    exp.DataType.Type.TIME,
+    exp.DataType.Type.TIMETZ,
+    exp.DataType.Type.TIMESTAMP,
+    exp.DataType.Type.TIMESTAMPTZ,
+    exp.DataType.Type.TIMESTAMPLTZ,
+    exp.DataType.Type.TIMESTAMPNTZ,
+)
+
+
+def _is_temporal(node: exp.Expression | None) -> bool:
+    """True for a DATE/TIME/TIMESTAMP value: the input a TO_CHAR format model applies to."""
+    if isinstance(node, exp.Paren):
+        return _is_temporal(node.this)
+    if isinstance(node, exp.Cast) and isinstance(node.to, exp.DataType):
+        return node.to.this in _TEMPORAL_TYPES
+    declared = column_types.declared_column_type(node)
+    return declared is not None and declared.strip().upper().startswith(("DATE", "TIME"))
+
+
 def _rewrite_snowflake_specifics(node: exp.Expression) -> exp.Expression:
     """Rewrite Snowflake nodes that sqlglot can't fully transpile to DuckDB."""
+    # ``IS_<type>`` predicates, ``OBJECT_PICK``/``OBJECT_DELETE``/``OBJECT_INSERT``,
+    # ``GET_IGNORE_CASE`` and ``OBJECT_CONSTRUCT(*)``.
+    rewritten = rewrite_object_function(node)
+    if rewritten is not node:
+        return rewritten
+
     # ``CURRENT_VERSION()`` -> a Snowflake-style dotted-numeric version literal.
     if isinstance(node, exp.CurrentVersion):
         return exp.Literal.string(EMULATED_SNOWFLAKE_VERSION)
@@ -545,6 +821,17 @@ def _rewrite_snowflake_specifics(node: exp.Expression) -> exp.Expression:
         return _rewrite_semi_structured_text_cast(node)
     if isinstance(node, exp.ToChar) and node.args.get("format") is None:
         return _rewrite_semi_structured_text_cast(node)
+    # A numeric or binary format model is dropped by the DuckDB generator (sqlglot warns that
+    # ``format`` is unsupported), which would silently answer an unformatted string. Snowflake
+    # applies the format, so reject the call instead of dropping it. Date/time formats are
+    # translated, so a temporal operand keeps working.
+    if isinstance(node, exp.ToChar) and node.args.get("format") is not None:
+        if not _is_temporal(node.this):
+            raise TranslationError(
+                "TO_CHAR/TO_VARCHAR format models are only supported for a DATE/TIME/TIMESTAMP "
+                "value; DuckDB would silently drop the numeric format."
+            )
+        return node
     if type(node) in _TEXT_ARGUMENTS:
         return _rewrite_variant_text_function(node)
     if isinstance(node, _COMPARISON_NODES):
@@ -552,14 +839,28 @@ def _rewrite_snowflake_specifics(node: exp.Expression) -> exp.Expression:
     if isinstance(node, exp.In):
         return _rewrite_semi_structured_membership(node)
 
-    # ``PARSE_JSON(<variant>)``: DuckDB's ``JSON(variant)`` first renders the VARIANT's
-    # internal repr (``{'names': [X]}``) and then fails to parse it. Snowflake parses the
-    # value's JSON text, which is exactly what casting the VARIANT to JSON gives.
+    # ``TO_JSON(<variant>)``: Snowflake returns the value's JSON representation. DuckDB's
+    # ``to_json`` casts a VARIANT to VARCHAR first, which double-encodes it as a JSON string.
+    if isinstance(node, exp.JSONFormat):
+        return _rewrite_to_json(node)
+
+    # ``PARSE_JSON``: Snowflake's empty-document and duplicate-key rules, plus the text
+    # form of a semi-structured operand.
     if isinstance(node, exp.ParseJSON):
-        operand = node.this
-        if _is_variant_value(operand) or column_types.is_variant_typed(operand):
-            return exp.cast(operand, exp.DataType.build("JSON"), dialect=WRITE_DIALECT)
-        return node
+        return _rewrite_parse_json(node)
+
+    # ``TYPEOF`` names the type stored in the VARIANT, not the storage type.
+    if isinstance(node, exp.Typeof):
+        return rewrite_typeof(node)
+
+    # ``GET(<variant>, 'path')``: sqlglot renders a bare ``->``, whose operand DuckDB parses
+    # as text, so a VARIANT column fails (``GET_PATH`` already gets the cast).
+    if isinstance(node, exp.GetExtract):
+        return _rewrite_get_extract(node)
+
+    # An OBJECT constant / ``OBJECT_CONSTRUCT`` omits a pair whose key or value is SQL NULL.
+    if isinstance(node, exp.Struct):
+        return _rewrite_object_literal(node)
 
     # Snowflake JSON path extraction (``col:path``, ``GET_PATH``) transpiles to
     # DuckDB's ``->``/``->>``, which parses its operand as JSON on the fly. A VALUE
@@ -568,6 +869,14 @@ def _rewrite_snowflake_specifics(node: exp.Expression) -> exp.Expression:
     # operand to JSON first makes it round-trip through real JSON instead of the
     # VARIANT/VARCHAR repr. ``exp.cast`` skips an operand that is already cast to JSON.
     if isinstance(node, (exp.JSONExtract, exp.JSONExtractScalar)):
+        # Snowflake's path grammar allows only non-negative array indices (GET_PATH: "index
+        # values ... can be non-negative decimal numbers"); DuckDB reads -1 as the last
+        # element, so a negative subscript in the path answers NULL, as an unmatched path does.
+        if _has_negative_subscript(node):
+            # A JSON null, so the expression keeps the path extraction's VARIANT type.
+            return exp.cast(
+                exp.Null(), exp.DataType.build("JSON"), dialect=WRITE_DIALECT
+            )
         if not isinstance(node.this, exp.ParseJSON):
             node.set(
                 "this",
