@@ -3603,3 +3603,91 @@ def test_numeric_format_model_parsing(client):
     resp = post("SELECT TO_CHAR(1.5, 'V99')")
     assert resp.status_code == 422
     assert "not supported" in resp.json()["detail"]["message"]
+
+
+def test_binary_format_models(client):
+    """`TO_CHAR`/`TO_VARCHAR` over BINARY use Snowflake's binary format models."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    # HEX is the default; BASE64 and UTF-8 are the other documented models.
+    assert data("SELECT TO_CHAR('abc'::BINARY, 'HEX')") == [["616263"]]
+    assert data("SELECT TO_VARCHAR('abc'::BINARY, 'BASE64')") == [["YWJj"]]
+    assert data("SELECT TO_CHAR('abc'::BINARY, 'UTF-8')") == [["abc"]]
+    assert data("SELECT TO_VARCHAR('abc'::BINARY)") == [["616263"]]
+    # A text cast of BINARY uses the same default.
+    assert data("SELECT CAST('abc'::BINARY AS VARCHAR)") == [["616263"]]
+    resp = post("SELECT TO_CHAR('abc'::BINARY, 'NOPE')")
+    assert resp.status_code == 422
+    assert "Binary format model" in resp.json()["detail"]["message"]
+
+
+def test_text_column_length_in_row_type(client):
+    """`rowType.length` carries the declared text length, which DuckDB does not keep."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def lengths(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return [col["length"] for col in resp.json()["resultSetMetaData"]["rowType"]]
+
+    assert post("CREATE TABLE len_t (s VARCHAR(5), c CHAR(3), d VARCHAR)").status_code == 200
+    assert lengths("SELECT s, c, d FROM len_t") == [5, 3, 16777216]
+    assert lengths(
+        "SELECT CAST('x' AS VARCHAR(7)) AS a, 'lit' AS b, CAST('a' AS VARCHAR) AS c"
+    ) == [7, 3, 16777216]
+    # A non-text column reports no length.
+    assert lengths("SELECT CAST(1.25 AS NUMBER(10,2)) AS n") == [None]
+
+
+def test_mixed_alter_table_actions(client):
+    """`ALTER TABLE ... ADD CONSTRAINT ..., ADD COLUMN ...` runs each action."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post("CREATE TABLE mixed_alt (id INT, v INT)").status_code == 200
+    assert data("ALTER TABLE mixed_alt ADD CONSTRAINT pk PRIMARY KEY (id), ADD COLUMN w INT") == [
+        ["Statement executed successfully."]
+    ]
+    assert [row[0] for row in data("DESCRIBE TABLE mixed_alt")] == ["ID", "V", "W"]
+    # The constraint is recorded but not enforced, as in Snowflake.
+    assert data("INSERT INTO mixed_alt (id, v, w) VALUES (1, 1, 1), (1, 2, 3)") == [[2]]
+    assert [row[6] for row in data("SHOW PRIMARY KEYS IN TABLE mixed_alt")] == ["PK"]
+    assert data("ALTER TABLE mixed_alt ADD COLUMN x INT, DROP COLUMN v") == [
+        ["Statement executed successfully."]
+    ]
+    assert [row[0] for row in data("DESCRIBE TABLE mixed_alt")] == ["ID", "W", "X"]
+
+
+def test_sample_forms(client):
+    """`SAMPLE` keeps Snowflake's row vs percentage semantics (and REPEATABLE)."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post("CREATE TABLE sample_src (a INT)").status_code == 200
+    assert data("INSERT INTO sample_src VALUES (1), (2), (3)") == [[3]]
+    assert len(data("SELECT * FROM sample_src SAMPLE (2 ROWS)")) == 2
+    assert len(data("SELECT * FROM sample_src SAMPLE (10 ROWS)")) == 3  # n > rows: all rows
+    assert len(data("SELECT * FROM sample_src SAMPLE (100)")) == 3
+    assert data("SELECT * FROM sample_src SAMPLE (0)") == []
+    # A percentage sample is probabilistic: 1% of three rows can legitimately be empty.
+    assert data("SELECT * FROM sample_src SAMPLE (1)") in ([], [[1]], [[2]], [[3]])
+    first = sorted(row[0] for row in data("SELECT * FROM sample_src SAMPLE (50) REPEATABLE (7)"))
+    second = sorted(row[0] for row in data("SELECT * FROM sample_src SAMPLE (50) REPEATABLE (7)"))
+    assert first == second

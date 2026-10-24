@@ -104,7 +104,7 @@ def _to_sf_schema(schema: pa.Schema, row_type: list[ColumnMeta]) -> pa.Schema:
                 "logicalType": col.type.upper(),
                 "precision": str(precision or 38),
                 "scale": str(scale or 0),
-                "charLength": "0",
+                "charLength": str(col.length or 0),
             }
         )
 

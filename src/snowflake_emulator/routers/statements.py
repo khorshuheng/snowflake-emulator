@@ -21,6 +21,7 @@ from snowflake_emulator.output_formats import (
     format_cell,
     output_formats_from_parameters,
 )
+from snowflake_emulator.type_mapping import parse_precision_scale
 from snowflake_emulator.schemas import (
     PartitionInfo,
     ResultSetMetaData,
@@ -206,6 +207,20 @@ def _json_cell(value: Any, col: ColumnMeta) -> Any:
     return value
 
 
+def _row_type_of(col: ColumnMeta) -> RowType:
+    """The SQL API's per-column metadata, including a text column's declared length."""
+    precision, scale = parse_precision_scale(col.duckdb_type)
+    if col.type == "fixed" and precision is None:
+        precision = None
+    return RowType(
+        name=col.name,
+        type=col.type,
+        length=col.length,
+        precision=precision,
+        scale=scale,
+    )
+
+
 def _to_response(
     result: ExecutionResult, partition: int | None = None
 ) -> StatementResponse:
@@ -220,7 +235,7 @@ def _to_response(
         createdOn=result.created_on,
         resultSetMetaData=ResultSetMetaData(
             numRows=len(rows),
-            rowType=[RowType(name=col.name, type=col.type) for col in result.row_type],
+            rowType=[_row_type_of(col) for col in result.row_type],
             partitionInfo=[PartitionInfo(rowCount=len(result.rows))],
         ),
         data=[

@@ -18,6 +18,9 @@ class ColumnMeta:
     name: str
     type: str
     duckdb_type: str = ""
+    # Declared maximum length of a text column (Snowflake's ``length`` in ``rowType``),
+    # which DuckDB's VARCHAR type does not carry.
+    length: int | None = None
 
 
 @dataclass

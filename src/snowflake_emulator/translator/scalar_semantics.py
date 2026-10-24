@@ -144,6 +144,59 @@ def _format_model(node: exp.Expression) -> str:
     return text
 
 
+_TEXT_TYPES = (
+    exp.DataType.Type.VARCHAR,
+    exp.DataType.Type.CHAR,
+    exp.DataType.Type.NCHAR,
+    exp.DataType.Type.NVARCHAR,
+    exp.DataType.Type.TEXT,
+)
+
+# Snowflake's binary format models (docs: BINARY input/output); the default is HEX.
+_BINARY_FORMATS = {
+    "HEX": "HEX",
+    "BASE64": "BASE64",
+    "UTF-8": "DECODE",
+    "UTF8": "DECODE",
+}
+
+
+def _is_binary(node: exp.Expression | None) -> bool:
+    """True for a BINARY value: a cast to BINARY/VARBINARY or a binary catalog column."""
+    if isinstance(node, (exp.Cast, exp.TryCast)) and isinstance(node.to, exp.DataType):
+        return node.to.this in (exp.DataType.Type.BINARY, exp.DataType.Type.VARBINARY)
+    declared = column_types.declared_column_type(node)
+    return declared is not None and declared.strip().upper().startswith(
+        ("BLOB", "BINARY", "VARBINARY", "BIT")
+    )
+
+
+def _binary_text(node: exp.Expression, model: str | None) -> exp.Expression:
+    """Render a BINARY value as text with Snowflake's binary format model (default HEX)."""
+    name = (model or "HEX").strip().upper()
+    function = _BINARY_FORMATS.get(name)
+    if function is None:
+        raise TranslationError(
+            f"Binary format model '{model}' is not supported; use HEX, BASE64 or UTF-8."
+        )
+    operand = _rewrite_operand(node) if isinstance(node, exp.Expression) else node
+    return sqlglot.parse_one(f"{function}({_sql(operand)})", read=WRITE_DIALECT)
+
+
+def _rewrite_binary_text_cast(node: exp.Expression) -> exp.Expression | None:
+    """``TO_CHAR(binary)`` / ``CAST(binary AS VARCHAR)``: the HEX text, as Snowflake does."""
+    operand = node.this
+    if not _is_binary(operand):
+        return None
+    model = None
+    if isinstance(node, exp.ToChar) and node.args.get("format") is not None:
+        literal = node.args.get("format")
+        if not (isinstance(literal, exp.Literal) and literal.is_string):
+            raise TranslationError("A binary format model must be a string literal.")
+        model = str(literal.this)
+    return _binary_text(operand, model)
+
+
 def _rewrite_to_char_format(node: exp.ToChar) -> exp.Expression:
     """``TO_CHAR(number, '<model>')``: apply Snowflake's numeric format model.
 
@@ -151,6 +204,9 @@ def _rewrite_to_char_format(node: exp.ToChar) -> exp.Expression:
     ``sfemu_format_number`` helper. A DATE/TIME/TIMESTAMP operand keeps sqlglot's own
     translation of its date format model.
     """
+    binary = _rewrite_binary_text_cast(node)
+    if binary is not None:
+        return binary
     if _is_temporal(node.this):
         return node
     model = _format_model(node)
@@ -261,8 +317,18 @@ def _rewrite_division(node: exp.Div) -> exp.Expression:
 
 def rewrite_scalar_semantics(node: exp.Expression) -> exp.Expression:
     """Rewrite one scalar node whose DuckDB form differs from Snowflake's documented one."""
-    if isinstance(node, exp.ToChar) and node.args.get("format") is not None:
-        return _rewrite_to_char_format(node)
+    if isinstance(node, exp.ToChar):
+        binary = _rewrite_binary_text_cast(node)
+        if binary is not None:
+            return binary
+        if node.args.get("format") is not None:
+            return _rewrite_to_char_format(node)
+        return node
+    if isinstance(node, (exp.Cast, exp.TryCast)) and isinstance(node.to, exp.DataType):
+        if node.to.this in _TEXT_TYPES:
+            binary = _rewrite_binary_text_cast(node)
+            if binary is not None:
+                return binary
     if isinstance(node, exp.ToNumber) and node.args.get("format") is not None:
         return _rewrite_to_number_format(node)
     if isinstance(node, exp.DateAdd):

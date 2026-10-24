@@ -86,14 +86,29 @@ def test_show_sequences_lists_created_sequence(client):
 
 
 def test_show_parameters_returns_session_parameters(client):
-    rows = _post(client, "SHOW PARAMETERS").json()["data"]
-    assert {row[0] for row in rows} == {"AUTOCOMMIT", "TIMEZONE", "CLIENT_PREFETCH_THREADS"}
+    body = _post(client, "SHOW PARAMETERS").json()
+    assert [col["name"] for col in body["resultSetMetaData"]["rowType"]] == [
+        "key",
+        "value",
+        "default",
+        "level",
+        "description",
+    ]
+    rows = body["data"]
+    keys = {row[0] for row in rows}
+    assert {"AUTOCOMMIT", "TIMEZONE", "CLIENT_PREFETCH_THREADS"} <= keys
+    assert {"DATE_OUTPUT_FORMAT", "BINARY_OUTPUT_FORMAT", "WEEK_START"} <= keys
+    assert all(row[3] == "SESSION" and row[4] for row in rows)
+    filtered = _post(client, "SHOW PARAMETERS LIKE 'TIME%'").json()["data"]
+    assert filtered and all(row[0].startswith("TIME") for row in filtered)
 
 
-def test_show_users_procedures_functions_return_empty(client):
+def test_show_users_procedures_return_empty_and_functions_list_builtins(client):
     assert _post(client, "SHOW USERS").json()["data"] == []
     assert _post(client, "SHOW PROCEDURES").json()["data"] == []
-    assert _post(client, "SHOW FUNCTIONS").json()["data"] == []
+    assert _post(client, "SHOW USER FUNCTIONS").json()["data"] == []
+    # SHOW FUNCTIONS lists the built-ins (docs); SHOW USER FUNCTIONS lists UDFs only.
+    assert _post(client, "SHOW FUNCTIONS").json()["data"]
 
 
 def test_show_databases_excludes_duckdb_internals(client):
@@ -436,3 +451,62 @@ def test_information_schema_functions_lists_user_functions(client):
         ["INFO_ADD", "(NUMBER(38,0), NUMBER(38,0))", "NUMBER(38,0)", "SQL", "SCALAR", "N"],
         ["INFO_UPPER", "(VARCHAR)", "VARCHAR", "SQL", "SCALAR", "N"],
     ]
+
+
+def test_show_roles_returns_the_system_roles(client):
+    body = _post(client, "SHOW ROLES").json()
+    assert [col["name"] for col in body["resultSetMetaData"]["rowType"]] == [
+        "created_on",
+        "name",
+        "is_default",
+        "is_current",
+        "is_inherited",
+        "assigned_to_users",
+        "granted_to_roles",
+        "granted_roles",
+        "owner",
+        "comment",
+    ]
+    rows = {row[1]: row for row in body["data"]}
+    assert set(rows) == {"ACCOUNTADMIN", "SYSADMIN", "PUBLIC"}
+    assert rows["ACCOUNTADMIN"][2] == "Y"
+    assert rows["ACCOUNTADMIN"][3] == "Y"
+    assert rows["SYSADMIN"][3] == "N"
+    filtered = _post(client, "SHOW ROLES LIKE 'A%'").json()["data"]
+    assert [row[1] for row in filtered] == ["ACCOUNTADMIN"]
+
+
+def test_show_grants_returns_the_static_role_model(client):
+    body = _post(client, "SHOW GRANTS").json()
+    assert [col["name"] for col in body["resultSetMetaData"]["rowType"]] == [
+        "created_on",
+        "privilege",
+        "granted_on",
+        "name",
+        "granted_to",
+        "grantee_name",
+        "grant_option",
+        "granted_by",
+    ]
+    # A bare SHOW GRANTS is documented as SHOW GRANTS TO USER <current_user>.
+    assert body["data"] == [
+        [None, None, "ROLE", "ACCOUNTADMIN", "USER", "EMULATOR_USER", False, "SECURITYADMIN"]
+    ]
+
+    to_role = _post(client, "SHOW GRANTS TO ROLE ACCOUNTADMIN").json()["data"]
+    assert {row[5] for row in to_role} == {"ACCOUNTADMIN"}
+    assert any(row[1] == "OWNERSHIP" and row[2] == "DATABASE" for row in to_role)
+    public = _post(client, "SHOW GRANTS TO ROLE PUBLIC").json()["data"]
+    assert public and all(row[1] == "USAGE" for row in public)
+
+    account = _post(client, "SHOW GRANTS ON ACCOUNT").json()
+    assert account["resultSetMetaData"]["rowType"][-1]["name"] == "granted_by_role_type"
+    assert {row[1] for row in account["data"]} == {
+        "CREATE DATABASE",
+        "CREATE ROLE",
+        "CREATE WAREHOUSE",
+    }
+    table = _post(client, "SHOW GRANTS ON TABLE t").json()["data"]
+    assert table[0][1] == "OWNERSHIP"
+    assert table[0][2] == "TABLE"
+    assert table[0][3] == "t"

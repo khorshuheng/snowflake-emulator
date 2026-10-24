@@ -316,6 +316,34 @@ null, not the text `null`). The omission is exact when the arguments are literal
 stores an OBJECT as a DuckDB STRUCT, which cannot drop a field it has typed, so a *run-time* NULL
 value still keeps its key.
 
+A text column's declared length is reported in `rowType.length` the way Snowflake does:
+`CAST(x AS VARCHAR(7))` -> 7, a created `VARCHAR(5)`/`CHAR(3)` column -> 5/3, a string literal ->
+its length, and an unbounded `VARCHAR` -> 16777216. DuckDB's `VARCHAR` type carries no length, so
+it is read from the projection (a cast) or from the catalog side table (a created column).
+
+`TO_CHAR`/`TO_VARCHAR` over a BINARY value use Snowflake's binary format models -- `HEX`
+(the default, also used by `CAST(binary AS VARCHAR)`), `BASE64` and `UTF-8` -- instead of
+DuckDB's `CAST(BLOB AS TEXT)`, which returns the bytes as text. An unknown model is a loud error.
+
+A multi-action `ALTER TABLE` (`ADD CONSTRAINT ..., ADD COLUMN ...`) is one Snowflake statement
+that sqlglot can only read as a raw command, so it is expanded into one `ALTER` per action before
+execution: the constraint is recorded (not enforced) and the column is added, in order.
+
+`SAMPLE`/`TABLESAMPLE` keep Snowflake's semantics through DuckDB's sampler: `SAMPLE (n ROWS)`
+returns exactly n rows (all rows when n exceeds the table), `SAMPLE (p)` samples a percentage
+(probabilistically, so a tiny table can legitimately yield no rows), and `REPEATABLE (<seed>)`
+makes a sample reproducible.
+
+`SHOW ROLES`, `SHOW GRANTS` and `SHOW PARAMETERS` answer from a static model: the system roles
+`ACCOUNTADMIN`/`SYSADMIN`/`PUBLIC` (the session role is current), Snowflake's grant shape
+(`created_on, privilege, granted_on, name, granted_to, grantee_name, grant_option, granted_by`,
+plus `granted_by_role_type` for `ON <object>` forms) over OWNERSHIP of each database, USAGE for
+PUBLIC and the account-level privileges of ACCOUNTADMIN, and the session parameters the emulator
+models (`TIMEZONE`, the output-format parameters, `WEEK_START`, `MULTI_STATEMENT_COUNT`, ...) with
+`key, value, default, level, description` columns. `SHOW FUNCTIONS` lists the built-in catalogue
+alongside user-defined functions; `SHOW USER FUNCTIONS` lists user functions only, and
+`INFORMATION_SCHEMA.FUNCTIONS` stays UDF-only, which is what Snowflake documents for that view.
+
 `TIMESTAMP_NTZ(7..9)` is stored at **microsecond** precision. DuckDB maps a precision above 6 to
 `TIMESTAMP_NS` (int64 nanoseconds), which only spans roughly 1677-2262, so Snowflake's year range
 (1-9999) -- e.g. a `9999-12-31` expiry -- could not be stored at all. Capping storage at
@@ -640,11 +668,11 @@ rejected with a Snowflake-shaped error rather than failing silently).
 | `SHOW` schemas/tables/views/objects/columns/keys/stages/databases/sequences/… | ✅ |
 | `CREATE FUNCTION` (SQL-bodied scalar UDFs), `DESCRIBE`/`DROP FUNCTION` | ✅ |
 | UDF overloading by arity (always) and by argument type (dispatched at run time) | ✅ |
-| `SHOW FUNCTIONS` of user-defined functions | ✅ |
-| Semi-structured function breadth beyond the list above | ⚠️ |
-| `VARCHAR(n)` lengths in `DESCRIBE`/`SHOW COLUMNS` | ⚠️ reported as `VARCHAR` |
+| `SHOW FUNCTIONS`/`SHOW USER FUNCTIONS` (built-ins + user-defined) | ✅ |
+| `SHOW ROLES`, `SHOW GRANTS`, `SHOW PARAMETERS` | ✅ static model (see below) |
+| `VARCHAR(n)`/`CHAR(n)` length in `rowType` and `DESCRIBE` | ✅ |
 | `TIMESTAMP_LTZ` precision | ⚠️ mapped to `TIMESTAMP_TZ` at microsecond precision |
-| `SHOW FUNCTIONS` built-in catalogue | ⚠️ user-defined functions only |
+| `SAMPLE`/`TABLESAMPLE` (row count, percentage, `REPEATABLE`) | ✅ |
 
 `PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY` and `CHECK` declarations are recorded and
 shown by `SHOW ... KEYS`, but not enforced, matching Snowflake; `NOT NULL` is

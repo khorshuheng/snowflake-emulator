@@ -35,7 +35,7 @@ def column_wire_metadata(col: ColumnMeta) -> dict[str, Any]:
     return {
         "name": col.name,
         "type": col.type,
-        "length": None,
+        "length": col.length,
         "precision": precision,
         "scale": scale,
         "nullable": True,

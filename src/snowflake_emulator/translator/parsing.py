@@ -131,6 +131,88 @@ def _parse_error_message(sql: str, exc: Exception) -> str:
     return message
 
 
+_ALTER_ACTION_RE = re.compile(
+    r"(?is)^\s*(ADD|DROP|RENAME|ALTER|CLUSTER|SET|UNSET|SWAP)\b"
+)
+_ALTER_TABLE_HEAD_RE = re.compile(
+    r"(?is)^\s*TABLE\s+"
+    r"((?:[A-Za-z_][\w$]*|\"[^\"]+\")(?:\s*\.\s*(?:[A-Za-z_][\w$]*|\"[^\"]+\"))*)\s+"
+)
+
+
+def _split_top_level_commas(text: str) -> list[str]:
+    """Split on commas that are outside parentheses, string literals and quoted names."""
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
+    quote: str | None = None
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote is not None:
+            current.append(char)
+            if char == quote:
+                if index + 1 < len(text) and text[index + 1] == quote:
+                    current.append(text[index + 1])
+                    index += 2
+                    continue
+                quote = None
+            index += 1
+            continue
+        if char in "'\"":
+            quote = char
+            current.append(char)
+        elif char == "(":
+            depth += 1
+            current.append(char)
+        elif char == ")":
+            depth -= 1
+            current.append(char)
+        elif char == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+        index += 1
+    parts.append("".join(current))
+    return parts
+
+
+def _split_mixed_alter(statement: exp.Expression) -> list[exp.Expression]:
+    """Expand a multi-action ``ALTER TABLE`` that sqlglot cannot parse.
+
+    Snowflake allows ``ALTER TABLE t ADD CONSTRAINT ..., ADD COLUMN ...``; sqlglot falls back
+    to a raw ``Command`` for it, which would reach DuckDB as one unsupported statement. Each
+    action is re-parsed as its own ALTER so the existing handlers (a constraint is recorded,
+    a column is added) apply per action.
+    """
+    if not isinstance(statement, exp.Command):
+        return [statement]
+    if str(statement.args.get("this") or "").upper() != "ALTER":
+        return [statement]
+    text = str(statement.args.get("expression") or "")
+    head = _ALTER_TABLE_HEAD_RE.match(text)
+    if head is None:
+        return [statement]
+    body = text[head.end() :]
+    actions = _split_top_level_commas(body)
+    if len(actions) < 2 or not all(_ALTER_ACTION_RE.match(action) for action in actions):
+        return [statement]
+    table = head.group(1)
+    expanded: list[exp.Expression] = []
+    for action in actions:
+        try:
+            parsed = sqlglot.parse_one(
+                f"ALTER TABLE {table} {action.strip()}", read=READ_DIALECT
+            )
+        except Exception:  # noqa: BLE001 - keep the original statement on any surprise
+            return [statement]
+        if not isinstance(parsed, exp.Alter):
+            return [statement]
+        expanded.append(parsed)
+    return expanded
+
+
 def split_statements(sql: str) -> list[exp.Expression]:
     """Split a (possibly multi-statement) Snowflake SQL string into parsed expressions.
 

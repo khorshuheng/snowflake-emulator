@@ -141,7 +141,7 @@ def test_overloading_by_arity_is_supported(client):
     _post(client, "CREATE FUNCTION f_ov(a NUMBER) RETURNS NUMBER LANGUAGE SQL AS $$ a * 100 $$")
     assert _data(client, "SELECT F_OV(1, 2) AS two, F_OV(3) AS one") == [[3, 300]]
     # Each arity is recorded separately, so both show up in the catalog.
-    assert [row[6] for row in _data(client, "SHOW FUNCTIONS")] == [
+    assert [row[6] for row in _data(client, "SHOW USER FUNCTIONS")] == [
         "F_OV(NUMBER(38,0)) RETURN NUMBER(38,0)",
         "F_OV(NUMBER(38,0), NUMBER(38,0)) RETURN NUMBER(38,0)",
     ]
@@ -175,7 +175,7 @@ def test_overloading_by_argument_type_dispatches_on_the_value(client):
 def test_both_overloads_appear_in_the_catalog(client):
     _post(client, CASE_INSENSITIVE_EQUAL)
     _post(client, CASE_INSENSITIVE_ARRAY_EQUAL)
-    signatures = [row[6] for row in _data(client, "SHOW FUNCTIONS")]
+    signatures = [row[6] for row in _data(client, "SHOW USER FUNCTIONS")]
     assert signatures == [
         "EQUAL_NULL_CASE_INSENSITIVE(ARRAY, ARRAY) RETURN BOOLEAN",
         "EQUAL_NULL_CASE_INSENSITIVE(VARCHAR, VARCHAR) RETURN BOOLEAN",
@@ -376,7 +376,7 @@ def test_dropping_one_overload_leaves_the_other_callable(client):
         client,
         "SELECT EQUAL_NULL_CASE_INSENSITIVE(ARRAY_CONSTRUCT('a'), ARRAY_CONSTRUCT('A'))",
     ) == [[True]]
-    assert len(_data(client, "SHOW FUNCTIONS")) == 1
+    assert len(_data(client, "SHOW USER FUNCTIONS")) == 1
 
 
 def test_replacing_one_overload_keeps_the_other(client):
@@ -393,7 +393,7 @@ def test_replacing_one_overload_keeps_the_other(client):
         "SELECT EQUAL_NULL_CASE_INSENSITIVE(ARRAY_CONSTRUCT('a'), ARRAY_CONSTRUCT('A'))",
     ) == [[False]]
     assert _data(client, "SELECT EQUAL_NULL_CASE_INSENSITIVE('aB', 'Ab')") == [[True]]
-    assert len(_data(client, "SHOW FUNCTIONS")) == 2
+    assert len(_data(client, "SHOW USER FUNCTIONS")) == 2
 
 
 def test_array_typed_arguments_are_supported(client):
@@ -504,16 +504,25 @@ def test_show_user_functions_lists_recorded_functions(client):
 def test_show_functions_and_like_filter(client):
     _post(client, "CREATE FUNCTION f_like(x NUMBER) RETURNS NUMBER LANGUAGE SQL AS $$ x $$")
     _post(client, "CREATE FUNCTION g_like(x NUMBER) RETURNS NUMBER LANGUAGE SQL AS $$ x $$")
-    assert [row[1] for row in _data(client, "SHOW FUNCTIONS")] == ["F_LIKE", "G_LIKE"]
-    assert [row[1] for row in _data(client, "SHOW FUNCTIONS LIKE 'F%'")] == ["F_LIKE"]
+    assert [row[1] for row in _data(client, "SHOW USER FUNCTIONS")] == ["F_LIKE", "G_LIKE"]
+    assert [row[1] for row in _data(client, "SHOW USER FUNCTIONS LIKE 'F%'")] == ["F_LIKE"]
     assert [
         row[1] for row in _data(client, "SHOW USER FUNCTIONS LIKE 'G%' IN EMULATOR_DB.PUBLIC")
     ] == ["G_LIKE"]
+    # SHOW FUNCTIONS lists built-ins as well (docs), and LIKE filters them too.
+    rows = _data(client, "SHOW FUNCTIONS LIKE 'UPPER'")
+    assert rows == [
+        [None, "UPPER", None, None, "Y", "N", "(VARCHAR)", "VARCHAR",
+         "Converts to upper case."]
+    ]
 
 
-def test_show_functions_is_empty_without_user_functions(client):
-    assert _data(client, "SHOW FUNCTIONS") == []
+def test_show_functions_lists_builtins_without_user_functions(client):
     assert _data(client, "SHOW USER FUNCTIONS IN EMULATOR_DB.PUBLIC") == []
+    # SHOW FUNCTIONS includes the built-in catalogue (docs), so it is never empty.
+    builtins = [row for row in _data(client, "SHOW FUNCTIONS") if row[4] == "Y"]
+    assert builtins
+    assert {row[1] for row in builtins} >= {"UPPER", "PARSE_JSON", "FLATTEN"}
 
 
 def test_describe_function_by_name_and_signature(client):
@@ -597,7 +606,7 @@ def test_function_is_scoped_to_its_schema(client):
     # ...and not from PUBLIC, where it was never created.
     assert _post(client, "USE SCHEMA PUBLIC", headers).status_code == 200
     assert _post(client, "SELECT F_SCOPED(1)", headers).status_code == 422
-    assert _post(client, "SHOW FUNCTIONS", headers).json()["data"] == []
+    assert _post(client, "SHOW USER FUNCTIONS", headers).json()["data"] == []
 
 
 def test_unknown_function_call_still_reports_a_duckdb_error(client):

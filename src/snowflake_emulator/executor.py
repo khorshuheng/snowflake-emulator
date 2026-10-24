@@ -10,6 +10,7 @@ from typing import Any
 import duckdb
 from sqlglot import exp
 
+from snowflake_emulator.core.constants import INFORMATION_SCHEMA_SCHEMA
 from snowflake_emulator.core.errors import ExecutionError
 from snowflake_emulator.core.results import (
     ColumnMeta,
@@ -17,6 +18,7 @@ from snowflake_emulator.core.results import (
     FileTransfer,  # re-exported for compatibility
 )
 from snowflake_emulator.catalog import column_type_resolver
+from snowflake_emulator.translator import column_types
 from snowflake_emulator.database import DuckDBManager
 from snowflake_emulator.engine.errors import as_execution_error
 from snowflake_emulator.engine.handlers.common import convert_describe_types
@@ -77,6 +79,7 @@ from snowflake_emulator.translator import (
     split_statements,
     transpile_to_duckdb,
 )
+from snowflake_emulator.translator.parsing import _split_mixed_alter
 from snowflake_emulator.type_mapping import duckdb_type_to_snowflake
 from snowflake_emulator.user_functions import SessionUserFunctionResolver
 
@@ -171,6 +174,13 @@ def _execute_sql(
     except TranslationError as exc:
         raise as_execution_error(exc) from exc
     _check_multi_statement_count(len(statements), multi_statement_count)
+    # A multi-action ``ALTER TABLE`` is one Snowflake statement that sqlglot can only read
+    # as a raw command: expand it into one ALTER per action now that the count is checked.
+    statements = [
+        action
+        for statement in statements
+        for action in _split_mixed_alter(statement)
+    ]
 
     row_type: list[ColumnMeta] = []
     rows: list[list[Any]] = []
@@ -417,6 +427,8 @@ def _execute_sql(
                 rows = [list(row) for row in cursor.fetchall()]
                 if isinstance(statement, exp.Describe):
                     rows = convert_describe_types(rows)
+                else:
+                    apply_declared_lengths(cursor, session, statement, row_type)
         else:
             row_type = [ColumnMeta(name="status", type="text")]
             affected = cursor.fetchone()
@@ -432,6 +444,115 @@ def _execute_sql(
         statement_type_id=statement_type_id(last_statement),
         number_of_binds=number_of_binds(last_statement),
     )
+
+
+_TEXT_LENGTH_RE = re.compile(r"^\s*(VAR)?CHAR\s*\(\s*(\d+)\s*\)", re.IGNORECASE)
+_TEXT_TYPES = ("VARCHAR", "CHAR", "NCHAR", "NVARCHAR", "TEXT", "STRING")
+_UNBOUNDED_TEXT_LENGTH = 16777216  # Snowflake's maximum VARCHAR length
+
+
+def _declared_text_length(declared: str | None) -> int | None:
+    """The length a declared Snowflake type text gives: ``VARCHAR(5)`` -> 5."""
+    if not declared:
+        return None
+    match = _TEXT_LENGTH_RE.match(declared)
+    if match is not None:
+        return int(match.group(2))
+    name = declared.strip().upper()
+    if name == "CHAR":
+        return 1
+    if name in _TEXT_TYPES:
+        return _UNBOUNDED_TEXT_LENGTH
+    return None
+
+
+def _catalog_text_length(
+    cursor: Any, session: SessionContext, column: exp.Column, statement: exp.Expression
+) -> int | None:
+    """Look the declared type of a bare text column up in the emulator's catalog side table."""
+    aliases = column_types.statement_table_aliases(statement)
+    table = aliases.get(column.table.upper(), column.table) if column.table else None
+    database = column.text("db") or None
+    schema = database or None  # a bare ``db.column`` is unusual; leave it unresolved
+    schema = column.text("schema") if column.args.get("db") else schema
+    conditions = ["lower(column_name) = lower(?)", "lower(database_name) <> 'temp'"]
+    params: list[Any] = [column.name]
+    if table:
+        conditions.append("lower(table_name) = lower(?)")
+        params.append(table)
+    if database:
+        conditions.append("lower(database_name) = lower(?)")
+        params.append(database)
+    candidates = cursor.execute(
+        f"SELECT database_name, schema_name, table_name FROM duckdb_columns() "
+        f"WHERE {' AND '.join(conditions)}",
+        params,
+    ).fetchall()
+    if not candidates:
+        return None
+    # Prefer the session's own schema/database, the way name resolution does.
+    def rank(row: tuple[str, str, str]) -> tuple[int, int]:
+        return (
+            0 if str(row[1]).lower() == str(session.schema).lower() else 1,
+            0 if str(row[0]).lower() == str(session.database).lower() else 1,
+        )
+
+    lengths: set[int | None] = set()
+    for db_name, schema_name, table_name in sorted({tuple(row) for row in candidates}, key=rank):
+        try:
+            declared = cursor.execute(
+                f'SELECT declared_type FROM "{db_name}".{INFORMATION_SCHEMA_SCHEMA}._sf_columns_ext '
+                "WHERE lower(table_schema) = lower(?) AND lower(table_name) = lower(?) "
+                "AND lower(column_name) = lower(?)",
+                [schema_name, table_name, column.name],
+            ).fetchone()
+        except Exception:  # noqa: BLE001 - a database without the side table
+            continue
+        lengths.add(_declared_text_length(declared[0] if declared else None))
+        if len(lengths) > 1:
+            return None  # ambiguous: different tables give different lengths
+    return lengths.pop() if len(lengths) == 1 else None
+
+
+def apply_declared_lengths(
+    cursor: Any,
+    session: SessionContext,
+    statement: exp.Expression,
+    row_type: list[ColumnMeta],
+) -> None:
+    """Fill ``ColumnMeta.length`` for text output columns.
+
+    DuckDB's VARCHAR type carries no length, while Snowflake reports the declared maximum
+    in ``rowType.length``: the length of a cast (``CAST(x AS VARCHAR(5))``), of a created
+    column the catalog side table recorded, or of a string literal.
+    """
+    if isinstance(statement, exp.Union):
+        select = statement.this
+    else:
+        select = statement
+    if not isinstance(select, exp.Select):
+        return
+    for item, meta in zip(select.expressions, row_type):
+        if meta.type != "text":
+            continue
+        value = item.this if isinstance(item, exp.Alias) else item
+        length: int | None = None
+        if isinstance(value, (exp.Cast, exp.TryCast)) and isinstance(value.to, exp.DataType):
+            if value.to.this.name in _TEXT_TYPES:
+                if value.to.expressions:
+                    parameter = value.to.expressions[0]
+                    if isinstance(parameter, exp.DataTypeParam):
+                        parameter = parameter.this
+                    if isinstance(parameter, exp.Literal) and not parameter.is_string:
+                        length = int(str(parameter.this))
+                if length is None:
+                    length = _declared_text_length(value.to.this.name)
+        elif isinstance(value, exp.Literal) and value.is_string:
+            length = len(str(value.this))
+        elif isinstance(value, exp.Column):
+            length = _catalog_text_length(cursor, session, value, statement)
+        if length is not None:
+            meta.length = length
 
 
 def _substitute_session_functions(
