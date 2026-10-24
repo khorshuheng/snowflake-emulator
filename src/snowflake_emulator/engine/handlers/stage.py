@@ -21,6 +21,7 @@ from snowflake_emulator.engine.handlers.show import show_limit, show_scope
 from snowflake_emulator.sessions import SessionContext
 from snowflake_emulator.stages import (
     StageError,
+    alter_stage,
     create_stage,
     drop_stage,
     get_stage_manager,
@@ -58,10 +59,10 @@ def execute_stage_command(
                 [
                     os.path.basename(f.rel_path),
                     f.rel_path,
+                    f.source_size or f.size,
                     f.size,
-                    f.size,
-                    "NONE",
-                    "NONE",
+                    f.source_compression,
+                    f.target_compression,
                     f.status,
                     f.message,
                 ]
@@ -84,6 +85,8 @@ def execute_stage_command(
                     src_locations=_strip_file_prefixes(put.files),
                     stage_location=target_dir,
                     overwrite=overwrite,
+                    auto_compress=put.options.get("AUTO_COMPRESS", "TRUE").upper()
+                    not in ("FALSE", "0", "NO", "OFF"),
                 ),
             )
 
@@ -169,21 +172,22 @@ def execute_stage_ddl(
     stages = get_stage_manager()
     try:
         if kind == "CREATE_STAGE":
-            create_stage(stages, session, statement)
+            create_stage(manager, stages, session, statement)
             return (
                 [ColumnMeta(name="status", type="text")],
                 [[f"Stage {statement.this.name} successfully created."]],
             )
         if kind == "DROP_STAGE":
-            name = drop_stage(stages, session, statement)
+            name = drop_stage(manager, stages, session, statement)
             return (
                 [ColumnMeta(name="status", type="text")],
                 [[f"Stage {name} successfully dropped."]],
             )
         if kind == "ALTER_STAGE":
+            name = alter_stage(manager, session, statement)
             return (
                 [ColumnMeta(name="status", type="text")],
-                [["Statement executed successfully."]],
+                [[f"Stage {name} successfully altered."]],
             )
         if kind == "SHOW_STAGES":
             scope = show_scope(statement, session) if isinstance(statement, exp.Show) else None
@@ -191,7 +195,7 @@ def execute_stage_ddl(
             rows = [
                 [name, db, schema_name, url]
                 for name, db, schema_name, url in show_stages(
-                    stages, session, database, schema
+                    manager, stages, session, database, schema
                 )
             ]
             prefix, like = show_name_patterns(statement)

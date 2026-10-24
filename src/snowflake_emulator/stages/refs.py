@@ -70,10 +70,13 @@ class StagedFile:
     name: str  # basename within the target directory
     rel_path: str  # path relative to the stage base directory
     size: int
+    source_size: int = 0
     md5: str = ""
     last_modified: str = ""
     status: str = "UPLOADED"
     message: str = ""
+    source_compression: str = "NONE"
+    target_compression: str = "NONE"
 
 def _check_stage_segments(segments: list[str], ref: str) -> None:
     """Reject stage/namespace components that would walk the filesystem.
@@ -169,6 +172,37 @@ def _strip_statement_terminator(sql: str) -> str:
     return sql.strip().rstrip(";").rstrip()
 
 
+def _split_put_sources(text: str) -> list[str]:
+    """Split PUT's source list into paths, honouring single-quoted paths with spaces."""
+    sources: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char in " \t,":
+            index += 1
+            continue
+        if char == "'":
+            index += 1
+            value: list[str] = []
+            while index < len(text):
+                if text[index] == "'":
+                    if index + 1 < len(text) and text[index + 1] == "'":
+                        value.append("'")
+                        index += 2
+                        continue
+                    index += 1
+                    break
+                value.append(text[index])
+                index += 1
+            sources.append("".join(value))
+            continue
+        start = index
+        while index < len(text) and text[index] not in " \t,":
+            index += 1
+        sources.append(text[start:index])
+    return sources
+
+
 def parse_put(sql: str) -> PutCommand:
     """Parse ``PUT file:///a.csv [file:///b.csv] @<stage> [PARALLEL=4] [OVERWRITE=TRUE]``."""
     rest = _strip_statement_terminator(sql)[3:].strip()
@@ -178,7 +212,7 @@ def parse_put(sql: str) -> PutCommand:
     src_spec = rest[:at_index].strip()
     stage_and_opts = rest[at_index:].strip()
 
-    files = [f for f in re.split(r"[\s,]+", src_spec) if f]
+    files = _split_put_sources(src_spec)
     if not files:
         raise StageError("PUT requires at least one source file.")
 

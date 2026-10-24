@@ -500,8 +500,9 @@ SELECT $1:name FROM @~/staged/data.json (FILE_FORMAT => 'my_json_format');
 | Parquet | the first column | Columns keep the file's own names; `$n` resolves to the nth of them. |
 
 The file format comes from the query: a `(FILE_FORMAT => ...)` clause wins (inline options
-or the name of a created format), otherwise it is inferred from the file extensions, as
-`COPY INTO` does here. A path mixing formats cannot be read as one relation, so it is
+or the name of a created format) and *replaces* the named stage's own `FILE_FORMAT`; with
+neither, a stage created as `CREATE STAGE s FILE_FORMAT = (...)` uses that default, and
+otherwise it is inferred from the file extensions, as `COPY INTO` does here. A path mixing formats cannot be read as one relation, so it is
 rejected rather than guessed. `(PATTERN => '<regex>')` filters the files read, a directory
 prefix reads everything under it, and only one staged location can be queried per
 statement. `gzip`/`zstd`-compressed files are read transparently; `bzip2` is rejected.
@@ -548,9 +549,23 @@ Caveats:
   `TIMESTAMP_LTZ` and `TIMESTAMP_TZ` as one type, so `IS_TIMESTAMP_LTZ` and `IS_TIMESTAMP_TZ`
   answer alike. `OBJECT_CONSTRUCT(*)` needs a FROM source whose columns can be enumerated, and
   `PARSE_JSON` rejects the `undefined` array element Snowflake accepts (e.g. `[1, ,77]`).
-- The stage's own `FILE_FORMAT` (`CREATE STAGE ... FILE_FORMAT = ...`) is not modelled,
-  so an explicit `(FILE_FORMAT => ...)` clause is required for anything but the inferred
-  per-extension format.
+- A stage's metadata (URL, owner, comment and `FILE_FORMAT`) lives in the database's
+  `_sf_stages_ext` side table, and a named file format in `_sf_file_formats_ext`, so both
+  survive with the database and are what `SHOW` and `INFORMATION_SCHEMA` report (the side
+  tables are recreated on demand if an older database lacks them). `CREATE STAGE` requires
+  its database and schema to exist, errors when the stage already exists (`IF NOT EXISTS`
+  keeps it, `OR REPLACE` replaces its metadata), and rejects an external or empty `URL`.
+  `ALTER STAGE ... SET FILE_FORMAT/COMMENT` updates the row in place (`CREATED` and the
+  owner are preserved; a value containing `)` is kept whole); any other `ALTER STAGE ... SET`
+  form is a loud error rather than a silent no-op.
+- **Stage names are case-sensitive**, matching their case-sensitive directory (`CREATE STAGE
+  cs` and `CREATE STAGE CS` are two stages, as `LIST @cs`/`@CS` already resolved them);
+  file-format names stay case-insensitive, with an unquoted name upper-cased and a quoted one
+  kept as written. A file-format DDL name may be qualified (`CREATE FILE FORMAT db.schema.ff`).
+- `PUT` gzips by default (`AUTO_COMPRESS`), skips a source that is already compressed (a
+  `SOURCE_COMPRESSION` option classifies one whose name does not say), reports the source and
+  target sizes, and rejects a directory or a wildcard spanning several directories (Snowflake
+  does not preserve the local directory structure).
 
 ## Development
 
@@ -609,6 +624,7 @@ src/snowflake_emulator/
   executor.py            # statement execution against DuckDB
   database.py             # DuckDB connection/catalog management
   sessions.py             # in-memory session (token -> db/schema/warehouse/role)
+  metadata.py             # persisted stage/file-format metadata (STAGES, FILE_FORMATS)
   stages/                # local stage tree: PUT/GET/LIST/REMOVE/COPY INTO @stage
     __init__.py          # staged-file query path and the stage-manager singleton
     refs.py              # stage references, command parsing and StageError
@@ -685,10 +701,13 @@ enforced. This covers both `CREATE TABLE` and `ALTER TABLE ... ADD CONSTRAINT`.
 | Feature | Status |
 | --- | --- |
 | `PUT`/`GET`/`LIST`/`REMOVE` for `@~`, `@name`, `@db.schema.name`, `@%table` | ✅ |
+| `PUT` `AUTO_COMPRESS` (gzip by default, skipped for compressed sources), `OVERWRITE` | ✅ |
 | `COPY INTO` from a stage with CSV/TSV/JSON and inline `FILE_FORMAT` | ✅ |
-| Named file formats (`CREATE FILE FORMAT`, `FORMAT_NAME=`) | ✅ |
+| Named file formats (`CREATE FILE FORMAT`, `FORMAT_NAME=`) | ✅ persisted |
+| Stage `FILE_FORMAT` default (`CREATE`/`ALTER STAGE ... SET FILE_FORMAT`) | ✅ |
+| `SHOW STAGES`/`SHOW FILE FORMATS`, `INFORMATION_SCHEMA.STAGES`/`FILE_FORMATS` | ✅ |
 | HTTP (non-shared-filesystem) stage transfer | ❌ local filesystem only |
-| External stages (`s3://`, `gcs://`, `azure://`) | ❌ |
+| External stages (`s3://`, `gcs://`, `azure://`) | ❌ rejected by `CREATE STAGE` |
 
 ### Not supported
 

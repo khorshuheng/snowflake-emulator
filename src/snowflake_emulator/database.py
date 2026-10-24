@@ -29,6 +29,7 @@ from typing import Any, Iterator
 
 import duckdb
 
+from snowflake_emulator import metadata
 from snowflake_emulator.core.constants import INFORMATION_SCHEMA_SCHEMA
 from snowflake_emulator.number_format import NumberFormatError, format_number, parse_number
 from snowflake_emulator.settings import settings
@@ -178,21 +179,32 @@ class DuckDBManager:
                     found.append(database)
         return found
 
+    def attach_database(self, database: str) -> None:
+        """Attach a database's catalog (and its INFORMATION_SCHEMA), creating no schema.
+
+        Stage/file-format DDL needs to tell a missing schema from an existing one, so it
+        attaches the catalog without ``CREATE SCHEMA IF NOT EXISTS``.
+        """
+        db_ident = _quote_ident(database)
+        with self._lock:
+            if database.lower() in self._attached_catalogs:
+                return
+            path = self._catalog_path(database).replace("'", "''")
+            # VARIANT columns require storage version v1.5.0 or newer, while DuckDB
+            # defaults new files to an older version; passing it here also upgrades
+            # a file created before this option was used.
+            self._connection.execute(
+                f"ATTACH '{path}' AS {db_ident} (STORAGE_VERSION '{_STORAGE_VERSION}')"
+            )
+            self._attached_catalogs.add(database.lower())
+            self._ensure_information_schema(db_ident, database)
+
     def ensure_namespace(self, database: str, schema: str) -> None:
         """Ensure the given Snowflake database/schema pair exists as a DuckDB catalog/schema."""
         db_ident = _quote_ident(database)
         schema_ident = _quote_ident(schema)
+        self.attach_database(database)
         with self._lock:
-            if database.lower() not in self._attached_catalogs:
-                path = self._catalog_path(database).replace("'", "''")
-                # VARIANT columns require storage version v1.5.0 or newer, while DuckDB
-                # defaults new files to an older version; passing it here also upgrades
-                # a file created before this option was used.
-                self._connection.execute(
-                    f"ATTACH '{path}' AS {db_ident} (STORAGE_VERSION '{_STORAGE_VERSION}')"
-                )
-                self._attached_catalogs.add(database.lower())
-                self._ensure_information_schema(db_ident, database)
             self._connection.execute(f"CREATE SCHEMA IF NOT EXISTS {db_ident}.{schema_ident}")
 
     def _ensure_information_schema(self, db_ident: str, database: str) -> None:
@@ -280,6 +292,16 @@ class DuckDBManager:
               AND lower(schema_name) != lower('{INFORMATION_SCHEMA_SCHEMA}')
             """
         )
+        # Snowflake-only stage and file-format metadata: DuckDB has no such objects, so
+        # CREATE STAGE / CREATE FILE FORMAT record them here and the STAGES/FILE_FORMATS
+        # views (and SHOW) read them back. The DDL lives in ``metadata`` so a write to a
+        # database created before these tables existed can recreate them.
+        self._connection.execute(
+            metadata.table_ddl(database, metadata.STAGES_TABLE)
+        )
+        self._connection.execute(
+            metadata.table_ddl(database, metadata.FILE_FORMATS_TABLE)
+        )
         # Snowflake-only column metadata DuckDB discards: the declared SQL type
         # (notably VARCHAR(n) lengths) and column comments.
         self._connection.execute(
@@ -353,6 +375,55 @@ class DuckDBManager:
     ) -> None:
         """Create the common INFORMATION_SCHEMA views beyond tables/columns."""
         internal = f"lower('{INFORMATION_SCHEMA_SCHEMA}')"
+        self._connection.execute(
+            f"""
+            CREATE OR REPLACE VIEW {db_ident}.{schema}.stages AS
+            SELECT
+                stage_catalog AS STAGE_CATALOG,
+                stage_schema AS STAGE_SCHEMA,
+                stage_name AS STAGE_NAME,
+                stage_url AS STAGE_URL,
+                NULL::VARCHAR AS STAGE_REGION,
+                stage_type AS STAGE_TYPE,
+                stage_owner AS STAGE_OWNER,
+                comment AS COMMENT,
+                created_on AS CREATED,
+                created_on AS LAST_ALTERED
+            FROM {db_ident}.{schema}._sf_stages_ext
+            """
+        )
+        self._connection.execute(
+            f"""
+            CREATE OR REPLACE VIEW {db_ident}.{schema}.file_formats AS
+            SELECT
+                file_format_catalog AS FILE_FORMAT_CATALOG,
+                file_format_schema AS FILE_FORMAT_SCHEMA,
+                file_format_name AS FILE_FORMAT_NAME,
+                file_format_owner AS FILE_FORMAT_OWNER,
+                file_format_type AS FILE_FORMAT_TYPE,
+                json_extract_string(options, '$.RECORD_DELIMITER') AS RECORD_DELIMITER,
+                json_extract_string(options, '$.FIELD_DELIMITER') AS FIELD_DELIMITER,
+                TRY_CAST(json_extract_string(options, '$.SKIP_HEADER') AS BIGINT) AS SKIP_HEADER,
+                json_extract_string(options, '$.DATE_FORMAT') AS DATE_FORMAT,
+                json_extract_string(options, '$.TIME_FORMAT') AS TIME_FORMAT,
+                json_extract_string(options, '$.TIMESTAMP_FORMAT') AS TIMESTAMP_FORMAT,
+                json_extract_string(options, '$.BINARY_FORMAT') AS BINARY_FORMAT,
+                json_extract_string(options, '$.ESCAPE') AS ESCAPE,
+                json_extract_string(options, '$.ESCAPE_UNENCLOSED_FIELD')
+                    AS ESCAPE_UNENCLOSED_FIELD,
+                json_extract_string(options, '$.TRIM_SPACE') AS TRIM_SPACE,
+                json_extract_string(options, '$.FIELD_OPTIONALLY_ENCLOSED_BY')
+                    AS FIELD_OPTIONALLY_ENCLOSED_BY,
+                json_extract_string(options, '$.NULL_IF') AS NULL_IF,
+                json_extract_string(options, '$.COMPRESSION') AS COMPRESSION,
+                json_extract_string(options, '$.ERROR_ON_COLUMN_COUNT_MISMATCH')
+                    AS ERROR_ON_COLUMN_COUNT_MISMATCH,
+                created_on AS CREATED,
+                created_on AS LAST_ALTERED,
+                comment AS COMMENT
+            FROM {db_ident}.{schema}._sf_file_formats_ext
+            """
+        )
         views = f"""
             CREATE OR REPLACE VIEW {db_ident}.{schema}.views AS
             SELECT

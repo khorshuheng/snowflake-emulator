@@ -32,6 +32,8 @@ class FileTransfer:
     stage_location: str
     local_location: str | None = None
     overwrite: bool = False
+    # PUT's AUTO_COMPRESS (default TRUE): the connector gzips during its own upload.
+    auto_compress: bool = False
 
 
 @dataclass

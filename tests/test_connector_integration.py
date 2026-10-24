@@ -261,7 +261,7 @@ def test_put_csv_then_copy_into(connection, tmp_path):
     _write_csv(csv_path)
 
     cur = connection.cursor()
-    cur.execute(f"PUT file://{csv_path} @~/staged")
+    cur.execute(f"PUT file://{csv_path} @~/staged AUTO_COMPRESS=FALSE")
     row = cur.fetchone()
     assert row[0] == "data.csv"  # source
     assert row[1] == "data.csv"  # target
@@ -286,7 +286,7 @@ def test_put_json_then_copy_into(connection, tmp_path):
     _write_json(json_path, [{"a": 3, "b": "z"}, {"a": 4, "b": "w"}])
 
     cur = connection.cursor()
-    cur.execute(f"PUT file://{json_path} @~/staged")
+    cur.execute(f"PUT file://{json_path} @~/staged AUTO_COMPRESS=FALSE")
     assert cur.fetchone()[6] == "UPLOADED"
 
     cur.execute("CREATE OR REPLACE TABLE staged_json (a INT, b VARCHAR)")
@@ -305,7 +305,7 @@ def test_put_list_remove(connection, tmp_path):
     _write_csv(csv_path)
 
     cur = connection.cursor()
-    cur.execute(f"PUT file://{csv_path} @~/staged")
+    cur.execute(f"PUT file://{csv_path} @~/staged AUTO_COMPRESS=FALSE")
     cur.execute("LIST @~/staged")
     rows = cur.fetchall()
     assert [(r[0], r[1]) for r in rows] == [("staged/data.csv", 12)]
@@ -324,7 +324,7 @@ def test_put_glob_and_list_pattern(connection, tmp_path):
     _write_json(tmp_path / "meta.json", [{"a": 9, "b": "q"}])
 
     cur = connection.cursor()
-    cur.execute(f"PUT file://{tmp_path}/*.csv @~/staged")
+    cur.execute(f"PUT file://{tmp_path}/*.csv @~/staged AUTO_COMPRESS=FALSE")
     assert cur.rowcount == 2
 
     cur.execute("LIST @~/staged")
@@ -342,12 +342,12 @@ def test_put_overwrite_default_and_force(connection, tmp_path):
     _write_csv(csv_path)
 
     cur = connection.cursor()
-    cur.execute(f"PUT file://{csv_path} @~/staged")
+    cur.execute(f"PUT file://{csv_path} @~/staged AUTO_COMPRESS=FALSE")
     # Without OVERWRITE, re-putting an existing file fails (like real Snowflake).
     with pytest.raises(snowflake.connector.errors.ProgrammingError):
-        cur.execute(f"PUT file://{csv_path} @~/staged")
+        cur.execute(f"PUT file://{csv_path} @~/staged AUTO_COMPRESS=FALSE")
     # With OVERWRITE=TRUE it succeeds.
-    cur.execute(f"PUT file://{csv_path} @~/staged OVERWRITE=TRUE")
+    cur.execute(f"PUT file://{csv_path} @~/staged OVERWRITE=TRUE AUTO_COMPRESS=FALSE")
     assert cur.fetchone()[6] == "UPLOADED"
 
 
@@ -359,7 +359,7 @@ def test_get_from_stage(connection, tmp_path):
     out_dir.mkdir()
 
     cur = connection.cursor()
-    cur.execute(f"PUT file://{csv_path} @~/staged")
+    cur.execute(f"PUT file://{csv_path} @~/staged AUTO_COMPRESS=FALSE")
     cur.execute(f"GET @~/staged file://{out_dir}")
     # The connector reports the downloaded file name (stage path stripped).
     assert cur.fetchall() == [("data.csv", 12, "DOWNLOADED", "")]
@@ -374,7 +374,7 @@ def test_named_stage_roundtrip(connection, tmp_path):
 
     cur = connection.cursor()
     cur.execute("CREATE STAGE my_stage")
-    cur.execute(f"PUT file://{csv_path} @my_stage")
+    cur.execute(f"PUT file://{csv_path} @my_stage AUTO_COMPRESS=FALSE")
     assert cur.fetchone()[6] == "UPLOADED"
 
     cur.execute("SHOW STAGES")
@@ -403,7 +403,7 @@ def test_copy_into_file_format_options(connection, tmp_path):
 
     headerless = tmp_path / "no_header.csv"
     headerless.write_text("1,x\n2,y\n")
-    cur.execute(f"PUT file://{headerless} @~/nh")
+    cur.execute(f"PUT file://{headerless} @~/nh AUTO_COMPRESS=FALSE")
     cur.execute("CREATE OR REPLACE TABLE th (a INT, b VARCHAR)")
     cur.execute("COPY INTO th FROM @~/nh FILE_FORMAT = (TYPE = CSV, SKIP_HEADER = 1)")
     loaded = cur.fetchall()
@@ -413,7 +413,7 @@ def test_copy_into_file_format_options(connection, tmp_path):
 
     tsv = tmp_path / "data.tsv"
     tsv.write_text("a\tb\n5\tq\n")
-    cur.execute(f"PUT file://{tsv} @~/t")
+    cur.execute(f"PUT file://{tsv} @~/t AUTO_COMPRESS=FALSE")
     cur.execute("CREATE OR REPLACE TABLE tt (a INT, b VARCHAR)")
     cur.execute(
         "COPY INTO tt FROM @~/t "
@@ -478,8 +478,8 @@ def test_select_from_staged_file(connection, tmp_path):
     _write_csv(csv_path, header=("a", "b"), rows=((1, "x"), (2, "y")))
 
     cur = connection.cursor()
-    cur.execute(f"PUT file://{json_path} @~/js")
-    cur.execute(f"PUT file://{csv_path} @~/cs")
+    cur.execute(f"PUT file://{json_path} @~/js AUTO_COMPRESS=FALSE")
+    cur.execute(f"PUT file://{csv_path} @~/cs AUTO_COMPRESS=FALSE")
 
     cur.execute("SELECT $1:a AS a, $1:b AS b FROM @~/js/data.json ORDER BY a")
     assert cur.description[0].name == "A"

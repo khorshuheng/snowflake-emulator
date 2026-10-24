@@ -54,9 +54,11 @@ from snowflake_emulator.stages.copy import (
 )
 from snowflake_emulator.stages.manager import (
     StageManager,
+    alter_stage,
     create_stage,
     drop_stage,
     show_stages,
+    stage_file_format,
 )
 from snowflake_emulator.stages.refs import (
     GetCommand,
@@ -294,7 +296,25 @@ def _stage_file_options(session: SessionContext, table: exp.Table) -> dict[str, 
         options = {
             key.upper(): value for key, value in resolve_file_format(session, options).items()
         }
+    if not options:
+        # A named stage's own FILE_FORMAT is the default when the reference names none.
+        stage_ref = _stage_reference(table)
+        if stage_ref is not None:
+            options = stage_file_format(session, stage_ref)
     return options
+
+
+def _stage_reference(table: exp.Table) -> StageRef | None:
+    """The stage a ``FROM @stage/path`` entry names, when it is a local stage."""
+    if not isinstance(table.this, exp.Var):
+        return None
+    name = (table.this.name or "").strip()
+    if not name.startswith("@"):
+        return None
+    try:
+        return parse_stage_ref(name)
+    except StageError:
+        return None
 
 
 

@@ -117,7 +117,7 @@ def query_request(
             },
             "parallel": 4,
             "overwrite": transfer.overwrite,
-            "autoCompress": False,
+            "autoCompress": transfer.auto_compress,
             "sourceCompression": "auto_detect",
             "threshold": 67108864,
         }

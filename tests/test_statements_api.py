@@ -1669,7 +1669,7 @@ def test_stage_put_list_copy_into_csv(client, tmp_path):
 
     put = client.post(
         "/api/v2/statements",
-        json={"statement": f"PUT file://{csv_path} @~/staged"},
+        json={"statement": f"PUT file://{csv_path} @~/staged AUTO_COMPRESS = FALSE"},
         headers=headers,
     )
     assert put.status_code == 200
@@ -1754,7 +1754,7 @@ def test_stage_remove_and_get(client, tmp_path):
 
     client.post(
         "/api/v2/statements",
-        json={"statement": f"PUT file://{csv_path} @~/staged"},
+        json={"statement": f"PUT file://{csv_path} @~/staged AUTO_COMPRESS = FALSE"},
         headers=headers,
     )
 
@@ -1853,7 +1853,8 @@ def _select(client, headers, statement):
 def _stage(client, headers, path, target):
     staged = client.post(
         "/api/v2/statements",
-        json={"statement": f"PUT file://{path} {target}"},
+        # Parsing is what these tests exercise; AUTO_COMPRESS would rename the file.
+        json={"statement": f"PUT file://{path} {target} AUTO_COMPRESS = FALSE"},
         headers=headers,
     )
     assert staged.status_code == 200, staged.json()
@@ -3691,3 +3692,401 @@ def test_sample_forms(client):
     first = sorted(row[0] for row in data("SELECT * FROM sample_src SAMPLE (50) REPEATABLE (7)"))
     second = sorted(row[0] for row in data("SELECT * FROM sample_src SAMPLE (50) REPEATABLE (7)"))
     assert first == second
+
+
+def test_stage_metadata_backs_show_and_information_schema(client):
+    """CREATE STAGE records the URL, owner, comment and FILE_FORMAT; DROP removes them."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post(
+        "CREATE STAGE meta_st FILE_FORMAT = (TYPE = CSV FIELD_DELIMITER = '|') "
+        "COMMENT = 'pipe stage'"
+    ).status_code == 200
+    assert data("SHOW STAGES LIKE 'META_ST'") == [
+        [
+            "meta_st",
+            "EMULATOR_DB",
+            "PUBLIC",
+            "s3://sfemu/EMULATOR_DB.PUBLIC.meta_st",
+        ]
+    ]
+    view = data(
+        "SELECT STAGE_NAME, STAGE_URL, STAGE_TYPE, STAGE_OWNER, COMMENT "
+        "FROM INFORMATION_SCHEMA.STAGES WHERE lower(STAGE_NAME) = 'meta_st'"
+    )
+    assert view == [
+        [
+            "meta_st",
+            "s3://sfemu/EMULATOR_DB.PUBLIC.meta_st",
+            "Internal Named",
+            "ACCOUNTADMIN",
+            "pipe stage",
+        ]
+    ]
+    # An external stage is rejected rather than silently created as an internal one.
+    resp = post("CREATE STAGE meta_ext URL = 's3://bucket/prefix'")
+    assert resp.status_code == 422
+    assert "External stages are not supported" in resp.json()["detail"]["message"]
+    assert data("DROP STAGE meta_st") == [["Stage meta_st successfully dropped."]]
+    assert data(
+        "SELECT STAGE_NAME FROM INFORMATION_SCHEMA.STAGES WHERE lower(STAGE_NAME) = 'meta_st'"
+    ) == []
+
+
+def test_file_formats_are_persisted_and_visible(client):
+    """Named file formats live in the catalog side table, so SHOW and the view agree."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post(
+        "CREATE FILE FORMAT pipes TYPE = CSV FIELD_DELIMITER = '|' SKIP_HEADER = 1"
+    ).status_code == 200
+    assert post("CREATE FILE FORMAT jsf TYPE = JSON").status_code == 200
+    assert [row[0] for row in data("SHOW FILE FORMATS")] == ["JSF", "PIPES"]
+    view = data(
+        "SELECT FILE_FORMAT_NAME, FILE_FORMAT_TYPE, FIELD_DELIMITER, SKIP_HEADER "
+        "FROM INFORMATION_SCHEMA.FILE_FORMATS ORDER BY 1"
+    )
+    assert view == [["JSF", "JSON", None, None], ["PIPES", "CSV", "|", 1]]
+    assert data("DROP FILE FORMAT jsf") == [["File format JSF successfully dropped."]]
+    assert [row[0] for row in data("SHOW FILE FORMATS")] == ["PIPES"]
+
+
+def test_stage_file_format_is_the_default_for_reads(client, tmp_path):
+    """A stage's own FILE_FORMAT parses reads that do not name one; explicit wins."""
+    def post(statement, headers=None):
+        return client.post("/api/v2/statements", json={"statement": statement}, headers=headers)
+
+    headers = _stage_headers(client)
+    pipes = tmp_path / "pipes.csv"
+    pipes.write_text("1|alpha\n2|beta\n")
+    commas = tmp_path / "commas.csv"
+    commas.write_text("3,gamma\n")
+
+    assert post("CREATE TABLE sf_read (a INT, b VARCHAR)").status_code == 200
+    assert post(
+        "CREATE STAGE pipes_st FILE_FORMAT = (TYPE = CSV FIELD_DELIMITER = '|')"
+    ).status_code == 200
+    assert post(
+        f"PUT file://{pipes} @pipes_st AUTO_COMPRESS = FALSE", headers
+    ).status_code == 200
+    # COPY INTO uses the stage's format (no FILE_FORMAT clause).
+    assert post("COPY INTO sf_read FROM @pipes_st").status_code == 200
+    assert post("SELECT * FROM sf_read ORDER BY a").json()["data"] == [
+        [1, "alpha"],
+        [2, "beta"],
+    ]
+    # The staged-file query path uses it too.
+    assert post("SELECT $1, $2 FROM @pipes_st/pipes.csv").json()["data"] == [
+        [1, "alpha"],
+        [2, "beta"],
+    ]
+    # An explicit clause still wins over the stage default.
+    assert post(f"PUT file://{commas} @pipes_st AUTO_COMPRESS = FALSE", headers).status_code == 200
+    assert post(
+        "COPY INTO sf_read FROM @pipes_st/commas.csv FILE_FORMAT = (TYPE = CSV)"
+    ).status_code == 200
+    assert post("SELECT * FROM sf_read WHERE a = 3").json()["data"] == [[3, "gamma"]]
+
+
+def test_put_auto_compresses_by_default(client, tmp_path):
+    """PUT gzips by default (AUTO_COMPRESS), skips compressed sources, and COPY reads gzip."""
+    def post(statement, headers=None):
+        return client.post("/api/v2/statements", json={"statement": statement}, headers=headers)
+
+    headers = _stage_headers(client)
+    csv_path = tmp_path / "data.csv"
+    _write_csv(csv_path)
+    assert post("CREATE TABLE gz_t (a INT, b VARCHAR)").status_code == 200
+
+    staged = post(f"PUT file://{csv_path} @~/gz", headers).json()["data"]
+    # source_size is the local file's size, target_size the gzipped one.
+    assert staged == [
+        ["data.csv.gz", "gz/data.csv.gz", 12, staged[0][3], "NONE", "GZIP", "UPLOADED", ""]
+    ]
+    assert staged[0][3] > 12
+    assert [row[0] for row in post("LIST @~/gz", headers).json()["data"]] == ["gz/data.csv.gz"]
+    assert (
+        post(
+            "COPY INTO gz_t FROM @~/gz FILE_FORMAT = (TYPE = CSV, SKIP_HEADER = 1)",
+            headers,
+        ).status_code
+        == 200
+    )
+    assert post("SELECT * FROM gz_t ORDER BY a").json()["data"] == [[1, "x"], [2, "y"]]
+
+    # AUTO_COMPRESS = FALSE keeps the name, and an already-compressed source is left alone.
+    plain = post(
+        f"PUT file://{csv_path} @~/gz AUTO_COMPRESS = FALSE", headers
+    ).json()["data"]
+    assert plain[0][0] == "data.csv"
+    listed = {row[0] for row in post("LIST @~/gz", headers).json()["data"]}
+    assert {"gz/data.csv", "gz/data.csv.gz"} <= listed
+
+
+def test_put_rejects_a_directory_and_divergent_paths(client, tmp_path):
+    """A bare directory and a glob across subdirectories are rejected, as Snowflake does."""
+    def post(statement, headers=None):
+        return client.post("/api/v2/statements", json={"statement": statement}, headers=headers)
+
+    headers = _stage_headers(client)
+    (tmp_path / "d1").mkdir()
+    (tmp_path / "d2").mkdir()
+    (tmp_path / "d1" / "a.csv").write_text("1,x\n")
+    (tmp_path / "d2" / "b.csv").write_text("2,y\n")
+    assert post(f"PUT 'file://{tmp_path}' @~/bad", headers).status_code == 422
+    divergent = post(f"PUT 'file://{tmp_path}/*/*.csv' @~/bad", headers)
+    assert divergent.status_code == 422
+    message = divergent.json()["detail"]["message"]
+    assert "divergent directory paths" in message
+    # A wildcard within one directory is fine.
+    assert post(f"PUT 'file://{tmp_path}/d1/*.csv' @~/ok", headers).status_code == 200
+
+
+def test_alter_stage_updates_the_recorded_format_and_comment(client):
+    """`ALTER STAGE ... SET FILE_FORMAT/COMMENT` rewrites the stage's metadata."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post("CREATE STAGE alter_st COMMENT = 'before'").status_code == 200
+    assert data("ALTER STAGE alter_st SET FILE_FORMAT = (TYPE = CSV FIELD_DELIMITER = ';')") == [
+        ["Stage ALTER_ST successfully altered."]
+    ]
+    assert data(
+        "SELECT COMMENT FROM INFORMATION_SCHEMA.STAGES WHERE lower(STAGE_NAME) = 'alter_st'"
+    ) == [["before"]]
+    assert data(
+        "ALTER STAGE alter_st SET FILE_FORMAT = (TYPE = CSV), COMMENT = 'after'"
+    ) == [["Stage ALTER_ST successfully altered."]]
+    assert data(
+        "SELECT COMMENT FROM INFORMATION_SCHEMA.STAGES WHERE lower(STAGE_NAME) = 'alter_st'"
+    ) == [["after"]]
+    resp = post("ALTER STAGE missing_st SET COMMENT = 'x'")
+    assert resp.status_code == 422
+    assert "does not exist" in resp.json()["detail"]["message"]
+
+
+def test_create_stage_respects_existence(client):
+    """Plain CREATE errors on an existing stage, IF NOT EXISTS keeps it, OR REPLACE replaces."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post("CREATE STAGE exist_st COMMENT = 'a'").status_code == 200
+    resp = post("CREATE STAGE exist_st COMMENT = 'b'")
+    assert resp.status_code == 422
+    assert "already exists" in resp.json()["detail"]["message"]
+    assert data("CREATE STAGE IF NOT EXISTS exist_st COMMENT = 'c'") == [
+        ["Stage exist_st successfully created."]
+    ]
+    assert data(
+        "SELECT COMMENT FROM INFORMATION_SCHEMA.STAGES WHERE lower(STAGE_NAME) = 'exist_st'"
+    ) == [["a"]]
+    assert data("CREATE OR REPLACE STAGE exist_st COMMENT = 'd'") == [
+        ["Stage exist_st successfully created."]
+    ]
+    assert data(
+        "SELECT COMMENT FROM INFORMATION_SCHEMA.STAGES WHERE lower(STAGE_NAME) = 'exist_st'"
+    ) == [["d"]]
+
+
+def test_stage_names_are_case_sensitive_like_their_directory(client):
+    """A stage's metadata identity is exact, so a case variant is a different stage."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post("CREATE STAGE case_st").status_code == 200
+    assert post("CREATE STAGE CASE_ST").status_code == 200
+    listed = {row[0] for row in data("SHOW STAGES")}
+    assert {"case_st", "CASE_ST"} <= listed
+    assert data("DROP STAGE case_st") == [["Stage case_st successfully dropped."]]
+    remaining = {row[0] for row in data("SHOW STAGES")}
+    assert "CASE_ST" in remaining and "case_st" not in remaining
+
+
+def test_alter_stage_rejects_unmodelled_set_forms(client):
+    """An ALTER STAGE SET the emulator cannot apply is an error, not a silent success."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    assert post("CREATE STAGE alter_set").status_code == 200
+    for statement in (
+        "ALTER STAGE alter_set SET URL = 's3://b/x'",
+        "ALTER STAGE alter_set SET CREDENTIALS = (AWS_KEY_ID = 'k')",
+        "ALTER STAGE alter_set SET DIRECTORY = (ENABLE = TRUE)",
+    ):
+        resp = post(statement)
+        assert resp.status_code == 422, (statement, resp.json())
+        assert "Unsupported ALTER STAGE SET form" in resp.json()["detail"]["message"]
+
+
+def test_alter_stage_format_keeps_a_parenthesis_in_a_value(client, tmp_path):
+    """The FILE_FORMAT parentheses are scanned, so a ')' delimiter survives the ALTER."""
+    def post(statement, headers=None):
+        return client.post("/api/v2/statements", json={"statement": statement}, headers=headers)
+
+    headers = _stage_headers(client)
+    paren = tmp_path / "paren.csv"
+    paren.write_text("1)alpha\n2)beta\n")
+    assert post("CREATE STAGE paren_st FILE_FORMAT = (TYPE = CSV)").status_code == 200
+    assert post("ALTER STAGE paren_st SET FILE_FORMAT = (TYPE = CSV, FIELD_DELIMITER = ')')").status_code == 200
+    assert post(f"PUT file://{paren} @paren_st AUTO_COMPRESS = FALSE", headers).status_code == 200
+    assert post("CREATE TABLE paren_t (a INT, b VARCHAR)").status_code == 200
+    assert post("COPY INTO paren_t FROM @paren_st").status_code == 200
+    assert post("SELECT * FROM paren_t ORDER BY a").json()["data"] == [[1, "alpha"], [2, "beta"]]
+
+
+def test_create_stage_requires_an_existing_database_and_schema(client):
+    """A stage in a missing database/schema is an error, not a silent filesystem directory."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    resp = post("CREATE STAGE no_such_db.public.s")
+    assert resp.status_code == 422
+    assert "Database 'NO_SUCH_DB' does not exist" in resp.json()["detail"]["message"]
+    resp = post("CREATE STAGE EMULATOR_DB.no_such_schema.s")
+    assert resp.status_code == 422
+    assert "Schema 'NO_SUCH_SCHEMA' does not exist" in resp.json()["detail"]["message"]
+
+
+def test_stage_ddl_quoted_names_with_dots_and_spaces(client):
+    """A quoted stage name keeps its dots/spaces through CREATE, ALTER and DROP."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post('CREATE STAGE "dot.name" COMMENT = \'a\'').status_code == 200
+    assert post('CREATE STAGE "space name" COMMENT = \'b\'').status_code == 200
+    assert data("ALTER STAGE \"dot.name\" SET COMMENT = 'x'") == [
+        ["Stage DOT.NAME successfully altered."]
+    ]
+    assert data("ALTER STAGE \"space name\" SET COMMENT = 'y'") == [
+        ["Stage SPACE NAME successfully altered."]
+    ]
+    assert data(
+        "SELECT STAGE_NAME, COMMENT FROM INFORMATION_SCHEMA.STAGES "
+        "WHERE STAGE_NAME IN ('dot.name', 'space name') ORDER BY STAGE_NAME"
+    ) == [["dot.name", "x"], ["space name", "y"]]
+    assert data('DROP STAGE "dot.name"') == [["Stage dot.name successfully dropped."]]
+
+
+def test_create_stage_rejects_an_empty_url(client):
+    resp = client.post(
+        "/api/v2/statements", json={"statement": "CREATE STAGE empty_url_st URL = ''"}
+    )
+    assert resp.status_code == 422
+    assert "URL must not be empty" in resp.json()["detail"]["message"]
+
+
+def test_put_honours_source_compression(client, tmp_path):
+    """SOURCE_COMPRESSION classifies a source whose name does not say it is compressed."""
+    import gzip
+
+    headers = _stage_headers(client)
+    plain = tmp_path / "plain.csv"
+    with gzip.open(plain, "wb") as fh:
+        fh.write(b"1,x\n")
+    put = client.post(
+        "/api/v2/statements",
+        json={
+            "statement": f"PUT 'file://{plain}' @~/sc SOURCE_COMPRESSION = GZIP AUTO_COMPRESS = FALSE"
+        },
+        headers=headers,
+    )
+    assert put.status_code == 200, put.json()
+    row = put.json()["data"][0]
+    assert row[0] == "plain.csv"
+    assert row[4] == "GZIP" and row[5] == "GZIP"
+
+
+def test_stage_metadata_side_table_is_recreated_on_demand(client):
+    """A missing side table is recreated by the next write instead of losing metadata."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post("DROP TABLE EMULATOR_DB.SF_INFORMATION_SCHEMA._sf_stages_ext").status_code == 200
+    assert post("CREATE STAGE healed_st COMMENT = 'h'").status_code == 200
+    assert data(
+        "SELECT STAGE_NAME, COMMENT FROM INFORMATION_SCHEMA.STAGES WHERE STAGE_NAME = 'healed_st'"
+    ) == [["healed_st", "h"]]
+
+
+def test_alter_stage_preserves_created_and_owner(client):
+    """ALTER STAGE updates the row in place, keeping CREATED and the original owner."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post("CREATE STAGE kept_st COMMENT = 'c1'").status_code == 200
+    before = data(
+        "SELECT STAGE_OWNER, CREATED FROM INFORMATION_SCHEMA.STAGES WHERE STAGE_NAME = 'kept_st'"
+    )[0]
+    assert data("ALTER STAGE kept_st SET COMMENT = 'c2'") == [
+        ["Stage KEPT_ST successfully altered."]
+    ]
+    after = data(
+        "SELECT STAGE_OWNER, CREATED, COMMENT FROM INFORMATION_SCHEMA.STAGES "
+        "WHERE STAGE_NAME = 'kept_st'"
+    )[0]
+    assert after[0] == before[0]
+    assert after[1] == before[1]
+    assert after[2] == "c2"
+
+
+def test_file_format_ddl_honours_its_namespace_and_quoted_case(client):
+    """`CREATE FILE FORMAT db.schema.name` lands there, and a quoted name keeps its case."""
+    def post(statement):
+        return client.post("/api/v2/statements", json={"statement": statement})
+
+    def data(statement):
+        resp = post(statement)
+        assert resp.status_code == 200, (statement, resp.json())
+        return resp.json()["data"]
+
+    assert post("CREATE DATABASE ffdb").status_code == 200
+    assert post("CREATE FILE FORMAT ffdb.public.ff_here TYPE = CSV").status_code == 200
+    # An unquoted name is upper-cased, as Snowflake does.
+    assert data("SELECT FILE_FORMAT_NAME FROM ffdb.INFORMATION_SCHEMA.FILE_FORMATS") == [
+        ["FF_HERE"]
+    ]
+    assert data("SHOW FILE FORMATS LIKE 'FF_HERE'") == []
+    assert post('CREATE FILE FORMAT "MixedCaseFF" TYPE = JSON').status_code == 200
+    assert [row[0] for row in data("SHOW FILE FORMATS LIKE 'MIXEDCASEFF'")] == ["MixedCaseFF"]

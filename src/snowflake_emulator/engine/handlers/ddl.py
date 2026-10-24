@@ -115,32 +115,63 @@ def _file_format_options(statement: exp.Expression) -> dict[str, str]:
     return options
 
 
+def _object_name(table: exp.Table | None, session: SessionContext) -> str:
+    """The name of a DDL target, in Snowflake's casing (quoted names keep their case)."""
+    if table is None:
+        return ""
+    identifier = table.this
+    if isinstance(identifier, exp.Identifier) and not identifier.args.get("quoted"):
+        return identifier.name.upper()
+    return identifier.name if isinstance(identifier, exp.Identifier) else table.name
+
+
+def _object_namespace(
+    table: exp.Table | None, session: SessionContext
+) -> tuple[str, str]:
+    """The ``(database, schema)`` a DDL target names, defaulting to the session's."""
+    if table is None:
+        return session.database, session.schema
+    return (
+        table.text("catalog") or session.database,
+        table.text("db") or session.schema,
+    )
+
+
 def execute_file_format_ddl(
     session: SessionContext, statement: exp.Expression
 ) -> tuple[list[ColumnMeta], list[list[Any]]] | None:
     """Handle CREATE/DROP FILE FORMAT and SHOW FILE FORMATS."""
     kind = str(statement.args.get("kind") or "").upper()
     if isinstance(statement, exp.Create) and kind == "FILE FORMAT":
-        name = statement.this.name if isinstance(statement.this, exp.Table) else ""
+        table = statement.this if isinstance(statement.this, exp.Table) else None
+        name = _object_name(table, session)
         if not name:
             return None
+        database, schema = _object_namespace(table, session)
         get_file_format_manager().create(
             session,
             name,
             _file_format_options(statement),
             replace=bool(statement.args.get("replace")),
             if_not_exists=bool(statement.args.get("exists")),
+            database=database,
+            schema=schema,
         )
         return [ColumnMeta(name="status", type="text")], [
             [f"File format {name.upper()} successfully created."]
         ]
     if isinstance(statement, exp.Drop) and kind == "FILE FORMAT":
         target = drop_target_table(statement)
-        name = target.name if target is not None else ""
+        name = _object_name(target, session)
         if not name:
             return None
+        database, schema = _object_namespace(target, session)
         get_file_format_manager().drop(
-            session, name, if_exists=bool(statement.args.get("exists"))
+            session,
+            name,
+            if_exists=bool(statement.args.get("exists")),
+            database=database,
+            schema=schema,
         )
         return [ColumnMeta(name="status", type="text")], [
             [f"File format {name.upper()} successfully dropped."]

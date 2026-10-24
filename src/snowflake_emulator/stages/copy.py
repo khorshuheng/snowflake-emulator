@@ -13,6 +13,7 @@ from sqlglot import exp
 from snowflake_emulator.file_formats import resolve_file_format
 from snowflake_emulator.translator import transpile_to_duckdb
 from snowflake_emulator.sessions import SessionContext
+from snowflake_emulator.stages.manager import stage_file_format
 from snowflake_emulator.stages.manager import StageManager
 from snowflake_emulator.stages.refs import (
     StageError,
@@ -319,6 +320,10 @@ def build_copy_sql(
     Snowflake-shaped COPY result row per file.
     """
     stage = parse_stage_ref(stage_ref_sql)
+    # A named stage's own FILE_FORMAT is the default for a read that does not name one;
+    # an explicit FILE_FORMAT clause replaces it entirely (Snowflake: it overrides).
+    if not file_format:
+        file_format = stage_file_format(session, stage)
     fmt_type = file_format.get("TYPE", "").upper()
 
     if fmt_type in ("JSON", "NDJSON"):
