@@ -805,3 +805,111 @@ def test_session_timezone_is_utc(client):
     assert timezone == "UTC"
     # A SQL API timestamp cell is Snowflake's ``YYYY-MM-DD HH24:MI:SS.FF3`` text.
     assert timestamp.startswith(datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:"))
+
+
+def _row_type_names(response):
+    return [col["name"] for col in response.json()["resultSetMetaData"]["rowType"]]
+
+
+def test_dml_reports_snowflake_result_columns(client):
+    """DuckDB's bare ``Count`` column is replaced by Snowflake's named count columns."""
+    assert _post(client, "CREATE TABLE dml_shape (id INT, v INT)").status_code == 200
+
+    inserted = _post(client, "INSERT INTO dml_shape VALUES (1, 10), (2, 20), (3, 30)")
+    assert _row_type_names(inserted) == ["number of rows inserted"]
+    assert inserted.json()["data"] == [[3]]
+
+    updated = _post(client, "UPDATE dml_shape SET v = v + 1 WHERE id < 3")
+    assert _row_type_names(updated) == [
+        "number of rows updated",
+        "number of multi-joined rows updated",
+    ]
+    assert updated.json()["data"] == [[2, 0]]
+
+    deleted = _post(client, "DELETE FROM dml_shape WHERE id = 3")
+    assert _row_type_names(deleted) == ["number of rows deleted"]
+    assert deleted.json()["data"] == [[1]]
+
+
+def test_update_from_reports_multi_joined_rows(client):
+    """A target row that matches several FROM rows is updated and multi-joined once."""
+    assert _post(client, "CREATE TABLE up_tgt (k INT, v INT)").status_code == 200
+    assert _post(client, "INSERT INTO up_tgt VALUES (0, 10), (1, 20)").status_code == 200
+    assert _post(client, "CREATE TABLE up_src (k INT, v INT)").status_code == 200
+    assert _post(client, "INSERT INTO up_src VALUES (0, 11), (0, 12), (0, 13)").status_code == 200
+
+    resp = _post(
+        client,
+        "UPDATE up_tgt SET v = src.v FROM up_src src WHERE up_tgt.k = src.k",
+    )
+    assert _row_type_names(resp) == [
+        "number of rows updated",
+        "number of multi-joined rows updated",
+    ]
+    # DuckDB reports one update per source match (3); Snowflake reports the target row
+    # once and counts it as multi-joined.
+    assert resp.json()["data"] == [[1, 1]]
+    assert _post(client, "SELECT v FROM up_tgt WHERE k = 0").json()["data"][0][0] in (11, 12, 13)
+
+
+def test_merge_reports_one_column_per_action(client):
+    assert _post(client, "CREATE TABLE mrg_tgt (id INT, v INT)").status_code == 200
+    assert _post(client, "INSERT INTO mrg_tgt VALUES (1, 10), (2, 20), (3, 30)").status_code == 200
+
+    merged = _post(
+        client,
+        "MERGE INTO mrg_tgt t USING "
+        "(SELECT 1 AS id, 99 AS v UNION ALL SELECT 2, 5 UNION ALL SELECT 4, 40) s "
+        "ON t.id = s.id "
+        "WHEN MATCHED AND s.v > t.v THEN UPDATE SET t.v = s.v "
+        "WHEN MATCHED THEN DELETE "
+        "WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
+    )
+    assert _row_type_names(merged) == [
+        "number of rows inserted",
+        "number of rows updated",
+        "number of rows deleted",
+    ]
+    # id 4 inserted, id 1 updated, id 2 deleted; the second WHEN MATCHED takes no row.
+    assert merged.json()["data"] == [[1, 1, 1]]
+    assert _post(client, "SELECT id, v FROM mrg_tgt ORDER BY id").json()["data"] == [
+        [1, 99],
+        [3, 30],
+        [4, 40],
+    ]
+
+
+def test_merge_reports_only_the_actions_it_names(client):
+    assert _post(client, "CREATE TABLE mrg_one (id INT, v INT)").status_code == 200
+    assert _post(client, "INSERT INTO mrg_one VALUES (1, 10)").status_code == 200
+    merged = _post(
+        client,
+        "MERGE INTO mrg_one t USING (SELECT 1 AS id, 99 AS v) s ON t.id = s.id "
+        "WHEN MATCHED THEN UPDATE SET t.v = s.v",
+    )
+    assert _row_type_names(merged) == ["number of rows updated"]
+    assert merged.json()["data"] == [[1]]
+
+
+def test_truncate_reports_status_not_duckdb_count(client):
+    assert _post(client, "CREATE TABLE tr_t (a INT)").status_code == 200
+    resp = _post(client, "TRUNCATE TABLE tr_t")
+    assert _row_type_names(resp) == ["status"]
+
+
+def test_update_from_with_a_real_rowid_column_still_reports_counts(client):
+    """A user column named ``rowid`` hides DuckDB's row identity; the update still works."""
+    assert _post(client, "CREATE TABLE rid_tgt (rowid INT, v INT)").status_code == 200
+    assert _post(client, "INSERT INTO rid_tgt VALUES (1, 10), (2, 20)").status_code == 200
+    assert _post(client, "CREATE TABLE rid_src (rowid INT, v INT)").status_code == 200
+    assert _post(client, "INSERT INTO rid_src VALUES (1, 99), (2, 88)").status_code == 200
+
+    resp = _post(
+        client,
+        "UPDATE rid_tgt SET v = src.v FROM rid_src src WHERE rid_tgt.rowid = src.rowid",
+    )
+    assert _row_type_names(resp) == [
+        "number of rows updated",
+        "number of multi-joined rows updated",
+    ]
+    assert resp.json()["data"] == [[2, 0]]

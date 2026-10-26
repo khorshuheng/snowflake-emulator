@@ -119,6 +119,25 @@ def test_ddl_dml_and_typed_roundtrip(connection):
     ]
 
 
+def test_dml_rowcount_uses_snowflake_result_columns(connection):
+    cur = connection.cursor()
+    cur.execute("CREATE OR REPLACE TABLE dml_rc (id INT, v INT)")
+    cur.execute("INSERT INTO dml_rc VALUES (1, 10), (2, 20), (3, 30)")
+    assert cur.rowcount == 3
+    cur.execute("UPDATE dml_rc SET v = v + 1 WHERE id < 3")
+    assert cur.rowcount == 2
+    cur.execute("DELETE FROM dml_rc WHERE id = 3")
+    assert cur.rowcount == 1
+    cur.execute(
+        "MERGE INTO dml_rc t USING "
+        "(SELECT 9 AS id, 99 AS v UNION ALL SELECT 4, 40) s ON t.id = s.id "
+        "WHEN MATCHED THEN UPDATE SET v = s.v "
+        "WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)"
+    )
+    # The connector sums Snowflake's per-action columns; it must see both actions.
+    assert cur.rowcount == 2
+
+
 def test_describe_table_returns_snowflake_types(connection):
     cur = connection.cursor()
     cur.execute("CREATE OR REPLACE TABLE desc_t (a INT, b VARCHAR, c TIMESTAMP)")
@@ -197,6 +216,7 @@ def test_bind_shapes_roundtrip(emulator_port):
 
         cur.execute("CREATE OR REPLACE TABLE batch_t (a INT, b VARCHAR)")
         cur.executemany("INSERT INTO batch_t VALUES (?, ?)", [(1, "x"), (2, "y"), (3, "z")])
+        assert cur.rowcount == 3, "array binding reports the inserted-row count"
         cur.execute("SELECT * FROM batch_t ORDER BY a")
         assert cur.fetchall() == [(1, "x"), (2, "y"), (3, "z")], "executemany array binding"
 

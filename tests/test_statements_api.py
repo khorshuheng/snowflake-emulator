@@ -2147,20 +2147,20 @@ def test_staged_json_writes_coerce_to_the_target_columns(client, tmp_path):
     run("INSERT INTO stage_num (n) SELECT $1:id FROM @~/staged/rows.json")
     assert run("SELECT n, LENGTH(n) FROM stage_num ORDER BY n") == [["1", 1], ["2", 1]]
 
-    # UPDATE ... FROM over the staged file assigns the text and matches an existing VARCHAR row.
+    # UPDATE reports Snowflake's two columns: rows updated, and multi-joined rows.
     assert run("UPDATE stage_t SET name = s.$1:name FROM @~/staged/rows.json s "
-               "WHERE stage_t.id = s.$1:id") == [[2]]
+               "WHERE stage_t.id = s.$1:id") == [[2, 0]]
     assert run("SELECT name FROM stage_t ORDER BY id") == [["ada"], ["bob"]]
     assert run(
         "SELECT COUNT(*) FROM stage_t t, @~/staged/rows.json s WHERE t.name = s.$1:name"
     ) == [[2]]
     # The WHERE comparison coerces the VARCHAR side just like the SET value: comparing it
     # with the staged JSON value used to raise ``Malformed JSON``.
-    assert run("UPDATE stage_t SET name = 'x'") == [[2]]
+    assert run("UPDATE stage_t SET name = 'x'") == [[2, 0]]
     assert run("UPDATE stage_t SET name = s.$1:name FROM @~/staged/rows.json s "
-               "WHERE stage_t.name = s.$1:name") == [[0]]
+               "WHERE stage_t.name = s.$1:name") == [[0, 0]]
     assert run("UPDATE stage_t SET name = s.$1:name FROM @~/staged/rows.json s "
-               "WHERE stage_t.id = s.$1:id") == [[2]]
+               "WHERE stage_t.id = s.$1:id") == [[2, 0]]
     assert run("SELECT name FROM stage_t ORDER BY id") == [["ada"], ["bob"]]
 
     # A derived relation over the stage is still a staged JSON value: its projected
@@ -2171,7 +2171,7 @@ def test_staged_json_writes_coerce_to_the_target_columns(client, tmp_path):
     run("INSERT INTO stage_derived SELECT $1:id, $1:name FROM @~/staged/rows.json")
     assert run("UPDATE stage_derived SET name = s.name FROM "
                "(SELECT $1:id AS id, $1:name AS name FROM @~/staged/rows.json) s "
-               "WHERE stage_derived.id = s.id") == [[2]]
+               "WHERE stage_derived.id = s.id") == [[2, 0]]
     assert run("SELECT id, name, LENGTH(name) FROM stage_derived ORDER BY id") == [
         [1, "ada", 3],
         [2, "bob", 3],

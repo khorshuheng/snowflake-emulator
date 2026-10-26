@@ -113,3 +113,14 @@ def test_describe_only_named_parameter(client):
     assert body["success"] is True, body
     assert [col["name"] for col in body["data"]["rowtype"]] == ["X"]
     assert body["data"]["numberOfBinds"] == 1
+
+
+def test_describe_only_merge_reports_only_its_actions(client):
+    _wire(client, "CREATE TABLE mrg_desc (id INT, v INT)")
+    body = _wire(
+        client,
+        "MERGE INTO mrg_desc t USING (SELECT 1 AS id) s ON t.id = s.id "
+        "WHEN MATCHED THEN UPDATE SET v = 1",
+        describeOnly=True,
+    ).json()
+    assert [col["name"] for col in body["data"]["rowtype"]] == ["number of rows updated"]

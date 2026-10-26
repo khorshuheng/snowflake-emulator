@@ -22,6 +22,7 @@ from snowflake_emulator.translator import column_types
 from snowflake_emulator.database import DuckDBManager
 from snowflake_emulator.engine.errors import as_execution_error
 from snowflake_emulator.engine.handlers.common import convert_describe_types
+from snowflake_emulator.engine.handlers import dml
 from snowflake_emulator.engine.handlers.ddl import (
     execute_alter_constraints,
     execute_create_database,
@@ -336,6 +337,17 @@ def _execute_sql(
         if isinstance(statement, exp.Copy):
             stage_copy = copy_stage_source(statement)
 
+        # DML result shapes (Snowflake names/columns instead of DuckDB's ``Count``);
+        # only a MERGE split or a multi-joined UPDATE needs counting before it runs.
+        executed = (
+            dml.parse_executed_statement(duckdb_sql)
+            if isinstance(statement, (exp.Update, exp.Merge))
+            else None
+        )
+        dml_columns = dml.result_columns(statement, executed)
+        dml_totals = [0] * len(dml_columns) if dml_columns is not None else None
+        preview: list[int] | None = None
+
         batch = bind_batch if len(statements) == 1 else None
         batch_affected = 0
         copy_loaded: list[tuple[str, int]] | None = None
@@ -364,14 +376,20 @@ def _execute_sql(
             elif batch is not None:
                 # An array binding (executemany) runs the statement once per row.
                 for row in batch:
+                    row_preview = dml.preview_values(executed, cursor, list(row))
                     cursor.execute(duckdb_sql, list(row))
-                    if cursor.description:
-                        fetched = cursor.fetchone()
-                        if fetched and isinstance(fetched[0], int):
-                            batch_affected += fetched[0]
+                    affected = _affected_rows(cursor)
+                    batch_affected += affected
+                    if dml_totals is not None:
+                        values = dml.result_values(statement, row_preview, affected)
+                        dml_totals = [
+                            total + value for total, value in zip(dml_totals, values)
+                        ]
             elif bind_params is not None and len(statements) == 1:
+                preview = dml.preview_values(executed, cursor, bind_params)
                 cursor.execute(duckdb_sql, bind_params)
             else:
+                preview = dml.preview_values(executed, cursor, None)
                 cursor.execute(duckdb_sql)
         except (StageError, FileFormatError) as exc:
             raise ExecutionError(str(exc)) from exc
@@ -385,6 +403,10 @@ def _execute_sql(
             record_declared_columns(manager, session, statement)
             record_constraints(manager, session, statement)
             record_temp_table_owner(manager, session, statement)
+
+        if dml_totals is not None and batch is None:
+            affected = 0 if preview is not None else _affected_rows(cursor)
+            dml_totals = dml.result_values(statement, preview, affected)
 
         if copy_loaded is not None:
             row_type = _COPY_RESULT_COLUMNS
@@ -403,6 +425,10 @@ def _execute_sql(
                 ]
                 for file_label, loaded in copy_loaded
             ]
+        elif dml_totals is not None:
+            # Snowflake names the affected rows per action instead of DuckDB's ``Count``.
+            row_type = [dml.result_column(name) for name in dml_columns or []]
+            rows = [list(dml_totals)]
         elif batch is not None:
             # Report the total affected rows across the batch, as Snowflake does for a
             # multi-row DML, instead of the last row's count.
@@ -444,6 +470,16 @@ def _execute_sql(
         statement_type_id=statement_type_id(last_statement),
         number_of_binds=number_of_binds(last_statement),
     )
+
+
+def _affected_rows(cursor: Any) -> int:
+    """Read the affected-row count DuckDB reports for a DML statement."""
+    if not cursor.description:
+        return 0
+    fetched = cursor.fetchone()
+    if fetched and isinstance(fetched[0], int):
+        return fetched[0]
+    return 0
 
 
 _TEXT_LENGTH_RE = re.compile(r"^\s*(VAR)?CHAR\s*\(\s*(\d+)\s*\)", re.IGNORECASE)

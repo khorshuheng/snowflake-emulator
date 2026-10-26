@@ -322,15 +322,15 @@ def record_temp_table_owner(
 
 
 def is_ddl_status_artifact(statement: exp.Expression, description: list[Any]) -> bool:
-    """Return True when DuckDB reports DDL as a single ``Count``/``Success`` column.
+    """Return True when DuckDB reports a statement without a result set as a bare column.
 
-    DuckDB's Python API reports CREATE/DROP/ALTER as a one-column result named
-    ``Count`` or ``Success`` with no rows. Snowflake returns a plain status instead,
-    so those statements are routed to the standard status result.
+    DuckDB's Python API reports DDL (CREATE/DROP/ALTER/TRUNCATE) as a one-column result
+    named ``Count`` or ``Success``. Snowflake returns a plain status for those, so they are
+    routed to the standard status result.
     """
     if len(description) != 1 or description[0][0] not in ("Count", "Success"):
         return False
-    return isinstance(statement, (exp.Create, exp.Drop, exp.Alter))
+    return isinstance(statement, (exp.Create, exp.Drop, exp.Alter, exp.TruncateTable))
 
 
 def _sf_name(identifier: exp.Identifier) -> str:

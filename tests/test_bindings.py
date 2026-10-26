@@ -162,3 +162,34 @@ def test_variant_list_binding_inserts_one_row(client):
     ).json()["success"]
     sel = client.post("/api/v2/statements", json={"statement": "SELECT COUNT(*) AS n FROM vlist"})
     assert sel.json()["data"] == [[1]]
+
+
+def test_merge_bindings_split_actions(client):
+    """A positional binding on a MERGE runs its per-action count previews with the values."""
+    assert client.post(
+        "/api/v2/statements", json={"statement": "CREATE TABLE bind_merge (id INT, v INT)"}
+    ).status_code == 200
+    assert client.post(
+        "/api/v2/statements", json={"statement": "INSERT INTO bind_merge VALUES (1, 10)"}
+    ).status_code == 200
+
+    resp = client.post(
+        "/api/v2/statements",
+        json={
+            "statement": (
+                "MERGE INTO bind_merge t USING (SELECT ? AS id, ? AS v) s ON t.id = s.id "
+                "WHEN MATCHED THEN UPDATE SET t.v = s.v "
+                "WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)"
+            ),
+            "bindings": {
+                "1": {"type": "FIXED", "value": "1"},
+                "2": {"type": "FIXED", "value": "77"},
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.json()
+    assert [col["name"] for col in resp.json()["resultSetMetaData"]["rowType"]] == [
+        "number of rows inserted",
+        "number of rows updated",
+    ]
+    assert resp.json()["data"] == [[0, 1]]

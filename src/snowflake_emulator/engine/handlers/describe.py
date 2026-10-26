@@ -13,6 +13,7 @@ from snowflake_emulator.core.constants import INFORMATION_SCHEMA_SCHEMA
 from snowflake_emulator.core.errors import ExecutionError
 from snowflake_emulator.core.results import ColumnMeta, ExecutionResult
 from snowflake_emulator.database import DuckDBManager
+from snowflake_emulator.engine.handlers import dml
 from snowflake_emulator.engine.handlers.common import (
     prefer_declared_type,
     result_columns,
@@ -65,14 +66,10 @@ _DESCRIBE_SYNTHETIC: dict[type[exp.Expression], list[tuple[str, str]]] = {
         ("number of multi-joined rows updated", "BIGINT"),
     ],
     exp.Delete: [("number of rows deleted", "BIGINT")],
-    # MERGE reports one count per operation; both are listed (a MERGE that omits a
-    # WHEN clause would report fewer, but describing must never execute the write).
-    exp.Merge: [
-        ("number of rows inserted", "BIGINT"),
-        ("number of rows updated", "BIGINT"),
-    ],
     exp.Copy: _DESCRIBE_COPY,
 }
+# A MERGE reports one count per action its WHEN clauses name, so its columns are built
+# from the statement itself (see ``_describe_sql``).
 
 # ``DESCRIBE FUNCTION`` adds the signature bounds a caller needs to tell overloads
 # apart. Snowflake reports both as the number of declared arguments.
@@ -145,6 +142,11 @@ def _describe_sql(
         statement = split_statements(raw_sql)[-1]
     except TranslationError:
         return None
+    if isinstance(statement, exp.Merge):
+        return _describe_result(
+            statement,
+            [(name, "BIGINT") for name in dml.result_columns(statement) or []],
+        )
     if type(statement) in _DESCRIBE_SYNTHETIC:
         return _describe_result(statement, _DESCRIBE_SYNTHETIC[type(statement)])
     if not isinstance(statement, (exp.Select, exp.Union, exp.Subquery)):
